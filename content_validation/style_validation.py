@@ -35,7 +35,7 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
 )
 
-from validate_toc_content import (
+from .validate_toc_content import (
     get_toc, _norm_key, _toc_ranges_by_key, _doc_body_size, _style_class_rel,
 )
 
