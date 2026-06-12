@@ -1,0 +1,16 @@
+__pycache__
+.venv
+tmp_uploads
+reports
+.git
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+node_modules
+*.db
+*.sqlite3
+dist
+build
+*.log

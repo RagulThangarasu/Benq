@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: benq-validator
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    region: oregon
+    routes:
+      - type: web
+    healthCheckPath: /
