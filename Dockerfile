@@ -25,4 +25,4 @@ ENV PORT=10000
 
 EXPOSE 10000
 
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:10000", "app:app"]
+CMD ["sh", "-lc", "exec gunicorn -w 4 -b 0.0.0.0:${PORT:-10000} app:app"]
