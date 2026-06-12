@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>PDF Folder Validation</title>
+    <style>
+      :root {
+        /* HashoutTech-inspired palette (high-level) */
+        --bg: linear-gradient(180deg,#f7fbfb 0%, #f0f8f9 100%);
+        --card: #ffffff;
+        --muted: #6b7280;
+        --text: #0b1220;
+        --primary-start: #0ea5a4; /* teal */
+        --primary-end: #3b82f6; /* blue */
+        --accent: #fb923c; /* warm accent */
+        --danger: #ef4444;
+        --border: rgba(11,18,23,0.12);
+        --border-soft: rgba(11,18,23,0.06);
+        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--text);
+        background: var(--bg);
+        font-size: 15px;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 0; }
+      /* full-width single-column layout */
+      .page { width: 100%; max-width: 1440px; margin: 14px auto; padding: 24px; }
+      header { display: block; margin-bottom: 30px; padding-bottom: 6px; }
+      header h1 { margin: 18px 0 0 0; font-size: 1.9rem; line-height: 1.05; }
+      header p { margin: 8px 0 0; color: var(--muted); max-width: 60rem; font-size: 0.98rem; }
+      .hero-pill { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 12px; background: linear-gradient(90deg,#0b1220,#111827); color: #f8fafc; font-weight:700; font-size: 0.9rem; box-shadow: 0 8px 28px rgba(2,6,23,0.16); }
+      .layout { display:block; gap: 22px; }
+      .card { background: linear-gradient(180deg,#ffffff,#fbfdff); border-radius: 14px; padding: 22px; box-shadow: 0 12px 36px rgba(11,18,32,0.06); border-left: 6px solid rgba(59,130,246,0.08); border: 1px solid var(--border-soft); }
+      h2 { margin-top: 0; font-size: 1.15rem; color: var(--accent); }
+      label { display: block; margin-bottom: 8px; font-size: 0.95rem; font-weight: 700; color: var(--text); }
+      input[type=file], input[type=search] { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: #fbfdff; font-size: 0.95rem; }
+      .upload-row { display:flex; gap:18px; flex-wrap:wrap; background: linear-gradient(90deg, rgba(59,130,246,0.03), rgba(139,92,246,0.02)); padding:14px; border-radius:12px; }
+      .upload-side { background: rgba(255,255,255,0.6); padding:10px; border-radius:10px; }
+      .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+      /* CTA area background */
+      .cta { background: linear-gradient(90deg, rgba(59,130,246,0.06), rgba(139,92,246,0.04)); padding:10px; border-radius:10px; display:inline-flex; gap:12px; }
+      button { min-width: 120px; border: none; border-radius: 10px; font-weight: 700; cursor: pointer; padding: 10px 14px; transition: transform 120ms ease, box-shadow 120ms ease; font-size: 0.95rem; }
+      button:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(2,6,23,0.12); }
+      /* Dark CTAs */
+      button.primary { background: linear-gradient(90deg,#0b1220,#111827); color: #ffffff; box-shadow: 0 8px 30px rgba(2,6,23,0.18); }
+      /* Choose-all and similar secondary actions use darker style too */
+      button.secondary { background: linear-gradient(90deg,#0f1724,#0b1220); color: #e6eef8; border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 6px 18px rgba(2,6,23,0.12); }
+      button.danger { background: linear-gradient(90deg,#b91c1c,#7f1d1d); color: white; }
+      .pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 11px; border-radius: 999px; background: linear-gradient(90deg,#0f1724,#0b1220); color: #e6eef8; font-size: 0.88rem; box-shadow: 0 6px 18px rgba(2,6,23,0.12); }
+      .queue-wrapper { border: 1px solid var(--border); border-radius: 12px; padding: 6px; max-height: 420px; overflow:auto; }
+      .queue-list { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+      .queue-list th:nth-child(2), .queue-list td:nth-child(2) { width: 56%; }
+      .queue-list th:nth-child(3), .queue-list td:nth-child(3) { width: 12%; }
+      .queue-list th:nth-child(4), .queue-list td:nth-child(4) { width: 12%; }
+      .queue-list th:nth-child(5), .queue-list td:nth-child(5) { width: 20%; }
+      .queue-list th, .queue-list td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--border-soft); }
+      .queue-list th { color: var(--muted); font-weight: 800; background: transparent; position: sticky; top: 0; z-index: 1; }
+      .queue-empty { color: #64748b; margin: 0; }
+      .status-chip { display: inline-flex; align-items: center; padding: 6px 10px; border-radius: 999px; font-size: 0.88rem; font-weight: 800; background: linear-gradient(90deg, rgba(59,130,246,0.12), rgba(139,92,246,0.08)); color: var(--text); }
+      .notice { margin-top: 18px; padding: 14px 16px; border-radius: 12px; background: linear-gradient(180deg,#f8fafc,#ffffff); border: 1px solid var(--border-soft); color: var(--muted); font-size: 0.94rem; }
+      /* Progress bar with moving stripes (scroll-like effect) */
+      .progress-wrap { background: rgba(14,165,164,0.06); border-radius: 10px; height: 16px; overflow: hidden; position: relative; }
+      .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg,var(--primary-start),var(--primary-end)); position: relative; transition: width 300ms ease; display:flex; align-items:center; justify-content:center; color: white; font-weight:800; }
+      .progress-bar .stripe { position: absolute; inset:0; background-image: linear-gradient(135deg, rgba(255,255,255,0.12) 25%, rgba(0,0,0,0.02) 25%, rgba(0,0,0,0.02) 50%, rgba(255,255,255,0.06) 50%, rgba(255,255,255,0.06) 75%, rgba(0,0,0,0.01) 75%); background-size: 24px 24px; opacity:0.6; transform: translateX(0); }
+      .progress-bar.animated .stripe { animation: scroll-stripes 1.2s linear infinite; }
+      @keyframes scroll-stripes { from { background-position: 0 0; } to { background-position: 48px 0; } }
+      .report-link { color: var(--primary-end); font-weight: 700; }
+      .footer { margin-top: 24px; font-size: 0.92rem; color: var(--muted); }
+      @media (max-width: 980px) {
+        .layout { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 720px) {
+        .page { padding: 18px; }
+        header { flex-direction: column; }
+        button { width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <div>
+          <span class="hero-pill">Folder-level PDF validation</span>
+          <h1>Upload PROD + STAGE folders</h1>
+          <p>Select the prod and stage folders, press <strong>Append</strong> to queue them, and then click <strong>Validate</strong>. Use <strong>Clear</strong> to reset the appended list.</p>
+        </div>
+      </header>
+
+      <div class="layout">
+        <section class="card">
+          <h2>Upload</h2>
+          <p style="color:#475569; margin-bottom: 18px;">High-level upload: choose a folder (any nested level will be scanned for PDFs) or a single PDF file for each side. Append pairs to the queue, then validate. The UI accepts nested folders and single-file validations.</p>
+
+          <form id="appendForm" enctype="multipart/form-data">
+            <div class="upload-row">
+              <div class="upload-side" style="flex:1; min-width:260px;">
+                <label style="font-weight:700;">PROD</label>
+                <div style="display:flex; gap:8px; margin-top:8px;">
+                  <select id="prod_mode" aria-label="prod upload mode" style="padding:8px; border-radius:8px; border:1px solid var(--border);">
+                    <option value="folder" selected>Upload Folder (recommended)</option>
+                    <option value="file">Single PDF</option>
+                  </select>
+                  <button id="prod_pick" type="button" class="secondary" style="padding:8px 12px;">Choose</button>
+                </div>
+                <input id="prod_folder_input" type="file" name="prod_files" webkitdirectory directory multiple accept="application/pdf" style="margin-top:10px; display:block;" />
+                <input id="prod_file_input" type="file" name="prod_files" accept="application/pdf" style="margin-top:10px; display:none;" />
+                <div id="prod_preview" style="margin-top:10px; color:#475569; font-size:0.95rem;">No files selected.</div>
+              </div>
+
+              <div class="upload-side" style="flex:1; min-width:260px;">
+                <label style="font-weight:700;">STAGE</label>
+                <div style="display:flex; gap:8px; margin-top:8px;">
+                  <select id="stage_mode" aria-label="stage upload mode" style="padding:8px; border-radius:8px; border:1px solid var(--border);">
+                    <option value="folder" selected>Upload Folder (recommended)</option>
+                    <option value="file">Single PDF</option>
+                  </select>
+                  <button id="stage_pick" type="button" class="secondary" style="padding:8px 12px;">Choose</button>
+                </div>
+                <input id="stage_folder_input" type="file" name="stage_files" webkitdirectory directory multiple accept="application/pdf" style="margin-top:10px; display:block;" />
+                <input id="stage_file_input" type="file" name="stage_files" accept="application/pdf" style="margin-top:10px; display:none;" />
+                <div id="stage_preview" style="margin-top:10px; color:#475569; font-size:0.95rem;">No files selected.</div>
+              </div>
+            </div>
+
+            <div class="actions cta" style="margin-top:14px;">
+              <button id="appendButton" type="button" class="primary">Append</button>
+              <button id="clearButton" type="button" class="secondary">Clear queue</button>
+            </div>
+          </form>
+
+          <div id="messages" style="margin-top:12px;"></div>
+
+          <div class="notice">
+            <strong>Note:</strong> Nested folders are scanned for PDFs. If you choose single-PDF mode, only that file will be used for validation.
+          </div>
+
+          <!-- Queued folders (moved below append controls) -->
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:18px;">
+            <div style="height:1px; flex:1;"></div>
+            <span class="status-chip" id="queueCount">0 items</span>
+          </div>
+
+            <div style="display:flex; gap:8px; align-items:center; margin-top:12px;">
+            <input id="queueSearch" type="search" placeholder="Search product..." style="flex:1; padding:8px 10px; border-radius:8px; border:1px solid #e6eefc;" />
+            <button id="selectAllFiltered" type="button" class="secondary">Select all (filtered)</button>
+            <button id="clearSelected" type="button" class="secondary">Clear selected</button>
+          </div>
+
+          <div class="queue-wrapper" style="margin-top:12px;">
+            <table class="queue-list" id="queueTable">
+              <thead>
+                <tr>
+                  <th style="width:36px"></th>
+                  <th>Folder pair</th>
+                  <th>Prod PDFs</th>
+                  <th>Stage PDFs</th>
+                  <th>Added</th>
+                </tr>
+              </thead>
+              <tbody id="queueBody">
+                <tr><td colspan="5" class="queue-empty">No appended folder pairs yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="notice" id="queueNotice" style="margin-top:12px;">Only the appended folder pairs are validated. Click <strong>Clear queue</strong> to remove all items before appending new pairs.</div>
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-top:12px; gap:12px;">
+            <div style="color:#475569; font-size:0.95rem;"><span id="selectedCount">0 selected</span></div>
+          </div>
+
+          <h2 style="margin-top: 26px;">Validation</h2>
+          <form id="validateForm" action="{{ url_for('validate') }}" method="post">
+            <fieldset style="border:1px solid #e2e8f0; border-radius:16px; padding:18px;">
+              <legend style="font-weight:700;">Mode</legend>
+              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="content" checked /> Content validation</label>
+              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="style" /> Style validation</label>
+              <label class="option" style="display:block;"><input type="radio" name="mode" value="both" /> Both (content + style)</label>
+            </fieldset>
+            <div class="actions cta" style="margin-top: 18px;">
+              <button id="validateButton" type="submit" class="primary">Validate queue</button>
+            </div>
+          </form>
+            <div id="progressContainer" style="display:none; margin-top:12px;">
+              <div class="progress-wrap">
+                <div id="progressBar" class="progress-bar" style="width:0%;">
+                  <div class="stripe"></div>
+                  <span id="progressPercent">0%</span>
+                </div>
+              </div>
+              <div style="margin-top:8px; font-size:0.9rem; color:#334155;">Progress: <span id="progressText">0/0</span> — <span id="progressLabel">idle</span></div>
+            </div>
+
+          {% if error %}
+            <div class="notice" style="background:#fee2e2; border-color:#fca5a5; color:#991b1b;">{{ error }}</div>
+          {% endif %}
+
+          {% if report_url %}
+            <div class="notice" style="background:#ecfdf5; border-color:#86efac; color:#166534;">
+              <p><strong>Report generated:</strong></p>
+              <p><a class="report-link" href="{{ report_url }}">Download {{ report_name }}</a></p>
+            </div>
+          {% endif %}
+        </section>
+
+        <!-- aside removed; queue is shown inline in the main card per user request -->
+      </div>
+
+      <footer class="footer">Reports are downloaded directly to your machine and are not permanently stored on the server.</footer>
+    </div>
+
+    <script>
+      const queueBody = document.getElementById('queueBody');
+      const queueCount = document.getElementById('queueCount');
+      const appendButton = document.getElementById('appendButton');
+      const clearButton = document.getElementById('clearButton');
+      const prodFolderInput = document.getElementById('prod_folder_input');
+      const prodFileInput = document.getElementById('prod_file_input');
+      const stageFolderInput = document.getElementById('stage_folder_input');
+      const stageFileInput = document.getElementById('stage_file_input');
+      const prodMode = document.getElementById('prod_mode');
+      const stageMode = document.getElementById('stage_mode');
+      const prodPick = document.getElementById('prod_pick');
+      const stagePick = document.getElementById('stage_pick');
+      const prodPreview = document.getElementById('prod_preview');
+      const stagePreview = document.getElementById('stage_preview');
+
+      async function fetchQueue() {
+        const res = await fetch('/queue');
+        const data = await res.json();
+        return data.queue || [];
+      }
+
+      // selection state for queued items
+      const selectedIds = new Set();
+      const queueSearch = document.getElementById('queueSearch');
+      const selectAllFilteredBtn = document.getElementById('selectAllFiltered');
+      const clearSelectedBtn = document.getElementById('clearSelected');
+      const selectedCountEl = document.getElementById('selectedCount');
+
+      function updateSelectedCount() {
+        selectedCountEl.textContent = `${selectedIds.size} selected`;
+      }
+
+      function renderQueue(queue) {
+        const term = (queueSearch.value || '').toLowerCase().trim();
+        queueBody.innerHTML = '';
+        if (!queue.length) {
+          queueBody.innerHTML = '<tr><td colspan="5" class="queue-empty">No appended folder pairs yet.</td></tr>';
+          queueCount.textContent = '0 items';
+          updateSelectedCount();
+          return;
+        }
+
+        const filtered = queue.filter(item => {
+          if (!term) return true;
+          return (item.label || '').toLowerCase().includes(term) || (item.prod_files || []).join(' ').toLowerCase().includes(term) || (item.stage_files || []).join(' ').toLowerCase().includes(term);
+        });
+
+        if (!filtered.length) {
+          queueBody.innerHTML = '<tr><td colspan="5" class="queue-empty">No matching folder pairs.</td></tr>';
+        }
+
+        filtered.forEach(item => {
+          const tr = document.createElement('tr');
+          const prodPreview = (item.prod_files || []).slice(0,5).map(f => f.split('/').pop()).join(', ');
+          const stagePreview = (item.stage_files || []).slice(0,5).map(f => f.split('/').pop()).join(', ');
+          const filesCell = `PROD: ${prodPreview || '-'}<br/>STAGE: ${stagePreview || '-'}${(item.prod_files && item.prod_files.length>5) || (item.stage_files && item.stage_files.length>5) ? ' <span style="color:#6b7280; font-size:0.85rem;">(more...)</span>' : ''}`;
+          const checked = selectedIds.has(item.id) ? 'checked' : '';
+          tr.innerHTML = `
+            <td><input type="checkbox" class="queue-check" data-id="${item.id}" ${checked} /></td>
+            <td>${item.label}</td>
+            <td>${item.prod_count}</td>
+            <td>${item.stage_count}</td>
+            <td>${new Date(item.created).toLocaleString()}</td>
+          `;
+          queueBody.appendChild(tr);
+          const previewTr = document.createElement('tr');
+          previewTr.innerHTML = `<td colspan="5" style="color:#475569; font-size:0.9rem; padding:8px 16px; background:#fcfdff;">${filesCell}</td>`;
+          queueBody.appendChild(previewTr);
+        });
+
+        // wire checkbox events
+        document.querySelectorAll('.queue-check').forEach(ch => {
+          ch.addEventListener('change', (ev) => {
+            const id = ch.getAttribute('data-id');
+            if (ch.checked) selectedIds.add(id); else selectedIds.delete(id);
+            updateSelectedCount();
+          });
+        });
+
+        queueCount.textContent = `${queue.length} item${queue.length > 1 ? 's' : ''}`;
+        updateSelectedCount();
+      }
+
+      async function loadQueue() {
+        const queue = await fetchQueue();
+        renderQueue(queue);
+      }
+
+      function summarizeFiles(files) {
+        if (!files || files.length === 0) return 'No files selected.';
+        if (files.length === 1) return files[0].webkitRelativePath || files[0].name;
+        const names = Array.from(files).slice(0,6).map(f => f.webkitRelativePath || f.name);
+        return names.join(', ') + (files.length > 6 ? ' …' : '');
+      }
+
+      prodFolderInput.addEventListener('change', () => prodPreview.textContent = summarizeFiles(prodFolderInput.files));
+      prodFileInput.addEventListener('change', () => prodPreview.textContent = summarizeFiles(prodFileInput.files));
+      stageFolderInput.addEventListener('change', () => stagePreview.textContent = summarizeFiles(stageFolderInput.files));
+      stageFileInput.addEventListener('change', () => stagePreview.textContent = summarizeFiles(stageFileInput.files));
+
+      // helper to show inline messages
+      function showMessage(type, text) {
+        const messages = document.getElementById('messages');
+        const div = document.createElement('div');
+        div.className = 'notice';
+        if (type === 'error') div.style.background = '#fee2e2', div.style.borderColor = '#fca5a5', div.style.color = '#991b1b';
+        div.textContent = text;
+        messages.prepend(div);
+        setTimeout(() => { try { div.remove(); } catch (e) {} }, 8000);
+      }
+
+      prodMode.addEventListener('change', () => {
+        const useFolder = prodMode.value === 'folder';
+        prodFolderInput.style.display = useFolder ? 'block' : 'none';
+        prodFileInput.style.display = useFolder ? 'none' : 'block';
+        prodPreview.textContent = 'No files selected.';
+      });
+      stageMode.addEventListener('change', () => {
+        const useFolder = stageMode.value === 'folder';
+        stageFolderInput.style.display = useFolder ? 'block' : 'none';
+        stageFileInput.style.display = useFolder ? 'none' : 'block';
+        stagePreview.textContent = 'No files selected.';
+      });
+
+      // Auto-append when both sides have files selected (no prompts)
+      function bothSidesHaveFiles() {
+        const prodFiles = prodMode.value === 'folder' ? prodFolderInput.files : prodFileInput.files;
+        const stageFiles = stageMode.value === 'folder' ? stageFolderInput.files : stageFileInput.files;
+        return prodFiles && prodFiles.length > 0 && stageFiles && stageFiles.length > 0;
+      }
+
+      function maybeAutoAppend() {
+        if (bothSidesHaveFiles()) {
+          appendPair();
+        }
+      }
+
+      prodFolderInput.addEventListener('change', maybeAutoAppend);
+      prodFileInput.addEventListener('change', maybeAutoAppend);
+      stageFolderInput.addEventListener('change', maybeAutoAppend);
+      stageFileInput.addEventListener('change', maybeAutoAppend);
+
+      prodPick.addEventListener('click', () => {
+        if (prodMode.value === 'folder') prodFolderInput.click(); else prodFileInput.click();
+      });
+      stagePick.addEventListener('click', () => {
+        if (stageMode.value === 'folder') stageFolderInput.click(); else stageFileInput.click();
+      });
+
+      async function appendPair() {
+        appendButton.disabled = true;
+        appendButton.textContent = 'Appending...';
+        const form = new FormData();
+        const prodFiles = prodMode.value === 'folder' ? prodFolderInput.files : prodFileInput.files;
+        const stageFiles = stageMode.value === 'folder' ? stageFolderInput.files : stageFileInput.files;
+        for (const file of prodFiles) {
+          form.append('prod_files', file, file.webkitRelativePath || file.name);
+        }
+        for (const file of stageFiles) {
+          form.append('stage_files', file, file.webkitRelativePath || file.name);
+        }
+        try {
+          const res = await fetch('/append_pair', { method: 'POST', body: form });
+          const data = await res.json();
+          if (!res.ok) {
+            showMessage('error', data.error || 'Failed to append folder pair.');
+            console.error(data.error || 'Failed to append folder pair.');
+            return;
+          }
+          renderQueue(data.queue);
+          showMessage('info', 'Folder pair appended');
+          // Keep the selected folder inputs populated until the user clears the queue
+        } catch (error) {
+          showMessage('error', 'Unable to append folder pair: ' + error.message);
+          console.error('Unable to append folder pair:', error);
+        } finally {
+          appendButton.disabled = false;
+          appendButton.textContent = 'Append';
+        }
+      }
+
+      async function clearQueue() {
+        clearButton.disabled = true;
+        clearButton.textContent = 'Clearing...';
+        try {
+          const res = await fetch('/clear_queue', { method: 'POST' });
+          const data = await res.json();
+          renderQueue(data.queue);
+          // Clear the file inputs only when the queue is cleared
+          prodFolderInput.value = '';
+          prodFileInput.value = '';
+          stageFolderInput.value = '';
+          stageFileInput.value = '';
+          prodPreview.textContent = 'No files selected.';
+          stagePreview.textContent = 'No files selected.';
+        } catch (error) {
+          showMessage('error', 'Unable to clear queue: ' + error.message);
+          console.error('Unable to clear queue:', error);
+        } finally {
+          clearButton.disabled = false;
+          clearButton.textContent = 'Clear queue';
+        }
+      }
+
+      appendButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        appendPair();
+      });
+      clearButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        clearQueue();
+      });
+
+      // search and bulk actions
+      queueSearch.addEventListener('input', async () => {
+        const q = await fetchQueue();
+        renderQueue(q);
+      });
+
+      selectAllFilteredBtn.addEventListener('click', async () => {
+        const q = await fetchQueue();
+        const term = (queueSearch.value || '').toLowerCase().trim();
+        q.forEach(item => {
+          if (!term || item.label.toLowerCase().includes(term) || (item.prod_files||[]).join(' ').toLowerCase().includes(term) || (item.stage_files||[]).join(' ').toLowerCase().includes(term)) {
+            selectedIds.add(item.id);
+          }
+        });
+        renderQueue(q);
+      });
+
+      clearSelectedBtn.addEventListener('click', async () => {
+        selectedIds.clear();
+        const q = await fetchQueue();
+        renderQueue(q);
+      });
+
+      // Prevent validate if queue empty
+      const validateForm = document.querySelector('form[action="{{ url_for('validate') }}"]');
+      if (validateForm) {
+        validateForm.addEventListener('submit', async (ev) => {
+          ev.preventDefault();
+          const q = await fetchQueue();
+          if (!q || q.length === 0) {
+            alert('No appended folder pairs to validate. Please append folders first.');
+            return;
+          }
+          // Disable button and show progress
+          const validateBtn = document.getElementById('validateButton');
+          validateBtn.disabled = true;
+          const progressContainer = document.getElementById('progressContainer');
+          const progressBar = document.getElementById('progressBar');
+          const progressText = document.getElementById('progressText');
+          const progressLabel = document.getElementById('progressLabel');
+          progressContainer.style.display = 'block';
+          progressBar.style.width = '0%';
+          document.getElementById('progressPercent').textContent = '0%';
+          progressText.textContent = '0/0';
+          progressLabel.textContent = 'starting...';
+
+          let pollId = null;
+          function startPolling() {
+            pollId = setInterval(async () => {
+              try {
+                const r = await fetch('/progress');
+                const p = await r.json();
+                const total = p.total || 0;
+                const completed = p.completed || 0;
+                const label = p.current || '';
+                const pct = total ? Math.round((completed / total) * 100) : 0;
+                progressBar.style.width = pct + '%';
+                document.getElementById('progressPercent').textContent = pct + '%';
+                progressText.textContent = `${completed}/${total}`;
+                progressLabel.textContent = label || 'working...';
+                if (p.finished) {
+                  progressBar.classList.remove('animated');
+                  clearInterval(pollId);
+                } else {
+                  progressBar.classList.add('animated');
+                }
+              } catch (err) {
+                // ignore polling errors
+              }
+            }, 1000);
+          }
+
+          startPolling();
+
+          // Post the validate request and wait for response
+          try {
+            const formData = new FormData(validateForm);
+            // include parallel count
+            const parallelSel = document.getElementById('parallelCount');
+            if (parallelSel) formData.append('parallel', parallelSel.value.match(/\d+/)?.[0] || '3');
+            const res = await fetch('/validate', { method: 'POST', body: formData });
+            const contentType = res.headers.get('content-type') || '';
+
+            // ensure final poll update
+            const final = await fetch('/progress');
+            const pfin = await final.json();
+            const pct = pfin.total ? Math.round((pfin.completed / pfin.total) * 100) : 0;
+            progressBar.style.width = pct + '%';
+            document.getElementById('progressPercent').textContent = pct + '%';
+            progressText.textContent = `${pfin.completed}/${pfin.total}`;
+            progressBar.classList.remove('animated');
+
+            if (!res.ok) {
+              let errMsg = 'Validation failed';
+              try { const j = await res.json(); errMsg = j.error || errMsg; } catch (e) {}
+              showMessage('error', errMsg);
+            } else if (contentType.includes('application/json')) {
+              const data = await res.json();
+              progressLabel.textContent = 'done';
+              if (data.report_url) {
+                const container = document.createElement('div');
+                container.className = 'notice';
+                container.innerHTML = `<p><strong>Report generated:</strong></p><p><a class="report-link" href="${data.report_url}">${data.report_name}</a></p>`;
+                validateForm.parentElement.appendChild(container);
+              }
+            } else {
+              // binary response (PDF or ZIP). Create visible download link below the validation area
+              const blob = await res.blob();
+              let filename = 'validation_report';
+              const disp = res.headers.get('content-disposition') || '';
+              const m = disp.match(/filename\*=UTF-8''(.+)|filename="?([^";]+)"?/);
+              if (m) filename = decodeURIComponent(m[1] || m[2]);
+              const url = URL.createObjectURL(blob);
+              // create downloads container if missing
+              let dlArea = document.getElementById('downloads');
+              if (!dlArea) {
+                dlArea = document.createElement('div');
+                dlArea.id = 'downloads';
+                dlArea.style.marginTop = '16px';
+                validateForm.parentElement.appendChild(dlArea);
+              }
+              const entry = document.createElement('div');
+              entry.className = 'notice';
+              entry.innerHTML = `<p><strong>Report ready:</strong> <a class="report-link" href="${url}" download="${filename}">${filename}</a></p>`;
+              dlArea.appendChild(entry);
+              // also trigger automatic download
+              const a = document.createElement('a');
+              a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+              progressLabel.textContent = 'done';
+            }
+          } catch (err) {
+            showMessage('error', 'Validation request failed: ' + err.message);
+            console.error('Validation request failed:', err);
+          } finally {
+            clearInterval(pollId);
+            validateBtn.disabled = false;
+          }
+        });
+      }
+
+      loadQueue();
+    </script>
+  </body>
+</html>
