@@ -474,16 +474,24 @@ def validate():
     if not queue:
         return jsonify(error="No appended folder pairs to validate."), 400
 
-    # Build (prod, stage, label) bundles from the queued folder pairs.
+    # Build (prod, stage, label) bundles from the queued folder pairs. The label
+    # becomes the zip folder name, so each product PDF must be named after its own
+    # folder — not a shared root + index — when one upload holds many products.
     bundles_list = []
     try:
         for item in queue:
             pair_dir = PAIRS_DIR / item["id"]
-            bundles = pair_pdfs(pair_dir / "prod", pair_dir / "stage")
+            prod_dir, stage_dir = pair_dir / "prod", pair_dir / "stage"
+            bundles = pair_pdfs(prod_dir, stage_dir)
             for index, (prod_path, stage_path, detail) in enumerate(bundles, start=1):
-                label = item["label"]
                 if len(bundles) > 1:
-                    label = f"{label}_{index}"
+                    # one report per product: name it after the PDF's immediate
+                    # folder (robust to any wrapper folders in the upload); fall
+                    # back to the filename if the PDFs sit flat in the upload.
+                    folder = Path(prod_path).parent.name
+                    label = folder if folder not in ("prod", "") else Path(prod_path).stem
+                else:
+                    label = item["label"]
                 bundles_list.append((prod_path, stage_path, label))
     except ValueError as exc:
         return jsonify(error=str(exc)), 400

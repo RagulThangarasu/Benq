@@ -632,6 +632,38 @@ def _pctl(vals, q):
 
 
 _FOOTER_NUM_RE = re.compile(r"^\d{1,3}$")
+_BULLET_RE = re.compile(r"^\s*[•▪◦‣∙·\-\*]\s+\S")
+
+
+def check_bullet_paragraph_size(s_all, findings):
+    """Bullet-list text should be the same size as body paragraph text. Flag
+    when bullets are rendered larger than paragraphs."""
+    from collections import Counter
+    bullets = []        # (size, page)
+    para_sizes = []
+    for l in s_all["lines"]:
+        t = l["text"].strip()
+        if len(t) < 6:
+            continue
+        sz = round(l["size"], 1)
+        if _BULLET_RE.match(t):
+            bullets.append((sz, l["page"]))
+        elif len(t) >= 25 and not t.endswith(":"):
+            para_sizes.append(sz)
+    if len(bullets) < 2 or not para_sizes:
+        return
+    b_mode = Counter(sz for sz, _ in bullets).most_common(1)[0][0]
+    p_mode = Counter(para_sizes).most_common(1)[0][0]
+    if b_mode - p_mode > 0.5:
+        pages = sorted({pg for sz, pg in bullets if sz > p_mode + 0.4})
+        plist = ", ".join(str(p) for p in pages[:20]) + (" …" if len(pages) > 20 else "")
+        findings.append(_f(
+            "Bullet vs paragraph size", "Medium", "Bullet text larger than paragraphs", plist,
+            f"Bullets same size as body text (~{p_mode}pt)",
+            f"Bullets ~{b_mode}pt vs paragraphs ~{p_mode}pt",
+            f"Bullet-list text is {round(b_mode - p_mode, 1)}pt larger than the body "
+            f"paragraph text ({b_mode}pt vs {p_mode}pt).",
+            f"Set bullet text to the paragraph size (~{p_mode}pt)."))
 
 
 def check_footer_alignment(s_all, findings):
@@ -1001,6 +1033,7 @@ def validate_style(prod_path, stage_path):
     check_image_position(geo, findings)
     check_table_layout(s_all, findings)
     check_footer_alignment(s_all, findings)
+    check_bullet_paragraph_size(s_all, findings)
     check_wrapped_text_padding(geo, findings)
     check_hyperlinks(geo, p_all, s_all, findings)
     check_underline(s_all, findings)
@@ -1014,7 +1047,7 @@ def validate_style(prod_path, stage_path):
 CATEGORY_ORDER = [
     "Image position", "Space above image", "Heading style", "Paragraph spacing",
     "Text colour", "Info / notice colour", "Table layout breaking", "Wrapped text padding",
-    "Footer page number", "Hyperlink issue", "Underline to remove",
+    "Footer page number", "Bullet vs paragraph size", "Hyperlink issue", "Underline to remove",
 ]
 SEV_COLOR = {"High": colors.HexColor("#c62828"),
              "Medium": colors.HexColor("#e65100"),
