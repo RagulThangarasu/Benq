@@ -72,6 +72,10 @@ def _emit(frac, msg=""):
             pass
 
 _INT_RE          = re.compile(r"^\d{1,3}$")
+# Numbered procedure-step bookmarks ("1. Attach the monitor base.") — STAGE
+# bookmarks individual steps that PROD keeps in body text. They are not section
+# discrepancies, so they're excluded from the "Extra in Stage" TOC list.
+_STEP_BOOKMARK_RE = re.compile(r"^\s*\d{1,2}\s*[.)]\s+\S")
 _PAGE_REF_RE     = re.compile(
     r"\b(?:on|see)\s+pages?\s+\d+(?:\s*[-–]\s*\d+)?\.?", re.IGNORECASE)
 _NAV_INLINE_RE   = re.compile(r"\b\d{1,2}\b")
@@ -1488,7 +1492,8 @@ def _image_context(doc, pno: int, xref: int):
     return img_name, context
 
 
-def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower):
+def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
+                     stage_section_lower=""):
     """Return (coverage_pct, [missing_fragment_str, ...]).
 
     Uses shingle windows to detect which PROD words are covered by STAGE text.
@@ -1570,6 +1575,20 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower):
                                 w in stage_full_lower for w in alpha_words
                             ):
                                 reported = False
+
+                    # 3) Reordered *within the same STAGE section*: every
+                    #    distinctive word (>=4 Latin letters) of the fragment is
+                    #    present in this section's text, so the content exists —
+                    #    just in a different word order (e.g. a hyperlink phrase
+                    #    "See USB-C Configuration for…" vs PROD "See for USB-C
+                    #    Configuration on page N", or a re-laid-out list).
+                    #    Section-scoped (not document-wide) so genuinely dropped
+                    #    content — whose words are absent from THIS section even
+                    #    if they occur elsewhere — is still reported.
+                    if reported and stage_section_lower:
+                        dwords = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", frag_text)]
+                        if dwords and all(w in stage_section_lower for w in dwords):
+                            reported = False
 
                     if reported:
                         frags.append(frag_text)
@@ -2362,13 +2381,20 @@ def validate(prod_path, stage_path, report_path):
                 "prod_page": pg, "stage_page": "-",
                 "toc_status": "Missing in Stage",
             })
+    n_step_bookmarks = 0
     for lvl, title, pg in stage_toc:
         if _norm_key(title) not in prod_keys:
+            # Skip numbered procedure-step bookmarks — not real extra sections.
+            if _STEP_BOOKMARK_RE.match(title or ""):
+                n_step_bookmarks += 1
+                continue
             toc_results.append({
                 "title": title, "level": lvl,
                 "prod_page": "-", "stage_page": pg,
                 "toc_status": "Extra in Stage",
             })
+    if n_step_bookmarks:
+        print(f"  (excluded {n_step_bookmarks} numbered step bookmarks from Extra in Stage)")
 
     n_m = sum(1 for r in toc_results if r["toc_status"] == "Match")
     n_mi = sum(1 for r in toc_results if r["toc_status"] == "Missing in Stage")
@@ -2444,7 +2470,8 @@ def validate(prod_path, stage_path, report_path):
         # Also try stage by matching key in case titles differ slightly
         sc    = stage_sections.get(title) or stage_lookup.get(key) or ""
         coverage, missing = _section_missing(
-            prod_words, stage_ns, stage_cset, stage_full_lower)
+            prod_words, stage_ns, stage_cset, stage_full_lower,
+            stage_section_lower=(sc or "").lower())
 
         status = "Pass" if not missing else "Fail"
         content_results.append({

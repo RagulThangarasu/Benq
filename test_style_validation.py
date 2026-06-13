@@ -17,8 +17,24 @@ sys.path.insert(0, os.path.join(HERE, "content_validation"))
 
 from style_validation import validate_style, main, CATEGORY_ORDER  # noqa: E402
 
-PROD = os.path.join(HERE, "PDF", "prod", "SW272_EN.pdf")
-STAGE = os.path.join(HERE, "PDF", "stage", "sw272_en_v5.pdf")
+import glob
+
+
+def _find_pdf(side, prefer):
+    """Locate the sample PDF under PDF/<side>/ even if it's nested in subfolders
+    (the sample tree gets reorganised when testing folder-pair uploads)."""
+    direct = os.path.join(HERE, "PDF", side, prefer)
+    if os.path.exists(direct):
+        return direct
+    hits = glob.glob(os.path.join(HERE, "PDF", side, "**", "*.pdf"), recursive=True)
+    for h in hits:
+        if "sw272" in os.path.basename(h).lower():
+            return h
+    return hits[0] if hits else direct
+
+
+PROD = _find_pdf("prod", "SW272_EN.pdf")
+STAGE = _find_pdf("stage", "sw272_en_v5.pdf")
 
 REQUIRED_KEYS = {"category", "severity", "topic", "pages", "expected",
                  "actual", "issue", "fix"}
