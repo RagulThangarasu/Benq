@@ -11,7 +11,7 @@ WORKDIR /app
 
 # copy requirements first for caching
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 
 # copy app
 COPY . /app
