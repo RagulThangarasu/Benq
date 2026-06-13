@@ -35,9 +35,16 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
 )
 
-from .validate_toc_content import (
-    get_toc, _norm_key, _toc_ranges_by_key, _doc_body_size, _style_class_rel,
-)
+# Works both as a package submodule (content_validation.style_validation) and
+# when run_validator.py / the tests import this file as a top-level module.
+try:
+    from .validate_toc_content import (
+        get_toc, _norm_key, _toc_ranges_by_key, _doc_body_size, _style_class_rel,
+    )
+except ImportError:
+    from validate_toc_content import (
+        get_toc, _norm_key, _toc_ranges_by_key, _doc_body_size, _style_class_rel,
+    )
 
 NOTICE_RE = re.compile(r"\b(NOTE|TIP|IMPORTANT|WARNING|CAUTION|INFO)\b", re.IGNORECASE)
 

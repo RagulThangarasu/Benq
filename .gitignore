@@ -6,3 +6,7 @@
 __pycache__/
 .pytest_cache/
 .DS_Store
+
+# Runtime artifacts (uploads, generated reports, progress/queue state)
+tmp_uploads/
+reports/

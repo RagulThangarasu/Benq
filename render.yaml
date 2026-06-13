@@ -5,7 +5,13 @@ services:
     plan: free
     region: oregon
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app -b 0.0.0.0:$PORT
-    routes:
-      - type: web
+    # 1 worker keeps the in-memory progress store shared; multiple THREADS let
+    # /progress polls be served while /validate runs a long job in another
+    # thread. A long --timeout stops gunicorn killing the worker mid-job.
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 600 --graceful-timeout 30 -b 0.0.0.0:$PORT
     healthCheckPath: /
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: VALIDATOR_MAX_PARALLEL
+        value: "1"

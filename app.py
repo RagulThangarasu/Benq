@@ -36,15 +36,20 @@ app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
 app.config["REPORTS_DIR"] = str(REPORTS_DIR)
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
+# Make the content_validation package importable. The actual validation runs in
+# a subprocess (run_validator.py), so these top-level imports are only a warm-up
+# / availability check — never let them crash app startup, or the whole service
+# fails its health check and the site goes down.
+sys.path.insert(0, str(BASE_DIR / "content_validation"))
 try:
-    from content_validation import style_validation
-    from content_validation import validate_toc_content
-except ImportError:
-    import sys
+    from content_validation import style_validation  # noqa: F401
+    from content_validation import validate_toc_content  # noqa: F401
+except Exception as _imp_exc:  # pragma: no cover
+    print(f"[startup] content_validation import warning: {_imp_exc}", flush=True)
 
-    sys.path.insert(0, str(BASE_DIR / "content_validation"))
-    from content_validation import style_validation
-    from content_validation import validate_toc_content
+# Free-tier memory is tight (~512 MB); each parallel job is a full PyMuPDF
+# subprocess. Cap concurrency via env so we don't OOM-kill the worker.
+MAX_PARALLEL = max(1, int(os.environ.get("VALIDATOR_MAX_PARALLEL", "1")))
 
 
 def allowed_file(filename: str) -> bool:
@@ -77,6 +82,12 @@ def write_progress(data: dict) -> None:
 
 def read_progress() -> dict:
     return dict(PROGRESS_STORE)
+
+
+@app.route("/progress", methods=["GET"])
+def progress_endpoint():
+    """Return the current in-memory progress as JSON for frontend polling."""
+    return jsonify(read_progress())
 
 
 def build_report_name(mode: str, label: str) -> str:
@@ -237,7 +248,8 @@ def validate():
         return jsonify(error=str(exc)), 400
 
     total = len(bundles_list) * (2 if mode == "both" else 1)
-    progress = {"total": total, "completed": 0, "current": None, "reports": [], "finished": False}
+    progress = {"total": total, "completed": 0, "current": None, "reports": [],
+                "finished": False, "errors": []}
     write_progress(progress)
 
     temp_files = []  # list of (path, download_name)
@@ -250,13 +262,13 @@ def validate():
         if mode in ("style", "both"):
             tasks.append(("style", prod_path, stage_path, label))
 
-    # concurrency controlled by form field 'parallel' (int)
+    # concurrency requested by the form, but hard-capped by MAX_PARALLEL so the
+    # free-tier worker is never OOM-killed by too many PyMuPDF subprocesses.
     try:
-        parallel = int(request.form.get('parallel', request.form.get('parallelCount', 3)))
-        if parallel < 1:
-            parallel = 1
+        parallel = int(request.form.get('parallel', request.form.get('parallelCount', 1)))
     except Exception:
-        parallel = 3
+        parallel = 1
+    parallel = max(1, min(parallel, MAX_PARALLEL))
 
     # run tasks using subprocesses to enable true parallelism and allow cancellation
     futures = []
@@ -308,13 +320,31 @@ def validate():
                 data = open(outpath, 'rb').read()
             except Exception:
                 data = b''
-            if len(data) > 1024 and not CANCELLED:
+
+            rc = proc.returncode
+            if len(data) > 1024 and rc == 0 and not CANCELLED:
                 temp_files.append((outpath, build_report_name(mode_task, label), data))
             else:
                 try:
                     os.unlink(outpath)
                 except Exception:
                     pass
+                # Surface WHY a job produced no report instead of hiding it. The
+                # subprocess stderr is the real error (missing dep, crash, OOM…).
+                if not CANCELLED:
+                    err_tail = ""
+                    try:
+                        err_tail = (stderr or b"").decode("utf-8", "replace").strip()
+                        err_tail = err_tail[-1500:]
+                    except Exception:
+                        pass
+                    msg = (f"{mode_task} validation failed for '{label}' "
+                           f"(exit code {rc}).")
+                    if err_tail:
+                        msg += f"\n{err_tail}"
+                    print(f"[validate] {msg}", flush=True)
+                    progress['errors'] = progress.get('errors', [])
+                    progress['errors'].append(msg)
             progress['completed'] += 1
             write_progress(progress)
 
@@ -322,9 +352,12 @@ def validate():
     progress['finished'] = True
     write_progress(progress)
 
-    # If no reports generated, inform the client
+    # If no reports generated, report the underlying errors (not a generic msg)
     if not temp_files:
-        return jsonify(error="No validation reports were generated (empty or no content)."), 422
+        errs = progress.get('errors') or []
+        detail = (" Details: " + " | ".join(errs)) if errs else ""
+        return jsonify(error="No validation reports were generated." + detail,
+                       errors=errs), 422
 
     # Deduplicate by content hash and prepare download
     import hashlib
@@ -397,11 +430,6 @@ def cancel():
 @app.route("/reports/<path:filename>")
 def download_report(filename: str):
     return send_from_directory(app.config["REPORTS_DIR"], filename, as_attachment=True)
-
-
-@app.route('/progress', methods=['GET'])
-def progress():
-    return jsonify(read_progress())
 
 
 if __name__ == "__main__":
