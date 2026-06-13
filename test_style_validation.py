@@ -71,6 +71,15 @@ def test_info_callout_icon_and_text_checked(findings):
     assert any("#333333" in f["actual"] for f in info)
 
 
+def test_footer_alignment_checked(findings):
+    """Footer page numbers not right-aligned are flagged as an issue."""
+    foot = [f for f in findings if f["category"] == "Footer page number"]
+    assert foot, "footer alignment not checked"
+    # the sample PDFs use centre-aligned footers; expect a centre finding
+    assert any("centre" in f["topic"].lower() or "left" in f["topic"].lower() for f in foot)
+    assert all("right-align" in f["fix"].lower() for f in foot)
+
+
 def test_underlined_links_detected(findings):
     u = [f for f in findings if f["category"] == "Underline to remove"]
     assert u, "underlined text/links not detected"

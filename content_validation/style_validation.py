@@ -631,6 +631,62 @@ def _pctl(vals, q):
     return s[min(len(s) - 1, max(0, int(q * (len(s) - 1))))]
 
 
+_FOOTER_NUM_RE = re.compile(r"^\d{1,3}$")
+
+
+def check_footer_alignment(s_all, findings):
+    """Footer page numbers should be right-aligned. Flag pages where the number
+    is left- or centre-aligned instead (grouped, one finding per alignment)."""
+    lines = s_all["lines"]
+    body_x0 = [l["rect"].x0 for l in lines if len(l["text"]) >= 20]
+    body_x1 = [l["rect"].x1 for l in lines if len(l["text"]) >= 20]
+    if not body_x0 or not body_x1:
+        return
+    left = _pctl(body_x0, 0.10)          # content left margin
+    right = _pctl(body_x1, 0.90)         # content right margin
+    centre = (left + right) / 2.0
+    tol = max(18.0, (right - left) * 0.12)
+
+    # one footer number per page: a pure-digit line nearest the page bottom
+    cand = {}
+    for l in lines:
+        r = l["rect"]
+        if r.y0 <= l["ph"] - 55:
+            continue
+        if not _FOOTER_NUM_RE.match(l["text"].strip()):
+            continue
+        pg = l["page"]
+        if pg not in cand or r.y0 > cand[pg].y0:
+            cand[pg] = r
+
+    by_align = {"left": [], "centre": [], "other": []}
+    for pg, r in cand.items():
+        cx = (r.x0 + r.x1) / 2.0
+        if abs(r.x1 - right) < tol and r.x0 > centre:
+            align = "right"
+        elif abs(r.x0 - left) < tol and r.x1 < centre:
+            align = "left"
+        elif abs(cx - centre) < tol:
+            align = "centre"
+        else:
+            align = "other"
+        if align != "right":
+            by_align[align].append(pg)
+
+    for align, pages in by_align.items():
+        if not pages:
+            continue
+        pages = sorted(set(pages))
+        plist = ", ".join(str(p) for p in pages[:20]) + (" …" if len(pages) > 20 else "")
+        findings.append(_f(
+            "Footer page number", "Medium", f"Footer ({align}-aligned)", plist,
+            "Page number right-aligned",
+            f"{align.capitalize()}-aligned on {len(pages)} page(s)",
+            f"The footer page number is {align}-aligned on {len(pages)} page(s) "
+            f"instead of right-aligned.",
+            "Right-align the footer page number on these pages."))
+
+
 def check_table_layout(s_all, findings):
     """STAGE table/layout defects (a table continuing onto the next page is fine):
 
@@ -944,6 +1000,7 @@ def validate_style(prod_path, stage_path):
     check_space_above_image(geo, findings)
     check_image_position(geo, findings)
     check_table_layout(s_all, findings)
+    check_footer_alignment(s_all, findings)
     check_wrapped_text_padding(geo, findings)
     check_hyperlinks(geo, p_all, s_all, findings)
     check_underline(s_all, findings)
@@ -957,7 +1014,7 @@ def validate_style(prod_path, stage_path):
 CATEGORY_ORDER = [
     "Image position", "Space above image", "Heading style", "Paragraph spacing",
     "Text colour", "Info / notice colour", "Table layout breaking", "Wrapped text padding",
-    "Hyperlink issue", "Underline to remove",
+    "Footer page number", "Hyperlink issue", "Underline to remove",
 ]
 SEV_COLOR = {"High": colors.HexColor("#c62828"),
              "Medium": colors.HexColor("#e65100"),
