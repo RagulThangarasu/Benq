@@ -468,100 +468,88 @@
           progressLabel.textContent = 'starting...';
 
           let pollId = null;
-          function startPolling() {
-            pollId = setInterval(async () => {
-              try {
-                const r = await fetch('/progress');
-                const p = await r.json();
-                const total = p.total || 0;
-                const completed = p.completed || 0;
-                const label = p.current || '';
-                // prefer the backend's fine-grained pct (advances during a job);
-                // fall back to completed/total for older responses.
-                const pct = (p.pct !== undefined && p.pct !== null)
-                  ? p.pct
-                  : (total ? Math.round((completed / total) * 100) : 0);
-                progressBar.style.width = pct + '%';
-                document.getElementById('progressPercent').textContent = pct + '%';
-                progressText.textContent = `${completed}/${total}`;
-                progressLabel.textContent = label || 'working...';
-                if (p.finished) {
-                  progressBar.classList.remove('animated');
-                  clearInterval(pollId);
-                } else {
-                  progressBar.classList.add('animated');
+          // Poll /progress until the background job reports finished; resolves
+          // with the final progress object.
+          function pollUntilDone() {
+            return new Promise((resolve) => {
+              pollId = setInterval(async () => {
+                try {
+                  const r = await fetch('/progress');
+                  if (!r.ok) return;                // transient (e.g. cold start)
+                  const p = await r.json();
+                  const total = p.total || 0;
+                  const completed = p.completed || 0;
+                  const pct = (p.pct !== undefined && p.pct !== null)
+                    ? p.pct
+                    : (total ? Math.round((completed / total) * 100) : 0);
+                  progressBar.style.width = pct + '%';
+                  document.getElementById('progressPercent').textContent = pct + '%';
+                  progressText.textContent = `${completed}/${total}`;
+                  progressLabel.textContent = p.current || 'working...';
+                  if (p.finished) {
+                    progressBar.classList.remove('animated');
+                    clearInterval(pollId); pollId = null;
+                    resolve(p);
+                  } else {
+                    progressBar.classList.add('animated');
+                  }
+                } catch (err) {
+                  // ignore transient polling errors; keep polling
                 }
-              } catch (err) {
-                // ignore polling errors
-              }
-            }, 1000);
+              }, 1000);
+            });
           }
 
-          startPolling();
-
-          // Post the validate request and wait for response
           try {
             const formData = new FormData(validateForm);
-            // include parallel count
-            const parallelSel = document.getElementById('parallelCount');
-            if (parallelSel) formData.append('parallel', parallelSel.value.match(/\d+/)?.[0] || '3');
+            // 1) Kick off the job — returns immediately (work runs in background).
             const res = await fetch('/validate', { method: 'POST', body: formData });
-            const contentType = res.headers.get('content-type') || '';
-
-            // ensure final poll update
-            const final = await fetch('/progress');
-            const pfin = await final.json();
-            const pct = (pfin.pct !== undefined && pfin.pct !== null)
-              ? pfin.pct
-              : (pfin.total ? Math.round((pfin.completed / pfin.total) * 100) : 0);
-            progressBar.style.width = pct + '%';
-            document.getElementById('progressPercent').textContent = pct + '%';
-            progressText.textContent = `${pfin.completed}/${pfin.total}`;
-            progressBar.classList.remove('animated');
-
             if (!res.ok) {
               let errMsg = 'Validation failed';
               try { const j = await res.json(); errMsg = j.error || errMsg; } catch (e) {}
               showMessage('error', errMsg);
-            } else if (contentType.includes('application/json')) {
-              const data = await res.json();
-              progressLabel.textContent = 'done';
-              if (data.report_url) {
-                const container = document.createElement('div');
-                container.className = 'notice';
-                container.innerHTML = `<p><strong>Report generated:</strong></p><p><a class="report-link" href="${data.report_url}">${data.report_name}</a></p>`;
-                validateForm.parentElement.appendChild(container);
-              }
-            } else {
-              // binary response (PDF or ZIP). Create visible download link below the validation area
-              const blob = await res.blob();
-              let filename = 'validation_report';
-              const disp = res.headers.get('content-disposition') || '';
-              const m = disp.match(/filename\*=UTF-8''(.+)|filename="?([^";]+)"?/);
-              if (m) filename = decodeURIComponent(m[1] || m[2]);
-              const url = URL.createObjectURL(blob);
-              // create downloads container if missing
-              let dlArea = document.getElementById('downloads');
-              if (!dlArea) {
-                dlArea = document.createElement('div');
-                dlArea.id = 'downloads';
-                dlArea.style.marginTop = '16px';
-                validateForm.parentElement.appendChild(dlArea);
-              }
-              const entry = document.createElement('div');
-              entry.className = 'notice';
-              entry.innerHTML = `<p><strong>Report ready:</strong> <a class="report-link" href="${url}" download="${filename}">${filename}</a></p>`;
-              dlArea.appendChild(entry);
-              // also trigger automatic download
-              const a = document.createElement('a');
-              a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
-              progressLabel.textContent = 'done';
+              return;
             }
+            // 2) Watch progress until the job finishes.
+            const pfin = await pollUntilDone();
+            if (pfin.errors && pfin.errors.length) {
+              showMessage('error', 'Validation failed: ' + pfin.errors.join(' | '));
+              progressLabel.textContent = 'failed';
+              return;
+            }
+            // 3) Download the finished report (PDF or ZIP).
+            const rr = await fetch('/result');
+            if (!rr.ok) {
+              let em = 'No report was generated';
+              try { const j = await rr.json(); em = (j.errors && j.errors.length) ? j.errors.join(' | ') : (j.error || em); } catch (e) {}
+              showMessage('error', em);
+              return;
+            }
+            const blob = await rr.blob();
+            let filename = 'validation_report.pdf';
+            const disp = rr.headers.get('content-disposition') || '';
+            const m = disp.match(/filename\*=UTF-8''(.+)|filename="?([^";]+)"?/);
+            if (m) filename = decodeURIComponent(m[1] || m[2]);
+            const url = URL.createObjectURL(blob);
+            let dlArea = document.getElementById('downloads');
+            if (!dlArea) {
+              dlArea = document.createElement('div');
+              dlArea.id = 'downloads';
+              dlArea.style.marginTop = '16px';
+              validateForm.parentElement.appendChild(dlArea);
+            }
+            const entry = document.createElement('div');
+            entry.className = 'notice';
+            entry.innerHTML = `<p><strong>Report ready:</strong> <a class="report-link" href="${url}" download="${filename}">${filename}</a></p>`;
+            dlArea.appendChild(entry);
+            const a = document.createElement('a');
+            a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+            progressLabel.textContent = 'done';
           } catch (err) {
             showMessage('error', 'Validation request failed: ' + err.message);
             console.error('Validation request failed:', err);
           } finally {
-            clearInterval(pollId);
+            if (pollId) { clearInterval(pollId); pollId = null; }
             validateBtn.disabled = false;
           }
         });

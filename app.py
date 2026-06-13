@@ -1,9 +1,13 @@
+import gc
+import hashlib
 import json
 import os
 import re
 import shutil
 import threading
+import traceback
 import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +27,14 @@ REPORTS_DIR = BASE_DIR / "reports"
 ALLOWED_EXTENSIONS = {"pdf"}
 PROGRESS_FILE = REPORTS_DIR / "progress.json"
 # In-memory progress store to avoid writing progress to disk
-PROGRESS_STORE: dict = {"total": 0, "completed": 0, "current": None, "reports": [], "finished": False}
+PROGRESS_STORE: dict = {"total": 0, "completed": 0, "current": None, "reports": [],
+                        "finished": True, "errors": [], "pct": 0}
+PROG_LOCK = threading.Lock()
+# background job control
+JOB_LOCK = threading.Lock()
+JOB_THREAD = None
+# finished report held in memory for /result download
+LAST_RESULT: dict = {"data": None, "name": None, "mime": None}
 # track running subprocesses for cancellation
 RUNNING_PROCS: list = []
 # cancellation flag
@@ -223,6 +234,123 @@ def clear_queue():
     return jsonify(queue=[])
 
 
+class _Cancelled(Exception):
+    pass
+
+
+def _safe_unlink(p):
+    try:
+        os.unlink(p)
+    except Exception:
+        pass
+
+
+def _run_jobs(tasks):
+    """Run validation tasks IN-PROCESS, sequentially, in a background thread.
+
+    Why in-process (not a subprocess): a subprocess loads a *second* full
+    Python + PyMuPDF interpreter on top of the gunicorn worker, and on the
+    512 MB free tier that double footprint gets OOM-killed → 502s on every
+    request (even /progress). Running in this worker keeps a single PyMuPDF
+    copy; sequential + gc.collect() bounds peak memory to one validation.
+    Running in a background thread keeps /validate from blocking the worker, so
+    /progress and /result stay responsive throughout.
+    """
+    n = len(tasks)
+    produced = []  # (download_name, bytes)
+    try:
+        for i, (mode_task, prod_path, stage_path, label) in enumerate(tasks):
+            if CANCELLED:
+                break
+            base, span = i / n, 1.0 / n
+
+            def cb(frac, msg="", _b=base, _s=span, _i=i, _m=mode_task, _l=label):
+                if CANCELLED:
+                    raise _Cancelled()
+                with PROG_LOCK:
+                    PROGRESS_STORE["pct"] = int(round((_b + _s * frac) * 100))
+                    PROGRESS_STORE["completed"] = _i + (1 if frac >= 1.0 else 0)
+                    PROGRESS_STORE["current"] = (f"{_m}: {_l} — {msg}" if msg
+                                                 else f"{_m}: {_l}")
+
+            tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            tf.close()
+            outpath = tf.name
+            try:
+                if mode_task == "style":
+                    style_validation.set_progress_callback(cb)
+                    style_validation.main(str(prod_path), str(stage_path), outpath)
+                else:
+                    validate_toc_content.set_progress_callback(cb)
+                    validate_toc_content.validate(str(prod_path), str(stage_path), outpath)
+            except _Cancelled:
+                _safe_unlink(outpath)
+                break
+            except Exception:
+                tb = traceback.format_exc()
+                last = tb.strip().splitlines()[-1] if tb.strip() else "unknown error"
+                print(f"[validate] {mode_task} failed for '{label}':\n{tb}", flush=True)
+                with PROG_LOCK:
+                    PROGRESS_STORE["errors"].append(
+                        f"{mode_task} validation failed for '{label}': {last}")
+                _safe_unlink(outpath)
+                continue
+            finally:
+                style_validation.set_progress_callback(None)
+                validate_toc_content.set_progress_callback(None)
+                gc.collect()
+
+            try:
+                data = open(outpath, "rb").read()
+            except Exception:
+                data = b""
+            _safe_unlink(outpath)
+            if len(data) > 1024:
+                produced.append((build_report_name(mode_task, label), data))
+            with PROG_LOCK:
+                PROGRESS_STORE["completed"] = i + 1
+                PROGRESS_STORE["pct"] = int(round((i + 1) / n * 100)) if n else 100
+    finally:
+        _finalize_result(produced)
+        with PROG_LOCK:
+            PROGRESS_STORE["finished"] = True
+            if not CANCELLED:
+                PROGRESS_STORE["pct"] = 100
+            PROGRESS_STORE["current"] = "cancelled" if CANCELLED else "done"
+
+
+def _finalize_result(produced):
+    """De-dup identical reports and stash a single PDF (or a zip) for /result."""
+    seen, items, name_counts = set(), [], {}
+    for name, data in produced:
+        h = hashlib.sha256(data).hexdigest()
+        if h in seen:
+            continue
+        seen.add(h)
+        if name in name_counts:
+            name_counts[name] += 1
+            root, ext = os.path.splitext(name)
+            name = f"{root}_{name_counts[name]}{ext}"
+        else:
+            name_counts[name] = 1
+        items.append((name, data))
+
+    if not items:
+        LAST_RESULT.update({"data": None, "name": None, "mime": None})
+    elif len(items) == 1:
+        name, data = items[0]
+        LAST_RESULT.update({"data": data, "name": name, "mime": "application/pdf"})
+    else:
+        zip_bio = io.BytesIO()
+        with zipfile.ZipFile(zip_bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, data in items:
+                zf.writestr(name, data)
+        LAST_RESULT.update({
+            "data": zip_bio.getvalue(),
+            "name": f"validation_reports_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            "mime": "application/zip"})
+
+
 @app.route("/validate", methods=["POST"])
 def validate():
     mode = request.form.get("mode")
@@ -233,14 +361,12 @@ def validate():
     if not queue:
         return jsonify(error="No appended folder pairs to validate."), 400
 
-    # Prepare bundles and total work count
-    bundles_list = []  # list of tuples (prod_path, stage_path, label)
+    # Build (prod, stage, label) bundles from the queued folder pairs.
+    bundles_list = []
     try:
         for item in queue:
             pair_dir = PAIRS_DIR / item["id"]
-            prod_dir = pair_dir / "prod"
-            stage_dir = pair_dir / "stage"
-            bundles = pair_pdfs(prod_dir, stage_dir)
+            bundles = pair_pdfs(pair_dir / "prod", pair_dir / "stage")
             for index, (prod_path, stage_path, detail) in enumerate(bundles, start=1):
                 label = item["label"]
                 if len(bundles) > 1:
@@ -249,14 +375,7 @@ def validate():
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
 
-    total = len(bundles_list) * (2 if mode == "both" else 1)
-    progress = {"total": total, "completed": 0, "current": None, "reports": [],
-                "finished": False, "errors": []}
-    write_progress(progress)
-
-    temp_files = []  # list of (path, download_name)
-
-    # Create a list of tasks (mode, prod, stage, label)
+    # Expand into per-mode tasks.
     tasks = []
     for (prod_path, stage_path, label) in bundles_list:
         if mode in ("content", "both"):
@@ -264,186 +383,45 @@ def validate():
         if mode in ("style", "both"):
             tasks.append(("style", prod_path, stage_path, label))
 
-    # concurrency requested by the form, but hard-capped by MAX_PARALLEL so the
-    # free-tier worker is never OOM-killed by too many PyMuPDF subprocesses.
-    try:
-        parallel = int(request.form.get('parallel', request.form.get('parallelCount', 1)))
-    except Exception:
-        parallel = 1
-    parallel = max(1, min(parallel, MAX_PARALLEL))
+    global JOB_THREAD, CANCELLED
+    with JOB_LOCK:
+        if JOB_THREAD is not None and JOB_THREAD.is_alive():
+            return jsonify(error="A validation run is already in progress."), 409
+        CANCELLED = False
+        LAST_RESULT.update({"data": None, "name": None, "mime": None})
+        with PROG_LOCK:
+            PROGRESS_STORE.update({"total": len(tasks), "completed": 0,
+                                   "current": "starting…", "reports": [],
+                                   "finished": False, "errors": [], "pct": 0})
+        JOB_THREAD = threading.Thread(target=_run_jobs, args=(tasks,), daemon=True)
+        JOB_THREAD.start()
 
-    # Each task runs as a subprocess whose stdout we STREAM line-by-line, parsing
-    # "@@PROGRESS:<frac>:<msg>@@" markers so the bar advances *during* a job
-    # (per page parsed), not just 0→100% at the end. Per-task fractions are
-    # summed into an overall percentage.
-    global CANCELLED
-    CANCELLED = False
-    n_tasks = len(tasks)
-    task_frac = [0.0] * n_tasks
-    prog_lock = threading.Lock()
-    PROG_RE = re.compile(r"@@PROGRESS:([0-9.]+):([^@]*)@@")
+    # Return immediately; the browser polls /progress, then GETs /result.
+    return jsonify(started=True, total=len(tasks))
 
-    def refresh(current=None):
-        with prog_lock:
-            done = sum(1 for f in task_frac if f >= 1.0)
-            overall = (sum(task_frac) / n_tasks) if n_tasks else 1.0
-            progress['completed'] = done
-            progress['pct'] = int(round(overall * 100))
-            if current is not None:
-                progress['current'] = current
-            write_progress(progress)
 
-    results = [None] * n_tasks   # (outpath, returncode, err_tail)
-
-    def run_task(i, mode_task, prod_path, stage_path, label):
-        tf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-        tf.close()
-        cmd = [sys.executable, str(BASE_DIR / 'run_validator.py'),
-               mode_task, str(prod_path), str(stage_path), tf.name]
-        errf = tempfile.NamedTemporaryFile(suffix='.log', delete=False, mode='w+')
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
-                                    text=True, bufsize=1)
-        except Exception as exc:
-            errf.close()
-            results[i] = (tf.name, -1, f"could not start: {exc}")
-            task_frac[i] = 1.0
-            refresh()
-            return
-        RUNNING_PROCS.append(proc)
-        refresh(f"{mode_task}: {label}")
-        try:
-            for line in proc.stdout:          # streams as the job runs
-                m = PROG_RE.search(line)
-                if m:
-                    task_frac[i] = float(m.group(1))
-                    refresh(f"{mode_task}: {label} — {m.group(2).strip()}")
-        except Exception:
-            pass
-        proc.wait()
-        errf.seek(0)
-        err_tail = errf.read()[-1500:].strip()
-        errf.close()
-        try:
-            os.unlink(errf.name)
-        except Exception:
-            pass
-        try:
-            RUNNING_PROCS.remove(proc)
-        except Exception:
-            pass
-        task_frac[i] = 1.0
-        results[i] = (tf.name, proc.returncode, err_tail)
-        refresh()
-
-    with ThreadPoolExecutor(max_workers=parallel) as exc:
-        futs = [exc.submit(run_task, i, *task) for i, task in enumerate(tasks)]
-        for _ in as_completed(futs):
-            pass
-
-    # collect outputs
-    for i, task in enumerate(tasks):
-        mode_task, _p, _s, label = task
-        res = results[i]
-        if res is None:
-            continue
-        outpath, rc, err_tail = res
-        try:
-            data = open(outpath, 'rb').read()
-        except Exception:
-            data = b''
-        if len(data) > 1024 and rc == 0 and not CANCELLED:
-            temp_files.append((outpath, build_report_name(mode_task, label), data))
-        else:
-            try:
-                os.unlink(outpath)
-            except Exception:
-                pass
-            if not CANCELLED:
-                msg = f"{mode_task} validation failed for '{label}' (exit code {rc})."
-                if err_tail:
-                    msg += f"\n{err_tail}"
-                print(f"[validate] {msg}", flush=True)
-                progress['errors'].append(msg)
-                write_progress(progress)
-
-    # finished generating reports
-    progress['finished'] = True
-    write_progress(progress)
-
-    # If no reports generated, report the underlying errors (not a generic msg)
-    if not temp_files:
-        errs = progress.get('errors') or []
-        detail = (" Details: " + " | ".join(errs)) if errs else ""
-        return jsonify(error="No validation reports were generated." + detail,
-                       errors=errs), 422
-
-    # Deduplicate by content hash and prepare download
-    import hashlib
-    unique = {}
-    name_counts = {}
-    for pth, dname, data in temp_files:
-        h = hashlib.sha256(data).hexdigest()
-        if h in unique:
-            # duplicate content, skip
-            try:
-                os.unlink(pth)
-            except Exception:
-                pass
-            continue
-        # ensure unique filename if same name appears
-        base = dname
-        if base in name_counts:
-            name_counts[base] += 1
-            base = f"{os.path.splitext(dname)[0]}_{name_counts[dname]}{os.path.splitext(dname)[1]}"
-        else:
-            name_counts[base] = 1
-        unique[h] = (pth, base, data)
-
-    items = list(unique.values())
-    if len(items) == 1:
-        pth, dname, data = items[0]
-        try:
-            os.unlink(pth)
-        except Exception:
-            pass
-        bio = io.BytesIO(data)
-        bio.seek(0)
-        return send_file(bio, mimetype='application/pdf', as_attachment=True, download_name=dname)
-
-    # multiple unique files -> zip in-memory
-    zip_bio = io.BytesIO()
-    import zipfile
-    with zipfile.ZipFile(zip_bio, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for pth, dname, data in items:
-            zf.writestr(dname, data)
-    # cleanup temp files
-    for pth, _, _ in temp_files:
-        try:
-            os.unlink(pth)
-        except Exception:
-            pass
-    zip_bio.seek(0)
-    zip_name = f"validation_reports_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    return send_file(zip_bio, mimetype='application/zip', as_attachment=True, download_name=zip_name)
+@app.route("/result", methods=["GET"])
+def result():
+    data = LAST_RESULT.get("data")
+    if not data:
+        errs = (read_progress().get("errors") or [])
+        if errs:
+            return jsonify(error="Validation produced no report.", errors=errs), 422
+        return jsonify(error="No report is ready yet."), 404
+    bio = io.BytesIO(data)
+    bio.seek(0)
+    return send_file(bio, mimetype=LAST_RESULT["mime"], as_attachment=True,
+                     download_name=LAST_RESULT["name"])
 
 
 @app.route('/cancel', methods=['POST'])
 def cancel():
-    """Cancel currently running validation jobs."""
+    """Request cancellation; the in-process job aborts at its next progress tick."""
     global CANCELLED
     CANCELLED = True
-    # kill running processes
-    for p in list(RUNNING_PROCS):
-        try:
-            p.kill()
-        except Exception:
-            pass
-    # clear the list
-    RUNNING_PROCS.clear()
-    PROGRESS_STORE['finished'] = True
-    PROGRESS_STORE['current'] = 'cancelled'
-    return jsonify(status='cancelled')
+    with PROG_LOCK:
+        PROGRESS_STORE['current'] = 'cancelling…'
+    return jsonify(status='cancelling')
 
 
 @app.route("/reports/<path:filename>")

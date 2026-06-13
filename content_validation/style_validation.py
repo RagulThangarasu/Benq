@@ -131,7 +131,10 @@ def _extract_page(page, pno, body_size):
         links.append({"page": pno, "kind": l.get("kind"), "uri": l.get("uri"),
                       "to_page": (l.get("page", -1) + 1) if l.get("kind") == fitz.LINK_GOTO else None,
                       "rect": fitz.Rect(l.get("from"))})
-    # single get_drawings() pass yields both underline strokes and bg fills
+    # single get_drawings() pass yields underline strokes, bg fills, and a quick
+    # count of horizontal/vertical rules used to decide whether a table is even
+    # possible on this page.
+    h_lines = v_lines = 0
     for dr in page.get_drawings():
         fc, r = _fill_to_int(dr.get("fill")), dr.get("rect")
         if fc is not None and r is not None and r.width > 100 and r.height > 14:
@@ -139,22 +142,33 @@ def _extract_page(page, pno, body_size):
         for it in dr.get("items", []):
             if it[0] == "l":
                 a, b2 = it[1], it[2]
-                if abs(a.y - b2.y) < 0.7 and abs(b2.x - a.x) > 12:
+                dy, dx = abs(a.y - b2.y), abs(b2.x - a.x)
+                if dy < 0.7 and dx > 12:
                     hstrokes.append({"page": pno, "y": (a.y + b2.y) / 2,
                                      "x0": min(a.x, b2.x), "x1": max(a.x, b2.x)})
+                    h_lines += 1
+                elif dx < 0.7 and dy > 12:
+                    v_lines += 1
             elif it[0] == "re":
                 r2 = it[1]
                 if r2.height < 1.3 and r2.width > 12:
                     hstrokes.append({"page": pno, "y": r2.y0 + r2.height / 2,
                                      "x0": r2.x0, "x1": r2.x1})
-    try:
-        for t in page.find_tables().tables:
-            cells = [fitz.Rect(c) for c in (t.cells or []) if c]
-            tables.append({"page": pno, "rect": fitz.Rect(t.bbox),
-                           "cols": len(t.header.cells) if t.header else len(t.cols),
-                           "cells": cells, "pw": pw, "ph": ph})
-    except Exception:
-        pass
+                    h_lines += 1
+                elif r2.width > 12 and r2.height > 12:
+                    h_lines += 1
+                    v_lines += 1
+    # find_tables() is the most expensive call; skip it on pages with no grid of
+    # ruling lines (text-only pages can't hold a line-detected table anyway).
+    if h_lines >= 2 and v_lines >= 1:
+        try:
+            for t in page.find_tables().tables:
+                cells = [fitz.Rect(c) for c in (t.cells or []) if c]
+                tables.append({"page": pno, "rect": fitz.Rect(t.bbox),
+                               "cols": len(t.header.cells) if t.header else len(t.cols),
+                               "cells": cells, "pw": pw, "ph": ph})
+        except Exception:
+            pass
     return {"lines": lines, "images": images, "links": links, "hstrokes": hstrokes,
             "tables": tables, "fills": fills, "pw": pw, "ph": ph}
 
