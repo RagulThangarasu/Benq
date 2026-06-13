@@ -177,6 +177,7 @@
             </fieldset>
             <div class="actions cta" style="margin-top: 18px;">
               <button id="validateButton" type="submit" class="primary">Validate queue</button>
+              <button id="cancelButton" type="button" class="secondary" style="display:none;">Cancel</button>
             </div>
           </form>
             <div id="progressContainer" style="display:none; margin-top:12px;">
@@ -456,7 +457,18 @@
           }
           // Disable button and show progress
           const validateBtn = document.getElementById('validateButton');
+          const cancelBtn = document.getElementById('cancelButton');
           validateBtn.disabled = true;
+          if (cancelBtn) {
+            cancelBtn.style.display = 'inline-block';
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = 'Cancel';
+            cancelBtn.onclick = async () => {
+              cancelBtn.disabled = true;
+              cancelBtn.textContent = 'Cancelling…';
+              try { await fetch('/cancel', { method: 'POST' }); } catch (e) {}
+            };
+          }
           const progressContainer = document.getElementById('progressContainer');
           const progressBar = document.getElementById('progressBar');
           const progressText = document.getElementById('progressText');
@@ -504,7 +516,11 @@
             const formData = new FormData(validateForm);
             // 1) Kick off the job — returns immediately (work runs in background).
             const res = await fetch('/validate', { method: 'POST', body: formData });
-            if (!res.ok) {
+            if (res.status === 409) {
+              // A run is already in progress — re-attach to it instead of erroring.
+              showMessage('info', 'A validation is already running — showing its progress.');
+              progressLabel.textContent = 'resuming…';
+            } else if (!res.ok) {
               let errMsg = 'Validation failed';
               try { const j = await res.json(); errMsg = j.error || errMsg; } catch (e) {}
               showMessage('error', errMsg);
@@ -512,6 +528,11 @@
             }
             // 2) Watch progress until the job finishes.
             const pfin = await pollUntilDone();
+            if (pfin.cancelled || pfin.current === 'cancelled') {
+              showMessage('info', 'Validation cancelled.');
+              progressLabel.textContent = 'cancelled';
+              return;
+            }
             if (pfin.errors && pfin.errors.length) {
               showMessage('error', 'Validation failed: ' + pfin.errors.join(' | '));
               progressLabel.textContent = 'failed';
@@ -551,6 +572,7 @@
           } finally {
             if (pollId) { clearInterval(pollId); pollId = null; }
             validateBtn.disabled = false;
+            if (cancelBtn) { cancelBtn.style.display = 'none'; cancelBtn.disabled = false; cancelBtn.textContent = 'Cancel'; }
           }
         });
       }

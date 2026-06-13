@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import traceback
 import uuid
 import zipfile
@@ -33,6 +34,7 @@ PROG_LOCK = threading.Lock()
 # background job control
 JOB_LOCK = threading.Lock()
 JOB_THREAD = None
+JOB_STARTED_AT = 0.0
 # finished report held in memory for /result download
 LAST_RESULT: dict = {"data": None, "name": None, "mime": None}
 # track running subprocesses for cancellation
@@ -234,7 +236,9 @@ def clear_queue():
     return jsonify(queue=[])
 
 
-class _Cancelled(Exception):
+class _Cancelled(BaseException):
+    # BaseException (not Exception) so the validators' `except Exception` inside
+    # _emit() can't swallow it — cancellation must propagate out and abort.
     pass
 
 
@@ -263,9 +267,10 @@ def _run_jobs(tasks):
         else:
             produced = _run_parallel_subprocess(tasks)
     finally:
-        _finalize_result(produced)
+        _finalize_result([] if CANCELLED else produced)
         with PROG_LOCK:
             PROGRESS_STORE["finished"] = True
+            PROGRESS_STORE["cancelled"] = bool(CANCELLED)
             if not CANCELLED:
                 PROGRESS_STORE["pct"] = 100
             PROGRESS_STORE["current"] = "cancelled" if CANCELLED else "done"
@@ -470,11 +475,19 @@ def validate():
         if mode in ("style", "both"):
             tasks.append(("style", prod_path, stage_path, label))
 
-    global JOB_THREAD, CANCELLED
+    global JOB_THREAD, CANCELLED, JOB_STARTED_AT
     with JOB_LOCK:
-        if JOB_THREAD is not None and JOB_THREAD.is_alive():
-            return jsonify(error="A validation run is already in progress."), 409
+        running = JOB_THREAD is not None and JOB_THREAD.is_alive()
+        # A job orphaned past this many seconds (e.g. a worker that hung) is
+        # treated as dead so the user is never permanently locked out.
+        stale = running and (time.time() - JOB_STARTED_AT) > 1800
+        if running and not stale:
+            return jsonify(error="A validation run is already in progress. "
+                                 "Use Cancel to stop it, or wait for it to finish.",
+                           in_progress=True), 409
+        # (a stale/orphaned thread is simply abandoned; the new run starts fresh)
         CANCELLED = False
+        JOB_STARTED_AT = time.time()
         LAST_RESULT.update({"data": None, "name": None, "mime": None})
         with PROG_LOCK:
             PROGRESS_STORE.update({"total": len(tasks), "completed": 0,
@@ -503,9 +516,15 @@ def result():
 
 @app.route('/cancel', methods=['POST'])
 def cancel():
-    """Request cancellation; the in-process job aborts at its next progress tick."""
+    """Stop the running job: flag it (in-process aborts at the next progress
+    tick) and kill any running subprocesses (parallel mode)."""
     global CANCELLED
     CANCELLED = True
+    for p in list(RUNNING_PROCS):
+        try:
+            p.kill()
+        except Exception:
+            pass
     with PROG_LOCK:
         PROGRESS_STORE['current'] = 'cancelling…'
     return jsonify(status='cancelling')
