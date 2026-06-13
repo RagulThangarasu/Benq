@@ -325,7 +325,7 @@ def _run_sequential_inproc(tasks):
             data = b""
         _safe_unlink(outpath)
         if len(data) > 1024:
-            produced.append((build_report_name(mode_task, label), data))
+            produced.append((label, mode_task, data))
         with PROG_LOCK:
             PROGRESS_STORE["completed"] = i + 1
             PROGRESS_STORE["pct"] = int(round((i + 1) / n * 100)) if n else 100
@@ -394,7 +394,7 @@ def _run_parallel_subprocess(tasks):
             data = b""
         _safe_unlink(tf.name)
         if rc == 0 and len(data) > 1024 and not CANCELLED:
-            slots[i] = (build_report_name(mode_task, label), data)
+            slots[i] = (label, mode_task, data)
         elif not CANCELLED:
             msg = f"{mode_task} validation failed for '{label}' (exit code {rc})."
             if err:
@@ -411,36 +411,57 @@ def _run_parallel_subprocess(tasks):
     return [s for s in slots if s]
 
 
+def _clean_folder(name: str) -> str:
+    """A zip-safe folder name derived from the PROD folder label."""
+    name = (name or "report").replace("\\", "/").split("/")[-1].strip()
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "", name).strip(". ")
+    return name or "report"
+
+
 def _finalize_result(produced):
-    """De-dup identical reports and stash a single PDF (or a zip) for /result."""
-    seen, items, name_counts = set(), [], {}
-    for name, data in produced:
+    """Build the download. Reports are organised into a zip with one folder per
+    PROD folder name, the report PDF(s) kept inside it:
+
+        <prod folder>/content_validation_report.pdf
+        <prod folder>/style_validation_report.pdf
+
+    A run that yields a single report is returned as a plain PDF.
+    """
+    # de-dup identical report bytes (e.g. duplicate uploads)
+    seen, items = set(), []
+    for folder, mode_task, data in produced:
         h = hashlib.sha256(data).hexdigest()
         if h in seen:
             continue
         seen.add(h)
-        if name in name_counts:
-            name_counts[name] += 1
-            root, ext = os.path.splitext(name)
-            name = f"{root}_{name_counts[name]}{ext}"
-        else:
-            name_counts[name] = 1
-        items.append((name, data))
+        items.append((folder, mode_task, data))
 
     if not items:
         LAST_RESULT.update({"data": None, "name": None, "mime": None})
-    elif len(items) == 1:
-        name, data = items[0]
-        LAST_RESULT.update({"data": data, "name": name, "mime": "application/pdf"})
-    else:
-        zip_bio = io.BytesIO()
-        with zipfile.ZipFile(zip_bio, "w", zipfile.ZIP_DEFLATED) as zf:
-            for name, data in items:
-                zf.writestr(name, data)
-        LAST_RESULT.update({
-            "data": zip_bio.getvalue(),
-            "name": f"validation_reports_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-            "mime": "application/zip"})
+        return
+
+    if len(items) == 1:
+        folder, mode_task, data = items[0]
+        LAST_RESULT.update({"data": data, "mime": "application/pdf",
+                            "name": f"{_clean_folder(folder)}_{mode_task}_validation_report.pdf"})
+        return
+
+    zip_bio = io.BytesIO()
+    used = set()
+    with zipfile.ZipFile(zip_bio, "w", zipfile.ZIP_DEFLATED) as zf:
+        for folder, mode_task, data in items:
+            base = f"{_clean_folder(folder)}/{mode_task}_validation_report.pdf"
+            path, k = base, 2
+            while path in used:        # avoid collisions if a name repeats
+                root, ext = os.path.splitext(base)
+                path = f"{root}_{k}{ext}"
+                k += 1
+            used.add(path)
+            zf.writestr(path, data)
+    LAST_RESULT.update({
+        "data": zip_bio.getvalue(),
+        "name": f"validation_reports_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        "mime": "application/zip"})
 
 
 @app.route("/validate", methods=["POST"])

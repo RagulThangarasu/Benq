@@ -236,9 +236,63 @@ def _extract_page_body_stage(page) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 # TOC access
 # ────────────────────────────────────────────────────────────────────────────
+_DERIVED_NOTICE = {"CAUTION", "NOTE", "WARNING", "TIP", "IMPORTANT", "INFO"}
+
+
+def _derive_toc(doc):
+    """Build a heading-based TOC for PDFs that have no embedded bookmarks.
+
+    Some source PDFs ship without an outline (e.g. shorter product guides), which
+    left the whole comparison empty (0 PROD entries). Here we treat lines rendered
+    noticeably larger than body text as section headings, so those PDFs can still
+    be validated. Only used as a fallback when doc.get_toc() is empty.
+    """
+    # modal body-text size (lines >= 15 chars)
+    sizes = {}
+    for page in doc:
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                t = "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
+                if len(t) >= 15:
+                    mx = round(max((s.get("size", 0) for s in ln.get("spans", [])), default=0), 1)
+                    if mx > 0:
+                        sizes[mx] = sizes.get(mx, 0) + 1
+    body = max(sizes.items(), key=lambda kv: kv[1])[0] if sizes else 10.0
+    h_min, h1 = body * 1.25, body * 1.45
+
+    toc, seen = [], set()
+    for pno in range(1, doc.page_count + 1):
+        page = doc[pno - 1]
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                spans = ln.get("spans", [])
+                t = "".join(s.get("text", "") for s in spans).strip()
+                if not (3 <= len(t) <= 80):
+                    continue
+                mx = round(max((s.get("size", 0) for s in spans), default=0), 1)
+                if mx < h_min:
+                    continue
+                if re.fullmatch(r"[\d.\s:/–-]+", t):          # numbers / rules
+                    continue
+                if t.strip(" :").upper() in _DERIVED_NOTICE:   # NOTE/CAUTION labels
+                    continue
+                key = re.sub(r"\s+", " ", t).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                toc.append((1 if mx >= h1 else 2, t, pno))
+    return toc
+
+
 def get_toc(pdf_path):
     doc = fitz.open(pdf_path)
     toc = [(lvl, title.strip(), pg) for lvl, title, pg in doc.get_toc()]
+    if not toc:                       # no embedded outline → derive from headings
+        toc = _derive_toc(doc)
     doc.close()
     return toc
 
@@ -264,7 +318,7 @@ def extract_sections(pdf_path, is_prod: bool) -> dict:
     used by generate_validation_report.py for reliable section boundaries.
     """
     doc  = fitz.open(pdf_path)
-    toc  = doc.get_toc()
+    toc  = doc.get_toc() or _derive_toc(doc)
     nav  = {1} | _detect_nav_pages(doc)
 
     stream      = []   # flat word list across all body pages
@@ -380,7 +434,7 @@ def _extract_section_images(pdf_path: str, nav_pages: set) -> dict:
     encoded at different resolutions in Stage vs PROD still compare correctly.
     """
     doc    = fitz.open(pdf_path)
-    toc    = doc.get_toc()
+    toc    = doc.get_toc() or _derive_toc(doc)
     total  = doc.page_count
     result = {}
 
