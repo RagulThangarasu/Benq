@@ -1,6 +1,8 @@
 import json
 import os
+import re
 import shutil
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -270,83 +272,100 @@ def validate():
         parallel = 1
     parallel = max(1, min(parallel, MAX_PARALLEL))
 
-    # run tasks using subprocesses to enable true parallelism and allow cancellation
-    futures = []
+    # Each task runs as a subprocess whose stdout we STREAM line-by-line, parsing
+    # "@@PROGRESS:<frac>:<msg>@@" markers so the bar advances *during* a job
+    # (per page parsed), not just 0→100% at the end. Per-task fractions are
+    # summed into an overall percentage.
     global CANCELLED
     CANCELLED = False
+    n_tasks = len(tasks)
+    task_frac = [0.0] * n_tasks
+    prog_lock = threading.Lock()
+    PROG_RE = re.compile(r"@@PROGRESS:([0-9.]+):([^@]*)@@")
+
+    def refresh(current=None):
+        with prog_lock:
+            done = sum(1 for f in task_frac if f >= 1.0)
+            overall = (sum(task_frac) / n_tasks) if n_tasks else 1.0
+            progress['completed'] = done
+            progress['pct'] = int(round(overall * 100))
+            if current is not None:
+                progress['current'] = current
+            write_progress(progress)
+
+    results = [None] * n_tasks   # (outpath, returncode, err_tail)
+
+    def run_task(i, mode_task, prod_path, stage_path, label):
+        tf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+        tf.close()
+        cmd = [sys.executable, str(BASE_DIR / 'run_validator.py'),
+               mode_task, str(prod_path), str(stage_path), tf.name]
+        errf = tempfile.NamedTemporaryFile(suffix='.log', delete=False, mode='w+')
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
+                                    text=True, bufsize=1)
+        except Exception as exc:
+            errf.close()
+            results[i] = (tf.name, -1, f"could not start: {exc}")
+            task_frac[i] = 1.0
+            refresh()
+            return
+        RUNNING_PROCS.append(proc)
+        refresh(f"{mode_task}: {label}")
+        try:
+            for line in proc.stdout:          # streams as the job runs
+                m = PROG_RE.search(line)
+                if m:
+                    task_frac[i] = float(m.group(1))
+                    refresh(f"{mode_task}: {label} — {m.group(2).strip()}")
+        except Exception:
+            pass
+        proc.wait()
+        errf.seek(0)
+        err_tail = errf.read()[-1500:].strip()
+        errf.close()
+        try:
+            os.unlink(errf.name)
+        except Exception:
+            pass
+        try:
+            RUNNING_PROCS.remove(proc)
+        except Exception:
+            pass
+        task_frac[i] = 1.0
+        results[i] = (tf.name, proc.returncode, err_tail)
+        refresh()
+
     with ThreadPoolExecutor(max_workers=parallel) as exc:
-        for mode_task, prod_path, stage_path, label in tasks:
-            if CANCELLED:
-                break
-            progress['current'] = f"{mode_task}: {label}"
-            write_progress(progress)
-            tf = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-            tf.close()
-            cmd = [sys.executable, str(BASE_DIR / 'run_validator.py'), mode_task, str(prod_path), str(stage_path), tf.name]
-            # start process so we can kill it if requested
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            RUNNING_PROCS.append(proc)
-            future = exc.submit(proc.communicate)
-            futures.append((future, proc, tf.name, mode_task, label))
+        futs = [exc.submit(run_task, i, *task) for i, task in enumerate(tasks)]
+        for _ in as_completed(futs):
+            pass
 
-        # collect results as they complete
-        for fut, proc, outpath, mode_task, label in futures:
-            if CANCELLED:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                continue
+    # collect outputs
+    for i, task in enumerate(tasks):
+        mode_task, _p, _s, label = task
+        res = results[i]
+        if res is None:
+            continue
+        outpath, rc, err_tail = res
+        try:
+            data = open(outpath, 'rb').read()
+        except Exception:
+            data = b''
+        if len(data) > 1024 and rc == 0 and not CANCELLED:
+            temp_files.append((outpath, build_report_name(mode_task, label), data))
+        else:
             try:
-                stdout, stderr = fut.result()
-            except Exception as excp:
-                progress['finished'] = True
-                write_progress(progress)
-                # cleanup
-                for pth, _, _ in temp_files:
-                    try:
-                        os.unlink(pth)
-                    except Exception:
-                        pass
-                return jsonify(error=f"Validation failed for {label}: {excp}"), 500
-            finally:
-                try:
-                    RUNNING_PROCS.remove(proc)
-                except Exception:
-                    pass
-
-            # read output
-            try:
-                data = open(outpath, 'rb').read()
+                os.unlink(outpath)
             except Exception:
-                data = b''
-
-            rc = proc.returncode
-            if len(data) > 1024 and rc == 0 and not CANCELLED:
-                temp_files.append((outpath, build_report_name(mode_task, label), data))
-            else:
-                try:
-                    os.unlink(outpath)
-                except Exception:
-                    pass
-                # Surface WHY a job produced no report instead of hiding it. The
-                # subprocess stderr is the real error (missing dep, crash, OOM…).
-                if not CANCELLED:
-                    err_tail = ""
-                    try:
-                        err_tail = (stderr or b"").decode("utf-8", "replace").strip()
-                        err_tail = err_tail[-1500:]
-                    except Exception:
-                        pass
-                    msg = (f"{mode_task} validation failed for '{label}' "
-                           f"(exit code {rc}).")
-                    if err_tail:
-                        msg += f"\n{err_tail}"
-                    print(f"[validate] {msg}", flush=True)
-                    progress['errors'] = progress.get('errors', [])
-                    progress['errors'].append(msg)
-            progress['completed'] += 1
-            write_progress(progress)
+                pass
+            if not CANCELLED:
+                msg = f"{mode_task} validation failed for '{label}' (exit code {rc})."
+                if err_tail:
+                    msg += f"\n{err_tail}"
+                print(f"[validate] {msg}", flush=True)
+                progress['errors'].append(msg)
+                write_progress(progress)
 
     # finished generating reports
     progress['finished'] = True

@@ -55,6 +55,22 @@ MIN_FRAG_WORDS  = 3      # minimum uncovered word-run length to report (lowered 
 VISUAL_PAGE_THRESHOLD = 0.82   # page-level visual similarity threshold (0-1)
 VISUAL_RENDER_SCALE   = 0.8    # render scale for visual compare (speed vs fidelity)
 
+# Optional progress reporting (installed by run_validator.py for the web UI).
+_PROGRESS_CB = None
+
+
+def set_progress_callback(cb):
+    global _PROGRESS_CB
+    _PROGRESS_CB = cb
+
+
+def _emit(frac, msg=""):
+    if _PROGRESS_CB:
+        try:
+            _PROGRESS_CB(max(0.0, min(1.0, float(frac))), msg)
+        except Exception:
+            pass
+
 _INT_RE          = re.compile(r"^\d{1,3}$")
 _PAGE_REF_RE     = re.compile(
     r"\b(?:on|see)\s+pages?\s+\d+(?:\s*[-–]\s*\d+)?\.?", re.IGNORECASE)
@@ -2322,6 +2338,7 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
 # ────────────────────────────────────────────────────────────────────────────
 def validate(prod_path, stage_path, report_path):
     # ── TOC comparison ──
+    _emit(0.02, "reading TOC")
     print("Reading TOC...")
     prod_toc  = get_toc(prod_path)
     stage_toc = get_toc(stage_path)
@@ -2359,6 +2376,7 @@ def validate(prod_path, stage_path, report_path):
     print(f"  TOC: Match={n_m} | Missing in Stage={n_mi} | Extra in Stage={n_e}")
 
     # ── Content extraction ──
+    _emit(0.10, "extracting section text")
     print("Extracting section text...")
     prod_sections  = extract_sections(prod_path,  is_prod=True)
     stage_sections = extract_sections(stage_path, is_prod=False)
@@ -2367,6 +2385,7 @@ def validate(prod_path, stage_path, report_path):
 
     # Build STAGE shingle index from ALL non-nav pages (not just section slices)
     # so content that falls before the first TOC heading is still covered.
+    _emit(0.24, "building STAGE index")
     print("Building STAGE content index...")
     stage_doc = fitz.open(stage_path)
     stage_nav = {1} | _detect_nav_pages(stage_doc)
@@ -2374,6 +2393,7 @@ def validate(prod_path, stage_path, report_path):
     stage_ns, stage_cset, stage_full_lower = _build_stage_index(stage_path, stage_nav)
 
     # ── Content comparison (all PROD topics: matching + missing in Stage) ──
+    _emit(0.34, "comparing content")
     print("Comparing content...")
     content_results = []
     for r in toc_results:
@@ -2450,6 +2470,7 @@ def validate(prod_path, stage_path, report_path):
                     print(f"      MISSING: {m[:100]}")
 
     # ── Image comparison ──
+    _emit(0.52, "extracting images")
     print("Extracting images...")
     prod_doc = fitz.open(prod_path)
     prod_nav = {1} | _detect_nav_pages(prod_doc)
@@ -2473,6 +2494,7 @@ def validate(prod_path, stage_path, report_path):
     _sdoc.close()
     print(f"  Stage icons doc-wide: {len(stage_all_icons)} placements")
 
+    _emit(0.64, "comparing images")
     print("Comparing images by on-page pt dimensions (content ±15%, icon ±25%)...")
     image_results = _compare_image_sections(prod_imgs, stage_imgs, stage_all_icons)
     n_ip = sum(1 for r in image_results if r["status"] == "Pass")
@@ -2497,6 +2519,7 @@ def validate(prod_path, stage_path, report_path):
     }
 
     # ── Layout / table / alignment extraction ──
+    _emit(0.72, "extracting layout")
     print("Extracting image layout, tables, and text alignment (PROD)...")
     prod_img_layout, prod_tables, prod_text_align = _extract_layout_prod(
         prod_path, prod_nav, prod_toc)
@@ -2515,6 +2538,7 @@ def validate(prod_path, stage_path, report_path):
     print(f"  Layout Pass={n_lp} | Fail={n_lf}")
 
     # ── Visual page-render validation ──
+    _emit(0.84, "comparing visuals")
     print("Comparing visual render similarity (Expected PROD vs Actual STAGE)...")
     visual_results = _compare_visual_sections(
         prod_path, stage_path, prod_toc, stage_toc, toc_results
@@ -2523,6 +2547,7 @@ def validate(prod_path, stage_path, report_path):
     n_vf = sum(1 for r in visual_results if r["status"] == "Fail")
     print(f"  Visual Pass={n_vp} | Fail={n_vf}")
 
+    _emit(0.90, "comparing style")
     print("Comparing style structure (headings/sub-headings/body/notices, by proportion)...")
     style_results = _compare_style_sections(
         prod_path, stage_path, prod_toc, stage_toc, toc_results
@@ -2540,10 +2565,12 @@ def validate(prod_path, stage_path, report_path):
                     print(f"        - {ln}")
 
     # ── Generate PDF ──
+    _emit(0.95, "building report")
     print("Generating report PDF...")
     generate_report(prod_path, stage_path, toc_results, content_results,
                     image_results, icon_doc_summary, layout_results,
                     visual_results, style_results, report_path)
+    _emit(1.0, "done")
     print("Done.")
 
 

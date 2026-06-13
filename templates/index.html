@@ -476,7 +476,11 @@
                 const total = p.total || 0;
                 const completed = p.completed || 0;
                 const label = p.current || '';
-                const pct = total ? Math.round((completed / total) * 100) : 0;
+                // prefer the backend's fine-grained pct (advances during a job);
+                // fall back to completed/total for older responses.
+                const pct = (p.pct !== undefined && p.pct !== null)
+                  ? p.pct
+                  : (total ? Math.round((completed / total) * 100) : 0);
                 progressBar.style.width = pct + '%';
                 document.getElementById('progressPercent').textContent = pct + '%';
                 progressText.textContent = `${completed}/${total}`;
@@ -507,7 +511,9 @@
             // ensure final poll update
             const final = await fetch('/progress');
             const pfin = await final.json();
-            const pct = pfin.total ? Math.round((pfin.completed / pfin.total) * 100) : 0;
+            const pct = (pfin.pct !== undefined && pfin.pct !== null)
+              ? pfin.pct
+              : (pfin.total ? Math.round((pfin.completed / pfin.total) * 100) : 0);
             progressBar.style.width = pct + '%';
             document.getElementById('progressPercent').textContent = pct + '%';
             progressText.textContent = `${pfin.completed}/${pfin.total}`;

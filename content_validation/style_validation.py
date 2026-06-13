@@ -48,6 +48,24 @@ except ImportError:
 
 NOTICE_RE = re.compile(r"\b(NOTE|TIP|IMPORTANT|WARNING|CAUTION|INFO)\b", re.IGNORECASE)
 
+# Optional progress reporting. run_validator.py installs a callback so the web
+# UI's progress bar can advance *during* a job (per page parsed), not just jump
+# 0→100% at the end. No-op when run standalone or in tests.
+_PROGRESS_CB = None
+
+
+def set_progress_callback(cb):
+    global _PROGRESS_CB
+    _PROGRESS_CB = cb
+
+
+def _emit(frac, msg=""):
+    if _PROGRESS_CB:
+        try:
+            _PROGRESS_CB(max(0.0, min(1.0, float(frac))), msg)
+        except Exception:
+            pass
+
 # ── colour helpers ──────────────────────────────────────────────────────────
 def _rgb(c):
     c = int(c or 0)
@@ -141,10 +159,20 @@ def _extract_page(page, pno, body_size):
             "tables": tables, "fills": fills, "pw": pw, "ph": ph}
 
 
-def _build_cache(doc, body_size):
-    """Parse every page once → {page_no: feature record}."""
-    return {pno: _extract_page(doc[pno - 1], pno, body_size)
-            for pno in range(1, doc.page_count + 1)}
+def _build_cache(doc, body_size, prog=None):
+    """Parse every page once → {page_no: feature record}.
+
+    prog: optional (lo, hi, label) — emit progress in the [lo, hi] band as pages
+    are parsed (this is the slow part, so it's where the bar visibly moves).
+    """
+    n = doc.page_count
+    out = {}
+    for pno in range(1, n + 1):
+        out[pno] = _extract_page(doc[pno - 1], pno, body_size)
+        if prog and (pno % 2 == 0 or pno == n):
+            lo, hi, label = prog
+            _emit(lo + (hi - lo) * pno / n, label)
+    return out
 
 
 def _assemble(cache, start, end):
@@ -860,9 +888,10 @@ def validate_style(prod_path, stage_path):
 
     # Parse every page once, then assemble whole-document and per-section views
     # from the cache (avoids re-parsing pages for every section + info pass).
-    p_cache = _build_cache(prod_doc, p_body)
+    _emit(0.04, "reading structure")
+    p_cache = _build_cache(prod_doc, p_body, (0.05, 0.45, "parsing PROD pages"))
     print("  extracted PROD features")
-    s_cache = _build_cache(stage_doc, s_body)
+    s_cache = _build_cache(stage_doc, s_body, (0.45, 0.82, "parsing STAGE pages"))
     print("  extracted STAGE features")
     p_all = _assemble(p_cache, 1, prod_doc.page_count)
     s_all = _assemble(s_cache, 1, stage_doc.page_count)
@@ -888,6 +917,7 @@ def validate_style(prod_path, stage_path):
         if max(p_n, s_n) >= 6 and 0.45 <= (s_n / max(p_n, 1)) <= 2.2:
             geo.append((title, p_feat, s_feat))
     print(f"  matched {len(sections)} sections ({len(geo)} comparable for geometry)")
+    _emit(0.86, "running style checks")
 
     findings = []
     check_heading_color(p_all, s_all, findings)
@@ -1009,6 +1039,7 @@ def build_report(prod_path, stage_path, findings, out_path):
 
 def main(prod_path, stage_path, out_path):
     print("Validating style (PROD = expected, STAGE = actual)...")
+    _emit(0.01, "starting")
     findings = validate_style(prod_path, stage_path)
     by_cat = {}
     for f in findings:
@@ -1018,7 +1049,9 @@ def main(prod_path, stage_path, out_path):
     for c in CATEGORY_ORDER:
         print(f"  {c:24} {by_cat.get(c, 0)}")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    _emit(0.95, "building report")
     build_report(prod_path, stage_path, findings, out_path)
+    _emit(1.0, "done")
     return findings
 
 
