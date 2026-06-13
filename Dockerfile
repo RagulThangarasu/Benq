@@ -22,6 +22,9 @@ USER appuser
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=10000
+# Concurrent validations. Keep 1 on small instances (each worker ~= one PDF in
+# RAM and needs its own CPU); raise to 2-4 on an instance with more CPU + memory.
+ENV VALIDATOR_MAX_PARALLEL=1
 
 EXPOSE 10000
 

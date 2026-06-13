@@ -246,70 +246,22 @@ def _safe_unlink(p):
 
 
 def _run_jobs(tasks):
-    """Run validation tasks IN-PROCESS, sequentially, in a background thread.
+    """Background-thread orchestrator. Dispatches to in-process (memory-light,
+    free-tier safe) or parallel subprocesses (faster on bigger instances).
 
-    Why in-process (not a subprocess): a subprocess loads a *second* full
-    Python + PyMuPDF interpreter on top of the gunicorn worker, and on the
-    512 MB free tier that double footprint gets OOM-killed → 502s on every
-    request (even /progress). Running in this worker keeps a single PyMuPDF
-    copy; sequential + gc.collect() bounds peak memory to one validation.
-    Running in a background thread keeps /validate from blocking the worker, so
-    /progress and /result stay responsive throughout.
+    MAX_PARALLEL == 1  → in-process, sequential (one PyMuPDF copy, lowest memory).
+    MAX_PARALLEL  > 1  → up to N validations at once, each in its OWN subprocess.
+                         Process isolation is required because PyMuPDF is not
+                         thread-safe — running validations in threads can segfault
+                         the worker. Each extra worker also costs ~one PDF's worth
+                         of RAM, so keep N within the instance's memory budget.
     """
-    n = len(tasks)
-    produced = []  # (download_name, bytes)
+    produced = []
     try:
-        for i, (mode_task, prod_path, stage_path, label) in enumerate(tasks):
-            if CANCELLED:
-                break
-            base, span = i / n, 1.0 / n
-
-            def cb(frac, msg="", _b=base, _s=span, _i=i, _m=mode_task, _l=label):
-                if CANCELLED:
-                    raise _Cancelled()
-                with PROG_LOCK:
-                    PROGRESS_STORE["pct"] = int(round((_b + _s * frac) * 100))
-                    PROGRESS_STORE["completed"] = _i + (1 if frac >= 1.0 else 0)
-                    PROGRESS_STORE["current"] = (f"{_m}: {_l} — {msg}" if msg
-                                                 else f"{_m}: {_l}")
-
-            tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-            tf.close()
-            outpath = tf.name
-            try:
-                if mode_task == "style":
-                    style_validation.set_progress_callback(cb)
-                    style_validation.main(str(prod_path), str(stage_path), outpath)
-                else:
-                    validate_toc_content.set_progress_callback(cb)
-                    validate_toc_content.validate(str(prod_path), str(stage_path), outpath)
-            except _Cancelled:
-                _safe_unlink(outpath)
-                break
-            except Exception:
-                tb = traceback.format_exc()
-                last = tb.strip().splitlines()[-1] if tb.strip() else "unknown error"
-                print(f"[validate] {mode_task} failed for '{label}':\n{tb}", flush=True)
-                with PROG_LOCK:
-                    PROGRESS_STORE["errors"].append(
-                        f"{mode_task} validation failed for '{label}': {last}")
-                _safe_unlink(outpath)
-                continue
-            finally:
-                style_validation.set_progress_callback(None)
-                validate_toc_content.set_progress_callback(None)
-                gc.collect()
-
-            try:
-                data = open(outpath, "rb").read()
-            except Exception:
-                data = b""
-            _safe_unlink(outpath)
-            if len(data) > 1024:
-                produced.append((build_report_name(mode_task, label), data))
-            with PROG_LOCK:
-                PROGRESS_STORE["completed"] = i + 1
-                PROGRESS_STORE["pct"] = int(round((i + 1) / n * 100)) if n else 100
+        if MAX_PARALLEL <= 1:
+            produced = _run_sequential_inproc(tasks)
+        else:
+            produced = _run_parallel_subprocess(tasks)
     finally:
         _finalize_result(produced)
         with PROG_LOCK:
@@ -317,6 +269,141 @@ def _run_jobs(tasks):
             if not CANCELLED:
                 PROGRESS_STORE["pct"] = 100
             PROGRESS_STORE["current"] = "cancelled" if CANCELLED else "done"
+
+
+def _run_sequential_inproc(tasks):
+    """Run tasks one at a time in this process (no subprocess, lowest memory)."""
+    n = len(tasks)
+    produced = []
+    for i, (mode_task, prod_path, stage_path, label) in enumerate(tasks):
+        if CANCELLED:
+            break
+        base, span = i / n, 1.0 / n
+
+        def cb(frac, msg="", _b=base, _s=span, _i=i, _m=mode_task, _l=label):
+            if CANCELLED:
+                raise _Cancelled()
+            with PROG_LOCK:
+                PROGRESS_STORE["pct"] = int(round((_b + _s * frac) * 100))
+                PROGRESS_STORE["completed"] = _i + (1 if frac >= 1.0 else 0)
+                PROGRESS_STORE["current"] = (f"{_m}: {_l} — {msg}" if msg else f"{_m}: {_l}")
+
+        tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tf.close()
+        outpath = tf.name
+        try:
+            if mode_task == "style":
+                style_validation.set_progress_callback(cb)
+                style_validation.main(str(prod_path), str(stage_path), outpath)
+            else:
+                validate_toc_content.set_progress_callback(cb)
+                validate_toc_content.validate(str(prod_path), str(stage_path), outpath)
+        except _Cancelled:
+            _safe_unlink(outpath)
+            break
+        except Exception:
+            tb = traceback.format_exc()
+            last = tb.strip().splitlines()[-1] if tb.strip() else "unknown error"
+            print(f"[validate] {mode_task} failed for '{label}':\n{tb}", flush=True)
+            with PROG_LOCK:
+                PROGRESS_STORE["errors"].append(f"{mode_task} validation failed for '{label}': {last}")
+            _safe_unlink(outpath)
+            continue
+        finally:
+            style_validation.set_progress_callback(None)
+            validate_toc_content.set_progress_callback(None)
+            gc.collect()
+
+        try:
+            data = open(outpath, "rb").read()
+        except Exception:
+            data = b""
+        _safe_unlink(outpath)
+        if len(data) > 1024:
+            produced.append((build_report_name(mode_task, label), data))
+        with PROG_LOCK:
+            PROGRESS_STORE["completed"] = i + 1
+            PROGRESS_STORE["pct"] = int(round((i + 1) / n * 100)) if n else 100
+    return produced
+
+
+_PROG_RE = re.compile(r"@@PROGRESS:([0-9.]+):([^@]*)@@")
+
+
+def _run_parallel_subprocess(tasks):
+    """Run up to MAX_PARALLEL validations concurrently, each in its own process.
+
+    Streams each subprocess's stdout for @@PROGRESS@@ markers so the bar reflects
+    the combined progress of all running workers.
+    """
+    n = len(tasks)
+    frac = [0.0] * n
+    slots = [None] * n     # (name, data) or None
+    flock = threading.Lock()
+
+    def refresh(current=None):
+        with PROG_LOCK:
+            PROGRESS_STORE["completed"] = sum(1 for f in frac if f >= 1.0)
+            PROGRESS_STORE["pct"] = int(round(sum(frac) / n * 100)) if n else 100
+            if current is not None:
+                PROGRESS_STORE["current"] = current
+
+    def run_one(i, mode_task, prod_path, stage_path, label):
+        tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tf.close()
+        errf = tempfile.NamedTemporaryFile(suffix=".log", delete=False, mode="w+")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(BASE_DIR / "run_validator.py"),
+                 mode_task, str(prod_path), str(stage_path), tf.name],
+                stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1)
+        except Exception as exc:
+            errf.close(); _safe_unlink(errf.name); _safe_unlink(tf.name)
+            with flock:
+                PROGRESS_STORE["errors"].append(f"{mode_task} could not start for '{label}': {exc}")
+            frac[i] = 1.0; refresh()
+            return
+        RUNNING_PROCS.append(proc)
+        refresh(f"{mode_task}: {label}")
+        try:
+            for line in proc.stdout:
+                if CANCELLED:
+                    proc.kill(); break
+                m = _PROG_RE.search(line)
+                if m:
+                    frac[i] = float(m.group(1))
+                    refresh(f"{mode_task}: {label} — {m.group(2).strip()}")
+        except Exception:
+            pass
+        proc.wait()
+        errf.seek(0); err = errf.read()[-1500:].strip(); errf.close(); _safe_unlink(errf.name)
+        try:
+            RUNNING_PROCS.remove(proc)
+        except Exception:
+            pass
+        frac[i] = 1.0
+        rc = proc.returncode
+        try:
+            data = open(tf.name, "rb").read()
+        except Exception:
+            data = b""
+        _safe_unlink(tf.name)
+        if rc == 0 and len(data) > 1024 and not CANCELLED:
+            slots[i] = (build_report_name(mode_task, label), data)
+        elif not CANCELLED:
+            msg = f"{mode_task} validation failed for '{label}' (exit code {rc})."
+            if err:
+                msg += f" {err.splitlines()[-1]}"
+            print(f"[validate] {msg}", flush=True)
+            with flock:
+                PROGRESS_STORE["errors"].append(msg)
+        refresh()
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+        futs = [ex.submit(run_one, i, *t) for i, t in enumerate(tasks)]
+        for _ in as_completed(futs):
+            pass
+    return [s for s in slots if s]
 
 
 def _finalize_result(produced):
