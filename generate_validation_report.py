@@ -33,14 +33,26 @@ import fitz  # PyMuPDF
 # Configuration
 # ---------------------------------------------------------------------------
 BASE = Path(__file__).resolve().parent
-PROD_PDF = BASE / "PDF" / "prod" / "SW272_EN.pdf"
-STAGE_PDF = BASE / "PDF" / "stage" / "sw272_en_v5.pdf"
+import glob
+def _find_pdf(side, prefer):
+    direct = BASE / "PDF" / side / prefer
+    if direct.exists():
+        return direct
+    hits = glob.glob(str(BASE / "PDF" / side / "**" / "*.pdf"), recursive=True)
+    for h in hits:
+        if "sw272" in Path(h).name.lower():
+            return Path(h)
+    return Path(hits[0]) if hits else direct
+
+PROD_PDF = _find_pdf("prod", "SW272_EN.pdf")
+STAGE_PDF = _find_pdf("stage", "sw272_en_v5.pdf")
 REPORTS_DIR = BASE / "reports"
 PDF_PATH = REPORTS_DIR / "pdf_validation_report.pdf"
 
 MIN_SPAN = 4          # report missing runs of >= this many consecutive words
 CHAR_SHINGLE = 18     # char-window length for shingle-based coverage detection
 _OSD_FONT_MAX = 8.5   # PROD spans at or below this pt size are OSD/diagram overlays
+_MIN_BLOCK_CHARS = 40  # minimum block characters for non-heading blocks
 _INT_RE = re.compile(r"\d{1,3}$")
 # Matches "on page 48", "see page 26 - 29", "on pages 44-55" etc.
 _PAGE_REF_RE = re.compile(

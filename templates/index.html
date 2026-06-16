@@ -81,6 +81,9 @@
       <header>
         <div>
           <span class="hero-pill">Folder-level PDF validation</span>
+          <a href="/download" style="float:right; text-decoration:none;"><span class="pill">⬇ Download BenQ PDFs</span></a>
+          <a href="/sites-validation" style="float:right; text-decoration:none; margin-right:10px;"><span class="pill">🌐 Sites Validation</span></a>
+          <a href="/guide" style="float:right; text-decoration:none; margin-right:10px;"><span class="pill">📖 Guide (TOC browser)</span></a>
           <h1>Upload PROD + STAGE folders</h1>
           <p>Select the prod and stage folders, press <strong>Append</strong> to queue them, and then click <strong>Validate</strong>. Use <strong>Clear</strong> to reset the appended list.</p>
         </div>
@@ -91,19 +94,36 @@
           <h2>Upload</h2>
           <p style="color:#475569; margin-bottom: 18px;">High-level upload: choose a folder (any nested level will be scanned for PDFs) or a single PDF file for each side. Append pairs to the queue, then validate. The UI accepts nested folders and single-file validations.</p>
 
+          <div class="notice" id="serverPicker" style="margin-bottom:18px;">
+            <strong>No upload needed.</strong> Pick from products already on the server —
+            <strong>PROD</strong> = the generated PDF, <strong>STAGE</strong> = its Final Cleanup PDF —
+            and add them straight to the queue below.
+            <div style="display:flex; gap:10px; align-items:flex-start; margin-top:12px; flex-wrap:wrap;">
+              <select id="serverProductSelect" multiple size="7" style="flex:1; min-width:280px; padding:8px; border-radius:8px; border:1px solid var(--border); background:#fff; font-size:0.95rem;">
+                <option disabled>Loading products…</option>
+              </select>
+              <div style="display:flex; flex-direction:column; gap:8px;">
+                <button id="addServerSelected" type="button" class="primary" style="padding:8px 12px; min-width:130px;">Add selected</button>
+                <button id="addServerAll" type="button" class="secondary" style="padding:8px 12px; min-width:130px;">Add all</button>
+                <button id="reloadServerProducts" type="button" class="secondary" style="padding:8px 12px; min-width:130px;">↻ Refresh</button>
+              </div>
+            </div>
+            <div id="serverPickerMsg" style="margin-top:8px; font-size:0.92rem;"></div>
+          </div>
+
           <form id="appendForm" enctype="multipart/form-data">
             <div class="upload-row">
               <div class="upload-side" style="flex:1; min-width:260px;">
                 <label style="font-weight:700;">PROD</label>
                 <div style="display:flex; gap:8px; margin-top:8px;">
                   <select id="prod_mode" aria-label="prod upload mode" style="padding:8px; border-radius:8px; border:1px solid var(--border);">
-                    <option value="folder" selected>Upload Folder (recommended)</option>
-                    <option value="file">Single PDF</option>
+                    <option value="file" selected>Single / Multiple PDFs</option>
+                    <option value="folder">Upload Folder</option>
                   </select>
                   <button id="prod_pick" type="button" class="secondary" style="padding:8px 12px;">Choose</button>
                 </div>
-                <input id="prod_folder_input" type="file" name="prod_files" webkitdirectory directory multiple accept="application/pdf" style="margin-top:10px; display:block;" />
-                <input id="prod_file_input" type="file" name="prod_files" accept="application/pdf" style="margin-top:10px; display:none;" />
+                <input id="prod_folder_input" type="file" name="prod_files" webkitdirectory directory multiple accept="application/pdf,.pdf" style="margin-top:10px; display:none;" />
+                <input id="prod_file_input" type="file" name="prod_files" multiple accept="application/pdf,.pdf" style="margin-top:10px; display:block;" />
                 <div id="prod_preview" style="margin-top:10px; color:#475569; font-size:0.95rem;">No files selected.</div>
               </div>
 
@@ -111,13 +131,13 @@
                 <label style="font-weight:700;">STAGE</label>
                 <div style="display:flex; gap:8px; margin-top:8px;">
                   <select id="stage_mode" aria-label="stage upload mode" style="padding:8px; border-radius:8px; border:1px solid var(--border);">
-                    <option value="folder" selected>Upload Folder (recommended)</option>
-                    <option value="file">Single PDF</option>
+                    <option value="file" selected>Single / Multiple PDFs</option>
+                    <option value="folder">Upload Folder</option>
                   </select>
                   <button id="stage_pick" type="button" class="secondary" style="padding:8px 12px;">Choose</button>
                 </div>
-                <input id="stage_folder_input" type="file" name="stage_files" webkitdirectory directory multiple accept="application/pdf" style="margin-top:10px; display:block;" />
-                <input id="stage_file_input" type="file" name="stage_files" accept="application/pdf" style="margin-top:10px; display:none;" />
+                <input id="stage_folder_input" type="file" name="stage_files" webkitdirectory directory multiple accept="application/pdf,.pdf" style="margin-top:10px; display:none;" />
+                <input id="stage_file_input" type="file" name="stage_files" multiple accept="application/pdf,.pdf" style="margin-top:10px; display:block;" />
                 <div id="stage_preview" style="margin-top:10px; color:#475569; font-size:0.95rem;">No files selected.</div>
               </div>
             </div>
@@ -576,6 +596,68 @@
           }
         });
       }
+
+      // ── Server-side product picker (validate without uploading) ───────────
+      const serverProductSelect = document.getElementById('serverProductSelect');
+      const serverPickerMsg = document.getElementById('serverPickerMsg');
+      const addServerSelected = document.getElementById('addServerSelected');
+      const addServerAll = document.getElementById('addServerAll');
+      const reloadServerProducts = document.getElementById('reloadServerProducts');
+
+      async function loadServerProducts() {
+        serverProductSelect.innerHTML = '<option disabled>Loading products…</option>';
+        serverPickerMsg.textContent = '';
+        serverPickerMsg.style.color = '';
+        let products = [];
+        try {
+          const r = await fetch('/download/products');
+          products = (await r.json()).products || [];
+        } catch (e) { products = []; }
+        if (!products.length) {
+          serverProductSelect.innerHTML = '<option disabled>No server products found</option>';
+          return;
+        }
+        serverProductSelect.innerHTML = products.map(p => {
+          const ok = !!p.zip_name;
+          const tag = ok ? p.source : 'no STAGE — can\'t validate';
+          return `<option value="${p.product}" ${ok ? '' : 'disabled'}>${p.product} (${tag})</option>`;
+        }).join('');
+      }
+
+      async function addProductsToQueue(productNames) {
+        if (!productNames.length) {
+          serverPickerMsg.style.color = '#991b1b';
+          serverPickerMsg.textContent = 'Select one or more products first.';
+          return;
+        }
+        addServerSelected.disabled = addServerAll.disabled = true;
+        serverPickerMsg.style.color = '';
+        let added = 0; const failed = [];
+        for (const name of productNames) {
+          serverPickerMsg.textContent = `Adding ${name}… (${added}/${productNames.length})`;
+          try {
+            const r = await fetch('/download/add-to-validation/' + encodeURIComponent(name), { method: 'POST' });
+            if (r.ok) added++; else { const d = await r.json().catch(() => ({})); failed.push(`${name}: ${d.error || r.status}`); }
+          } catch (e) { failed.push(`${name}: ${e.message}`); }
+        }
+        await loadQueue();
+        addServerSelected.disabled = addServerAll.disabled = false;
+        serverPickerMsg.style.color = failed.length ? '#b45309' : '#047857';
+        serverPickerMsg.textContent = `Added ${added} to queue.` + (failed.length ? ` Skipped: ${failed.join('; ')}` : '');
+      }
+
+      addServerSelected.addEventListener('click', () => {
+        const picked = Array.from(serverProductSelect.selectedOptions)
+          .filter(o => !o.disabled).map(o => o.value);
+        addProductsToQueue(picked);
+      });
+      addServerAll.addEventListener('click', () => {
+        const all = Array.from(serverProductSelect.options)
+          .filter(o => !o.disabled && o.value).map(o => o.value);
+        addProductsToQueue(all);
+      });
+      reloadServerProducts.addEventListener('click', loadServerProducts);
+      loadServerProducts();
 
       loadQueue();
     </script>

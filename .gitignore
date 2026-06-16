@@ -10,3 +10,14 @@ __pycache__/
 # Runtime artifacts (uploads, generated reports, progress/queue state)
 tmp_uploads/
 reports/
+content_validation/folderwise_reports/
+content_validation/folderwise_reports.zip
+
+# Ad-hoc inspection / scratch scripts
+scratch/
+
+# Tesseract OCR trained-data blobs (large; install separately)
+tessdata/
+
+# AEM session cookies
+.sessions/

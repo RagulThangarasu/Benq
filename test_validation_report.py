@@ -51,10 +51,9 @@ def test_toc_content_matches(result):
         lines = []
         for r in failed:
             lines.append(f"\n[{r['coverage']:.0f}%] {r['heading']} (p{r['prod_page']}):")
-            for text, label, _ in r["spans"]:
-                if label == "MISSING":
-                    snippet = text if len(text) <= 100 else text[:97] + "..."
-                    lines.append(f"    - {snippet}")
+            for text in r["spans"]:
+                snippet = text if len(text) <= 100 else text[:97] + "..."
+                lines.append(f"    - {snippet}")
         pytest.fail(
             f"{len(failed)}/{len(result['cont_rows'])} section(s) have content "
             f"missing from STAGE (see {result['pdf_path'].name}):" + "".join(lines)

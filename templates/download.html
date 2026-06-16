@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Download BenQ PDFs</title>
+    <style>
+      :root {
+        --bg: linear-gradient(180deg,#f7fbfb 0%, #f0f8f9 100%);
+        --card: #ffffff;
+        --muted: #6b7280;
+        --text: #0b1220;
+        --primary-start: #0ea5a4;
+        --primary-end: #3b82f6;
+        --danger: #ef4444;
+        --border: rgba(11,18,23,0.12);
+        --border-soft: rgba(11,18,23,0.06);
+        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--text);
+        background: var(--bg);
+        font-size: 15px;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 0; }
+      .page { width: 100%; max-width: 1200px; margin: 14px auto; padding: 24px; }
+      header { display: block; margin-bottom: 24px; }
+      header h1 { margin: 14px 0 0 0; font-size: 1.8rem; line-height: 1.05; }
+      header p { margin: 8px 0 0; color: var(--muted); max-width: 60rem; }
+      .hero-pill { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 12px; background: linear-gradient(90deg,#0b1220,#111827); color: #f8fafc; font-weight:700; font-size: 0.9rem; box-shadow: 0 8px 28px rgba(2,6,23,0.16); }
+      .pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 11px; border-radius: 999px; background: linear-gradient(90deg,#0f1724,#0b1220); color: #e6eef8; font-size: 0.88rem; box-shadow: 0 6px 18px rgba(2,6,23,0.12); }
+      .card { background: linear-gradient(180deg,#ffffff,#fbfdff); border-radius: 14px; padding: 22px; box-shadow: 0 12px 36px rgba(11,18,32,0.06); border: 1px solid var(--border-soft); }
+      h2 { margin-top: 0; font-size: 1.15rem; color: #fb923c; }
+      .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; align-items:center; }
+      button { min-width: 120px; border: none; border-radius: 10px; font-weight: 700; cursor: pointer; padding: 11px 16px; transition: transform 120ms ease, box-shadow 120ms ease; font-size: 0.95rem; }
+      button:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(2,6,23,0.12); }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      button.primary { background: linear-gradient(90deg,#0b1220,#111827); color: #ffffff; box-shadow: 0 8px 30px rgba(2,6,23,0.18); }
+      button.secondary { background: linear-gradient(90deg,#0f1724,#0b1220); color: #e6eef8; }
+      a.backlink { text-decoration:none; color: var(--primary-end); font-weight: 700; }
+      .progress-wrap { background: rgba(14,165,164,0.06); border-radius: 10px; height: 18px; overflow: hidden; position: relative; margin-top: 16px; }
+      .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg,var(--primary-start),var(--primary-end)); transition: width 300ms ease; display:flex; align-items:center; justify-content:center; color:white; font-weight:800; font-size:0.78rem; }
+      .progress-bar .stripe { position:absolute; inset:0; background-image: linear-gradient(135deg, rgba(255,255,255,0.12) 25%, rgba(0,0,0,0.02) 25%, rgba(0,0,0,0.02) 50%, rgba(255,255,255,0.06) 50%, rgba(255,255,255,0.06) 75%, rgba(0,0,0,0.01) 75%); background-size: 24px 24px; opacity:0.6; }
+      .progress-bar.animated .stripe { animation: scroll-stripes 1.2s linear infinite; }
+      @keyframes scroll-stripes { from { background-position: 0 0; } to { background-position: 48px 0; } }
+      .status-line { margin-top: 10px; color: var(--muted); font-size: 0.92rem; min-height: 1.2em; }
+      table { width:100%; border-collapse: collapse; font-size: 0.92rem; margin-top: 14px; }
+      th, td { padding: 9px 12px; text-align:left; border-bottom: 1px solid var(--border-soft); }
+      th { color: var(--muted); font-weight: 800; }
+      .tag { display:inline-block; padding: 3px 9px; border-radius: 999px; font-size:0.78rem; font-weight:800; }
+      .tag.ok { background: rgba(16,185,129,0.12); color:#047857; }
+      .tag.bad { background: rgba(239,68,68,0.12); color:#b91c1c; }
+      .summary { margin-top: 16px; font-weight: 700; }
+      .notice { margin-top: 18px; padding: 14px 16px; border-radius: 12px; background: linear-gradient(180deg,#f8fafc,#ffffff); border: 1px solid var(--border-soft); color: var(--muted); font-size: 0.9rem; }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <span class="hero-pill">AEM ⇢ Local</span>
+        <a href="/" class="backlink" style="float:right;">← Back to validation</a>
+        <h1>Download BenQ PDFs</h1>
+        <p>Fetches the <strong>latest generated PDF</strong> for every configured product from the AEM Guides server and stores it under <code>benq_pdfs/&lt;PRODUCT&gt;/</code>. Existing files are overwritten with the newest version.</p>
+      </header>
+
+      <section class="card">
+        <h2>Run download</h2>
+        <div class="actions">
+          <button id="startBtn" class="primary">⬇ Download latest PDFs</button>
+          <button id="zipBtn" class="secondary" disabled>Download all as ZIP</button>
+        </div>
+
+        <div class="progress-wrap" id="progWrap" style="display:none;">
+          <div class="progress-bar" id="progBar"><span class="stripe"></span><span id="progPct"></span></div>
+        </div>
+        <div class="status-line" id="statusLine"></div>
+
+        <div id="summary" class="summary"></div>
+        <div id="resultsWrap"></div>
+
+        <div class="notice">
+          Products and AEM credentials are configured in <code>download_benq_pdfs.py</code>. The download runs server-side; you can leave this page open while it works.
+        </div>
+      </section>
+
+      <section class="card" style="margin-top:22px;">
+        <h2>Download a single product</h2>
+        <p style="margin:0 0 14px; color:var(--muted); max-width:60rem;">
+          Every downloaded <strong>PROD product</strong>. Pick one to grab its generated PROD PDF;
+          where a matching <strong>Final Cleanup files</strong> entry exists (by folder name), its
+          source ZIP is offered too.
+        </p>
+
+        <div class="actions">
+          <select id="prodSelect" style="min-width:320px; padding:11px 14px; border-radius:10px; border:1px solid var(--border); background:#fff; font-size:0.95rem; font-weight:600; color:var(--text);">
+            <option value="">Loading products…</option>
+          </select>
+          <button id="reloadProducts" class="secondary">↻ Refresh</button>
+          <button id="allPdfBtn" class="primary">⬇ Download all PROD PDFs</button>
+        </div>
+
+        <div id="prodDetail" style="display:none; margin-top:16px;">
+          <table>
+            <thead><tr><th>File</th><th>Source</th><th>Size</th><th></th></tr></thead>
+            <tbody>
+              <tr>
+                <td><strong>PROD PDF</strong><br><span id="pdfName" style="color:var(--muted); font-size:0.85rem;"></span></td>
+                <td>benq_pdfs</td>
+                <td id="pdfSize"></td>
+                <td><button id="pdfBtn" class="primary">⬇ Download PDF</button></td>
+              </tr>
+              <tr id="zipRow">
+                <td><strong>Final Cleanup ZIP</strong><br><span id="zipName" style="color:var(--muted); font-size:0.85rem;"></span></td>
+                <td id="zipSource"></td>
+                <td id="zipSize"></td>
+                <td><button id="zipDlBtn" class="secondary">⬇ Download ZIP</button></td>
+              </tr>
+              <tr id="noZipRow">
+                <td colspan="4" style="color:var(--muted); font-style:italic;">No matching Final Cleanup file for this product — PROD PDF only.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="actions" style="margin-top:16px; border-top:1px solid var(--border-soft); padding-top:16px;">
+            <button id="validateBtn" class="primary">➕ Add to validation queue</button>
+            <a href="/" class="backlink" id="goValidate" style="display:none;">Go to validation →</a>
+            <span id="validateMsg" class="status-line" style="margin:0;"></span>
+          </div>
+          <p style="margin:8px 0 0; color:var(--muted); font-size:0.85rem;">
+            Queues this product without downloading — <strong>PROD</strong> = the generated PDF,
+            <strong>STAGE</strong> = the PDF inside its Final Cleanup file. Then run it from the
+            validation page.
+          </p>
+        </div>
+        <div id="prodEmpty" class="notice" style="display:none;">
+          No matched products found. Download the PROD PDFs above first, and make sure the
+          Final Cleanup files directory is reachable (set <code>BENQ_CLEANUP_DIR</code> if its path differs).
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const startBtn = document.getElementById('startBtn');
+      const zipBtn = document.getElementById('zipBtn');
+      const progWrap = document.getElementById('progWrap');
+      const progBar = document.getElementById('progBar');
+      const progPct = document.getElementById('progPct');
+      const statusLine = document.getElementById('statusLine');
+      const summary = document.getElementById('summary');
+      const resultsWrap = document.getElementById('resultsWrap');
+      let poll = null;
+
+      const STATUS_LABEL = {
+        ok: 'Downloaded', not_found: 'No ditamap', no_pdf: 'Never generated',
+        error: 'Error', bad_pdf: 'Not a PDF',
+      };
+
+      function renderRows(rows) {
+        if (!rows || !rows.length) { resultsWrap.innerHTML = ''; return; }
+        let html = '<table><thead><tr><th>#</th><th>Product</th><th>Status</th><th>Detail</th></tr></thead><tbody>';
+        rows.forEach((r, i) => {
+          const ok = r.status === 'ok';
+          const detail = ok ? `${r.file} · ${r.kb} KB · ${r.match}` : (r.detail || '');
+          html += `<tr><td>${i + 1}</td><td><strong>${r.product}</strong></td>`
+                + `<td><span class="tag ${ok ? 'ok' : 'bad'}">${STATUS_LABEL[r.status] || r.status}</span></td>`
+                + `<td>${detail}</td></tr>`;
+        });
+        html += '</tbody></table>';
+        resultsWrap.innerHTML = html;
+      }
+
+      function update(d) {
+        progWrap.style.display = 'block';
+        progBar.style.width = (d.pct || 0) + '%';
+        progPct.textContent = (d.pct || 0) + '%';
+        statusLine.textContent = d.current || '';
+        if (d.rows && d.rows.length) renderRows(d.rows);
+        if (d.error) { statusLine.textContent = 'Failed: ' + d.error; statusLine.style.color = '#b91c1c'; }
+        if (d.finished) {
+          clearInterval(poll); poll = null;
+          startBtn.disabled = false;
+          progBar.classList.remove('animated');
+          if (!d.error && d.total) {
+            summary.textContent = `Downloaded ${d.ok} of ${d.total} products.`;
+            if (d.ok > 0) zipBtn.disabled = false;
+          }
+        }
+      }
+
+      async function tick() {
+        try {
+          const r = await fetch('/download/progress');
+          update(await r.json());
+        } catch (e) { /* keep polling */ }
+      }
+
+      startBtn.addEventListener('click', async () => {
+        startBtn.disabled = true;
+        zipBtn.disabled = true;
+        summary.textContent = '';
+        resultsWrap.innerHTML = '';
+        statusLine.style.color = '';
+        progBar.classList.add('animated');
+        const r = await fetch('/download/start', { method: 'POST' });
+        if (r.status === 409) {
+          // a run is already going — just attach to it
+        } else if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          statusLine.textContent = 'Could not start: ' + (j.error || r.status);
+          statusLine.style.color = '#b91c1c';
+          startBtn.disabled = false;
+          return;
+        }
+        if (poll) clearInterval(poll);
+        poll = setInterval(tick, 800);
+        tick();
+      });
+
+      zipBtn.addEventListener('click', () => { window.location = '/download/zip'; });
+
+      // ── Per-product download ──────────────────────────────────────────────
+      const prodSelect = document.getElementById('prodSelect');
+      const prodDetail = document.getElementById('prodDetail');
+      const prodEmpty = document.getElementById('prodEmpty');
+      const reloadProducts = document.getElementById('reloadProducts');
+      const pdfName = document.getElementById('pdfName');
+      const pdfSize = document.getElementById('pdfSize');
+      const zipName = document.getElementById('zipName');
+      const zipSize = document.getElementById('zipSize');
+      const zipSource = document.getElementById('zipSource');
+      const pdfBtn = document.getElementById('pdfBtn');
+      const zipDlBtn = document.getElementById('zipDlBtn');
+      let products = [];
+
+      const zipRow = document.getElementById('zipRow');
+      const noZipRow = document.getElementById('noZipRow');
+      const validateBtn = document.getElementById('validateBtn');
+      const validateMsg = document.getElementById('validateMsg');
+      const goValidate = document.getElementById('goValidate');
+
+      function showDetail() {
+        const m = products.find(p => p.product === prodSelect.value);
+        if (!m) { prodDetail.style.display = 'none'; return; }
+        pdfName.textContent = m.pdf_dl || m.pdf_name;
+        pdfSize.textContent = m.pdf_kb + ' KB';
+        const hasZip = !!m.zip_name;
+        zipRow.style.display = hasZip ? '' : 'none';
+        noZipRow.style.display = hasZip ? 'none' : '';
+        if (hasZip) {
+          zipName.textContent = m.zip_name;
+          zipSize.textContent = m.zip_kb + ' KB';
+          zipSource.textContent = m.source;
+        }
+        // Validation needs a STAGE source (the cleanup PDF); disable without one.
+        validateBtn.disabled = !hasZip;
+        validateBtn.title = hasZip ? '' : 'No Final Cleanup file to use as STAGE.';
+        validateMsg.textContent = '';
+        validateMsg.style.color = '';
+        goValidate.style.display = 'none';
+        prodDetail.style.display = 'block';
+      }
+
+      validateBtn.addEventListener('click', async () => {
+        const product = prodSelect.value;
+        if (!product) return;
+        validateBtn.disabled = true;
+        validateMsg.style.color = '';
+        validateMsg.textContent = 'Adding to validation queue…';
+        goValidate.style.display = 'none';
+        try {
+          const r = await fetch('/download/add-to-validation/' + encodeURIComponent(product), { method: 'POST' });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+          validateMsg.style.color = '#047857';
+          validateMsg.textContent = `Queued "${product}" (${d.queue.length} in queue).`;
+          goValidate.style.display = 'inline';
+        } catch (e) {
+          validateMsg.style.color = '#b91c1c';
+          validateMsg.textContent = 'Failed: ' + e.message;
+        } finally {
+          validateBtn.disabled = false;
+        }
+      });
+
+      async function loadProducts() {
+        prodSelect.innerHTML = '<option value="">Loading products…</option>';
+        prodDetail.style.display = 'none';
+        prodEmpty.style.display = 'none';
+        try {
+          const r = await fetch('/download/products');
+          const d = await r.json();
+          products = d.products || [];
+        } catch (e) { products = []; }
+        if (!products.length) {
+          prodSelect.innerHTML = '<option value="">No matched products</option>';
+          prodEmpty.style.display = 'block';
+          return;
+        }
+        prodSelect.innerHTML = '<option value="">Select a product…</option>'
+          + products.map(p => `<option value="${p.product}">${p.product} (${p.source || 'PDF only'})</option>`).join('');
+      }
+
+      prodSelect.addEventListener('change', showDetail);
+      reloadProducts.addEventListener('click', loadProducts);
+      document.getElementById('allPdfBtn').addEventListener('click', () => {
+        window.location = '/download/all-prod-pdfs';
+      });
+      pdfBtn.addEventListener('click', () => {
+        if (prodSelect.value) window.location = '/download/prod-pdf/' + encodeURIComponent(prodSelect.value);
+      });
+      zipDlBtn.addEventListener('click', () => {
+        if (prodSelect.value) window.location = '/download/cleanup-zip/' + encodeURIComponent(prodSelect.value);
+      });
+      loadProducts();
+
+      // If a download is already running when the page loads, attach to it.
+      tick().then(() => {
+        fetch('/download/progress').then(r => r.json()).then(d => {
+          if (d.running) {
+            startBtn.disabled = true;
+            progBar.classList.add('animated');
+            poll = setInterval(tick, 800);
+          }
+        });
+      });
+    </script>
+  </body>
+</html>

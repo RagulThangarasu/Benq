@@ -5,14 +5,15 @@ PROD is the reference ("expected"); STAGE is what's checked ("actual").
 Nine style dimensions are validated and collected into one clean PDF report:
 
   1. Image position        — left / centre / right alignment per image
-  2. Space above image     — vertical gap between an image and the text above it
-  3. Heading style         — heading colour & relative size
-  4. Paragraph spacing     — gap above and below body paragraphs
-  5. Text colour           — body-text colour (should stay PROD's colour)
-  6. Info / notice colour  — colour of NOTE / TIP / IMPORTANT callouts
-  7. Table layout breaking — tables that split across a page boundary
-  8. Hyperlink issues      — missing / broken / re-targeted links
-  9. Underline removal      — text underlines in STAGE that should be removed
+  2. Image padding         — left / right whitespace (margins) around each image
+  3. Space above image     — vertical gap between an image and the text above it
+  4. Heading style         — heading colour & relative size
+  5. Paragraph spacing     — gap above and below body paragraphs
+  6. Text colour           — body-text colour (should stay PROD's colour)
+  7. Info / notice colour  — NOTE / TIP / IMPORTANT label-text colour only
+                             (icon colour & themed background vary per type — not flagged)
+  8. Table layout breaking — tables that split across a page boundary
+  9. Hyperlink issues      — missing / broken / re-targeted links
 
 Built on PyMuPDF (open-source). Run:
 
@@ -24,6 +25,13 @@ import os
 import re
 import statistics
 import sys
+
+# Configure local TESSDATA_PREFIX before importing fitz (PyMuPDF)
+_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_CUR_DIR)
+_LOCAL_TESSDATA = os.path.join(_PROJECT_ROOT, "tessdata")
+if os.path.isdir(_LOCAL_TESSDATA):
+    os.environ["TESSDATA_PREFIX"] = _LOCAL_TESSDATA
 
 import fitz  # PyMuPDF
 
@@ -38,15 +46,64 @@ from reportlab.platypus import (
 # Works both as a package submodule (content_validation.style_validation) and
 # when run_validator.py / the tests import this file as a top-level module.
 try:
-    from .validate_toc_content import (
-        get_toc, _norm_key, _toc_ranges_by_key, _doc_body_size, _style_class_rel,
-    )
+    from .validate_toc_content import get_toc, _norm_key, _is_pdf_garbled, _get_pdf_language
 except ImportError:
-    from validate_toc_content import (
-        get_toc, _norm_key, _toc_ranges_by_key, _doc_body_size, _style_class_rel,
-    )
+    from validate_toc_content import get_toc, _norm_key, _is_pdf_garbled, _get_pdf_language
 
 NOTICE_RE = re.compile(r"\b(NOTE|TIP|IMPORTANT|WARNING|CAUTION|INFO)\b", re.IGNORECASE)
+
+
+# ── Style helpers (self-contained; previously shared from validate_toc_content) ──
+def _toc_ranges_by_key(toc: list, total_pages: int) -> dict:
+    """Return {_norm_key(title): (start_page, end_page, title)} for TOC entries."""
+    out = {}
+    for i, (lvl, title, pg) in enumerate(toc):
+        end_pg = total_pages
+        for j in range(i + 1, len(toc)):
+            if toc[j][0] <= lvl:
+                end_pg = toc[j][2] - 1
+                break
+        key = _norm_key(title)
+        out.setdefault(key, (pg, max(pg, end_pg), title))
+    return out
+
+
+def _doc_body_size(doc) -> float:
+    """Most common font size of running body text (lines >= 15 chars)."""
+    sizes = {}
+    for page in doc:
+        d = page.get_text("dict")
+        for b in d.get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for line in b.get("lines", []):
+                spans = line.get("spans", [])
+                txt = "".join(s.get("text", "") for s in spans).strip()
+                if len(txt) < 15:
+                    continue
+                mx = max((round(s.get("size", 0.0), 1) for s in spans), default=0.0)
+                if mx > 0:
+                    sizes[mx] = sizes.get(mx, 0) + 1
+    if not sizes:
+        return 10.0
+    return max(sizes.items(), key=lambda kv: kv[1])[0]
+
+
+def _style_class_rel(text: str, max_size: float, body_size: float) -> str:
+    """Classify a line by its size ratio to the document's own body size."""
+    t = (text or "").strip()
+    if not t:
+        return "other"
+    if NOTICE_RE.search(t):
+        return "notice"
+    ratio = (max_size / body_size) if body_size > 0 else 1.0
+    if ratio >= 1.45:
+        return "heading"
+    if ratio >= 1.12:
+        return "subheading"
+    if ratio >= 0.85 and len(t) >= 15:
+        return "body"
+    return "other"
 
 # Optional progress reporting. run_validator.py installs a callback so the web
 # UI's progress bar can advance *during* a job (per page parsed), not just jump
@@ -79,6 +136,7 @@ def _cdist(a, b):
     return sum((x - y) ** 2 for x, y in zip(ra, rb)) ** 0.5
 
 COLOR_TOL = 28          # RGB euclidean distance below which two colours are "the same"
+IMG_PAD_TOL = 12        # pt — left/right image padding diff (PROD vs STAGE) above which we flag
 WHITE = 0xFFFFFF
 
 def _dominant_color(weighted):
@@ -105,7 +163,16 @@ def _extract_page(page, pno, body_size):
     pw, ph = page.rect.width, page.rect.height
     lines, images, links, hstrokes, tables, fills = [], [], [], [], [], []
 
-    for b in page.get_text("dict").get("blocks", []):
+    doc = page.parent
+    tp = None
+    if _is_pdf_garbled(doc):
+        lang = _get_pdf_language(doc)
+        try:
+            tp = page.get_textpage_ocr(dpi=150, language=lang)
+        except Exception as e:
+            print(f"OCR failed for style page {pno}: {e}")
+
+    for b in page.get_text("dict", textpage=tp).get("blocks", []):
         if b.get("type") != 0:
             continue
         for ln in b.get("lines", []):
@@ -304,10 +371,149 @@ def _wrapped_cell_padding_stats(feat):
     }
 
 
+def _space_below_headings(feat):
+    """List of (heading_line, gap_below) using nearest line below with x-overlap on the same page."""
+    out = []
+    lines = sorted(feat["lines"], key=lambda l: (l["page"], l["rect"].y0))
+    for i, h_line in enumerate(lines):
+        if h_line["cls"] not in ("heading", "subheading"):
+            continue
+        best = None
+        for j in range(i + 1, len(lines)):
+            b = lines[j]
+            if b["page"] != h_line["page"]:
+                break
+            r = b["rect"]
+            hr = h_line["rect"]
+            if r.y0 >= hr.y1 - 1 and not (r.x1 < hr.x0 or r.x0 > hr.x1):
+                best = r.y0
+                break
+        if best is not None:
+            gap = round(best - h_line["rect"].y1, 1)
+            if 0 <= gap < 150:
+                out.append((h_line, gap))
+    return out
+
+
 # ── checks (each returns a list of finding dicts) ───────────────────────────
 def _f(cat, sev, topic, pages, expected, actual, issue, fix):
     return {"category": cat, "severity": sev, "topic": topic, "pages": pages,
             "expected": expected, "actual": actual, "issue": issue, "fix": fix}
+
+
+# BenQ A4 PDF typography specification
+# Source: BenQ style guide (H1/H2/H3 headings, body, table note)
+_BENQ_TYPO_SPEC = {
+    "H1 heading":      {"size": 20.0, "bold": True,  "tol": 1.5},
+    "H2 heading":      {"size": 14.0, "bold": True,  "tol": 1.5},
+    "H3 heading":      {"size": 12.0, "bold": True,  "tol": 1.0},
+    "Body text":       {"size": 12.0, "bold": False, "tol": 1.0},
+    "Table note text": {"size": 10.0, "bold": False, "tol": 1.0},
+}
+
+# Tolerance (pt) within which a size is accepted as matching the spec
+_TYPO_TOL = 1.5
+
+
+def _is_bold_span(flags: int) -> bool:
+    """PyMuPDF font flags: bit 4 (0x10) = bold."""
+    return bool(flags & 0x10)
+
+
+def check_typography_spec(stage_doc, s_body, findings):
+    """Check that STAGE heading and body font sizes match the BenQ A4 PDF spec.
+
+    BenQ A4 PDF specification (from style guide):
+      H1  — 20 pt, Bold
+      H2  — 14 pt, Bold
+      H3  — 12 pt, Bold
+      Body default — 12 pt, Regular
+      Table note   — 10 pt, Regular
+
+    Strategy: collect all text spans from STAGE, bucket them by approximate
+    size, then map the three largest size buckets to H1/H2/H3 and verify.
+    Body and table-note are checked using modal sizes near the spec values.
+    """
+    from collections import defaultdict
+
+    # Collect (size, bold, page) per span across the whole document
+    size_samples: dict[float, list] = defaultdict(list)
+    for pno, page in enumerate(stage_doc, 1):
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            for ln in b.get("lines", []):
+                for sp in ln.get("spans", []):
+                    txt = (sp.get("text") or "").strip()
+                    if len(txt) < 2:
+                        continue
+                    sz = round(sp.get("size", 0.0) * 2) / 2  # round to 0.5pt
+                    bold = _is_bold_span(sp.get("flags", 0))
+                    size_samples[sz].append({"page": pno, "bold": bold, "text": txt})
+
+    if not size_samples:
+        return
+
+    # Sort size buckets largest-first to identify heading levels
+    sorted_sizes = sorted(size_samples.keys(), reverse=True)
+
+    # Heading candidates: sizes noticeably above the body size
+    heading_candidates = [s for s in sorted_sizes if s > s_body + 1.0]
+
+    spec_checks = []
+    if len(heading_candidates) >= 1:
+        spec_checks.append(("H1 heading", heading_candidates[0]))
+    if len(heading_candidates) >= 2:
+        spec_checks.append(("H2 heading", heading_candidates[1]))
+    if len(heading_candidates) >= 3:
+        spec_checks.append(("H3 heading", heading_candidates[2]))
+
+    # Body text: modal size near 12pt
+    body_candidates = [s for s in sorted_sizes
+                       if abs(s - 12.0) <= 2.0 and s <= s_body + 1.0]
+    if body_candidates:
+        # pick the most common one
+        body_size = max(body_candidates, key=lambda s: len(size_samples[s]))
+        spec_checks.append(("Body text", body_size))
+
+    # Table note: modal size near 10pt
+    note_candidates = [s for s in sorted_sizes if abs(s - 10.0) <= 2.0]
+    if note_candidates:
+        note_size = max(note_candidates, key=lambda s: len(size_samples[s]))
+        spec_checks.append(("Table note text", note_size))
+
+    for level, actual_size in spec_checks:
+        spec = _BENQ_TYPO_SPEC[level]
+        expected_size = spec["size"]
+        tol = spec["tol"]
+        samples = size_samples[actual_size]
+        pages_str = ", ".join(str(p) for p in
+                              sorted({s["page"] for s in samples})[:5])
+
+        # Check size
+        if abs(actual_size - expected_size) > tol:
+            sev = "High" if abs(actual_size - expected_size) > 3 else "Medium"
+            findings.append(_f(
+                "Typography spec", sev, level, pages_str,
+                f"{expected_size}pt",
+                f"{actual_size}pt",
+                f"{level} size is {actual_size}pt — BenQ A4 spec requires {expected_size}pt "
+                f"(Δ{abs(round(actual_size - expected_size, 1))}pt).",
+                f"Set {level} to {expected_size}pt per BenQ A4 PDF typography specification.",
+            ))
+
+        # Check bold for headings
+        if spec["bold"] and level.endswith("heading"):
+            non_bold = [s for s in samples if not s["bold"]]
+            if non_bold and len(non_bold) / max(len(samples), 1) > 0.3:
+                nb_pages = ", ".join(str(s["page"]) for s in non_bold[:5])
+                findings.append(_f(
+                    "Typography spec", "Medium", f"{level} (not bold)", nb_pages,
+                    "Bold",
+                    "Regular / not bold",
+                    f"{level} has non-bold instances — BenQ A4 spec requires Bold.",
+                    f"Apply Bold weight to all {level} text.",
+                ))
 
 
 def check_heading_color(p_all, s_all, findings):
@@ -508,19 +714,10 @@ def check_info_callouts(p_info, s_info, findings):
                 "Add a coloured info icon and colour the label text (and a themed background)."))
             continue
 
-        # icon should be coloured
-        if icon_missing:
-            findings.append(_f(
-                "Info / notice colour", "Medium", f"{typ} icon", pages,
-                "Coloured info icon", "No icon",
-                f"{typ} callouts have no info icon.",
-                "Add a coloured info icon matching the theme."))
-        elif icon_tot and s["icon_gray"] > s["icon_color"]:
-            findings.append(_f(
-                "Info / notice colour", "Low", f"{typ} icon", pages,
-                "Coloured info icon", "Greyscale / uncoloured icon",
-                f"{typ} icon is not coloured.",
-                "Colour the info icon to match the theme."))
+        # NOTE: the coloured icon and the themed background colour legitimately
+        # differ per callout type (NOTE / TIP / IMPORTANT / WARNING each carry
+        # their own theme colour), so icon-colour and background-colour diffs are
+        # NOT flagged — they are expected variation, not defects.
 
         # text should be coloured (theme colour for the callout type)
         p_text = _mode(p["text"]) if p else None
@@ -531,27 +728,6 @@ def check_info_callouts(p_info, s_info, findings):
                 f"Label text {_hex(s_text)} (not coloured)",
                 f"{typ} label text is {_hex(s_text)}, which is a grey/black, not a theme colour.",
                 "Colour the label text to the callout's theme colour."))
-        elif p and _is_chromatic(p_text) and _cdist(p_text, s_text) > COLOR_TOL:
-            findings.append(_f(
-                "Info / notice colour", "Low", f"{typ} text", pages,
-                f"Text {_hex(p_text)}", f"Text {_hex(s_text)}",
-                f"{typ} label text colour differs from PROD.",
-                f"Set {typ} text toward {_hex(p_text)} (or the theme colour)."))
-
-        # themed background (informational — theme dependent)
-        p_bg = _mode(p["bg"]) if p else -1
-        if themed_bg and p and p_bg not in (None, -1) and _cdist(s_bg, p_bg) > 18:
-            findings.append(_f(
-                "Info / notice colour", "Low", f"{typ} background", pages,
-                f"Background {_hex(p_bg)}", f"Background {_hex(s_bg)}",
-                f"{typ} themed background colour differs from PROD.",
-                "Confirm the themed background colour is intended."))
-        elif not themed_bg and p and p_bg not in (None, -1):
-            findings.append(_f(
-                "Info / notice colour", "Low", f"{typ} background", pages,
-                f"Background {_hex(p_bg)}", "No background",
-                f"{typ} has a themed background in PROD but none in STAGE.",
-                "Add the themed background colour if the theme calls for it."))
 
 
 def check_heading_size(sections, findings):
@@ -599,29 +775,222 @@ def check_space_above_image(sections, findings):
                 f"Set space above images toward ~{pm}pt."))
 
 
-def check_image_position(sections, findings):
+def check_image_dimensions_and_alignment(sections, findings):
+    for title, p_feat, s_feat in sections:
+        pim = sorted([im for im in p_feat["images"] if max(im["rect"].width, im["rect"].height) > 80.0],
+                     key=lambda im: (im["page"], im["rect"].y0))
+        sim = sorted([im for im in s_feat["images"] if max(im["rect"].width, im["rect"].height) > 80.0],
+                     key=lambda im: (im["page"], im["rect"].y0))
+        if not pim or not sim or len(pim) != len(sim):
+            continue
+            
+        for i, (pi, si) in enumerate(zip(pim, sim)):
+            pw_val, sw_val = round(pi["rect"].width, 1), round(si["rect"].width, 1)
+            if abs(pw_val - sw_val) > 5.0 and (abs(pw_val - sw_val) / max(pw_val, 1)) > 0.10:
+                findings.append(_f(
+                    "Image dimension", "Medium", title, str(si["page"]),
+                    f"Image #{i+1} width ~{pw_val}pt", f"Image #{i+1} width ~{sw_val}pt",
+                    f"Image #{i+1} has a width of {sw_val}pt in STAGE vs {pw_val}pt in PROD.",
+                    f"Resize the image in STAGE to match PROD width of {pw_val}pt."))
+            
+            pa, sa = _align(pi["rect"], pi["pw"]), _align(si["rect"], si["pw"])
+            pcx = (pi["rect"].x0 + pi["rect"].x1) / 2 / pi["pw"]
+            scx = (si["rect"].x0 + si["rect"].x1) / 2 / si["pw"]
+            if pa != sa and abs(pcx - scx) > 0.12:
+                findings.append(_f(
+                    "Image alignment", "Medium", title, str(si["page"]),
+                    f"Image #{i+1} aligned {pa}", f"Image #{i+1} aligned {sa}",
+                    f"Image #{i+1} is aligned {sa} in STAGE but {pa} in PROD.",
+                    f"Re-align the image to match PROD ({pa})."))
+
+
+def check_icon_sizes_and_alignment(sections, findings):
+    for title, p_feat, s_feat in sections:
+        pim = sorted([im for im in p_feat["images"] if max(im["rect"].width, im["rect"].height) <= 80.0],
+                     key=lambda im: (im["page"], im["rect"].y0))
+        sim = sorted([im for im in s_feat["images"] if max(im["rect"].width, im["rect"].height) <= 80.0],
+                     key=lambda im: (im["page"], im["rect"].y0))
+        if not pim or not sim or len(pim) != len(sim):
+            continue
+            
+        for i, (pi, si) in enumerate(zip(pim, sim)):
+            pw_val, sw_val = round(pi["rect"].width, 1), round(si["rect"].width, 1)
+            if abs(pw_val - sw_val) > 3.0 and (abs(pw_val - sw_val) / max(pw_val, 1)) > 0.15:
+                findings.append(_f(
+                    "Icon size", "Medium", title, str(si["page"]),
+                    f"Icon #{i+1} width ~{pw_val}pt", f"Icon #{i+1} width ~{sw_val}pt",
+                    f"Icon #{i+1} has a width of {sw_val}pt in STAGE vs {pw_val}pt in PROD.",
+                    f"Resize the icon in STAGE to match PROD width of {pw_val}pt."))
+            
+            pa, sa = _align(pi["rect"], pi["pw"]), _align(si["rect"], si["pw"])
+            pcx = (pi["rect"].x0 + pi["rect"].x1) / 2 / pi["pw"]
+            scx = (si["rect"].x0 + si["rect"].x1) / 2 / si["pw"]
+            if pa != sa and abs(pcx - scx) > 0.12:
+                findings.append(_f(
+                    "Icon alignment", "Low", title, str(si["page"]),
+                    f"Icon #{i+1} aligned {pa}", f"Icon #{i+1} aligned {sa}",
+                    f"Icon #{i+1} is aligned {sa} in STAGE but {pa} in PROD.",
+                    f"Re-align the icon to match PROD ({pa})."))
+
+
+def check_heading_below_spacing(sections, findings):
+    for title, p_feat, s_feat in sections:
+        pgaps = _space_below_headings(p_feat)
+        sgaps = _space_below_headings(s_feat)
+
+        for cls_name, label in [("heading", "H1"), ("subheading", "H2/H3")]:
+            pv = [g for ln, g in pgaps if ln["cls"] == cls_name]
+            sv = [g for ln, g in sgaps if ln["cls"] == cls_name]
+
+            pm, sm = _median(pv), _median(sv)
+            if pm is not None and sm is not None and abs(pm - sm) > 6.0:
+                more_less = "larger" if sm > pm else "smaller"
+                findings.append(_f(
+                    "Heading spacing below", "Low", title,
+                    ", ".join(str(ln["page"]) for ln, g in sgaps if ln["cls"] == cls_name)[:20] or "—",
+                    f"~{pm}pt space below {label}", f"~{sm}pt space below {label}",
+                    f"The vertical space below {label} headings is {more_less} than PROD (STAGE ~{sm}pt vs PROD ~{pm}pt).",
+                    f"Adjust the spacing below {label} headings to ~{pm}pt to match PROD."))
+
+
+def check_heading_line_height_global(p_all, s_all, findings):
+    """Check space-below-heading across ALL pages end-to-end (PROD median vs each STAGE heading).
+
+    Returns (prod_heading_count, stage_heading_count, issue_count).
+    Complements check_heading_below_spacing (section-level) with a document-wide view.
+    """
+    pgaps = _space_below_headings(p_all)
+    sgaps = _space_below_headings(s_all)
+
+    prod_total = len(pgaps)
+    stage_total = len(sgaps)
+    issue_count = 0
+
+    for cls_name, label in [("heading", "H1"), ("subheading", "H2/H3")]:
+        pv  = [g for ln, g in pgaps if ln["cls"] == cls_name]
+        sv  = [(ln, g) for ln, g in sgaps if ln["cls"] == cls_name]
+        pm  = _median(pv)
+        sm  = _median([g for _, g in sv])
+        if pm is None:
+            continue
+
+        tol = 5.0  # pt tolerance — flag headings whose gap deviates more than this
+        bad_pages = sorted({ln["page"] for ln, g in sv if abs(g - pm) > tol})
+        n_bad = sum(1 for _, g in sv if abs(g - pm) > tol)
+
+        if n_bad > 0:
+            issue_count += n_bad
+            pg_str = ", ".join(str(p) for p in bad_pages[:15])
+            if len(bad_pages) > 15:
+                pg_str += f" … (+{len(bad_pages)-15} more)"
+            findings.append(_f(
+                "Heading line height", "Medium",
+                f"{label} — line height below heading (all pages)",
+                pg_str or "—",
+                f"~{pm}pt below {label} (PROD median across all pages)",
+                f"~{sm}pt median · {n_bad} of {len(sv)} {label} headings deviate >5pt in STAGE",
+                (f"{n_bad} {label} heading(s) on page(s) {pg_str} have incorrect line height below "
+                 f"the heading. PROD median is ~{pm}pt; STAGE median is ~{sm}pt."),
+                f"Set the paragraph spacing below {label} headings in STAGE to ~{pm}pt to match PROD."
+            ))
+
+    return prod_total, stage_total, issue_count
+
+
+def check_image_dimensions_global(p_cache, s_cache, prod_doc, stage_doc, findings):
+    """Compare image dimensions page-by-page across ALL pages (width + height, ≥80pt images).
+
+    Returns (images_checked, issues_found).
+    Complements check_image_dimensions_and_alignment (section-level) with full-document coverage.
+    """
+    checked = 0
+    issues  = 0
+
+    common_pages = min(prod_doc.page_count, stage_doc.page_count)
+    for pno in range(1, common_pages + 1):
+        if pno not in p_cache or pno not in s_cache:
+            continue
+        p_feat = _assemble(p_cache, pno, pno)
+        s_feat = _assemble(s_cache, pno, pno)
+
+        pim = sorted(
+            [im for im in p_feat["images"] if max(im["rect"].width, im["rect"].height) > 80.0],
+            key=lambda im: im["rect"].y0,
+        )
+        sim = sorted(
+            [im for im in s_feat["images"] if max(im["rect"].width, im["rect"].height) > 80.0],
+            key=lambda im: im["rect"].y0,
+        )
+        if not pim or not sim:
+            continue
+
+        for idx, (pi, si) in enumerate(zip(pim, sim), 1):
+            checked += 1
+            pw = round(pi["rect"].width,  1)
+            ph = round(pi["rect"].height, 1)
+            sw = round(si["rect"].width,  1)
+            sh = round(si["rect"].height, 1)
+
+            w_diff  = abs(pw - sw)
+            h_diff  = abs(ph - sh)
+            w_pct   = w_diff / max(pw, 1) * 100
+            h_pct   = h_diff / max(ph, 1) * 100
+
+            bad_w = w_diff > 5.0 and w_pct > 10
+            bad_h = h_diff > 5.0 and h_pct > 10
+            if bad_w or bad_h:
+                issues += 1
+                dim_note = []
+                if bad_w:
+                    dim_note.append(f"W: PROD {pw}pt → STAGE {sw}pt ({w_pct:.0f}% off)")
+                if bad_h:
+                    dim_note.append(f"H: PROD {ph}pt → STAGE {sh}pt ({h_pct:.0f}% off)")
+                findings.append(_f(
+                    "Image dimension", "Medium",
+                    f"Page {pno} — image #{idx}",
+                    str(pno),
+                    f"W:{pw}pt × H:{ph}pt (PROD)",
+                    f"W:{sw}pt × H:{sh}pt (STAGE)",
+                    "Image dimension mismatch: " + "; ".join(dim_note) + ".",
+                    f"Resize image #{idx} on page {pno} in STAGE to W:{pw}pt × H:{ph}pt.",
+                ))
+
+    return checked, issues
+
+
+def check_image_padding(sections, findings):
+    """Apple-to-apple image padding: the left / right whitespace (margins) around
+    each image in PROD should match STAGE. Images are paired by reading order
+    within a section, only when both sides expose the same image count (so we
+    compare like for like). Right padding is only judged when the two images are
+    a similar width (otherwise the difference is a resize, not a padding change),
+    and pages with different geometry are skipped."""
     for title, p_feat, s_feat in sections:
         pim = sorted(p_feat["images"], key=lambda im: (im["page"], im["rect"].y0))
         sim = sorted(s_feat["images"], key=lambda im: (im["page"], im["rect"].y0))
-        # only compare when both sides expose the same number of images
         if not pim or not sim or len(pim) != len(sim):
             continue
         mism = []
         for i, (pi, si) in enumerate(zip(pim, sim)):
-            pa, sa = _align(pi["rect"], pi["pw"]), _align(si["rect"], si["pw"])
-            pcx = (pi["rect"].x0 + pi["rect"].x1) / 2 / pi["pw"]
-            scx = (si["rect"].x0 + si["rect"].x1) / 2 / si["pw"]
-            # require a real horizontal shift, not a borderline rounding
-            if pa != sa and abs(pcx - scx) > 0.12:
-                mism.append((i, pa, sa))
+            if abs(pi["pw"] - si["pw"]) > 6:      # different page geometry — not comparable
+                continue
+            pl, sl = pi["rect"].x0, si["rect"].x0                 # left padding (indent)
+            pr, sr = pi["pw"] - pi["rect"].x1, si["pw"] - si["rect"].x1   # right padding
+            pwd, swd = pi["rect"].width, si["rect"].width
+            widths_similar = max(pwd, swd) and abs(pwd - swd) / max(pwd, swd) < 0.15
+            dl = abs(pl - sl)
+            dr = abs(pr - sr) if widths_similar else 0.0
+            if dl > IMG_PAD_TOL or dr > IMG_PAD_TOL:
+                mism.append((i, round(pl), round(sl), round(pr), round(sr), max(dl, dr)))
         if mism:
+            worst = round(max(m[5] for m in mism))
             findings.append(_f(
-                "Image position", "Medium", title,
-                ", ".join(str(sim[i]["page"]) for i, _a, _b in mism[:4]),
-                ", ".join(f"#{i+1}:{a}" for i, a, _b in mism[:4]),
-                ", ".join(f"#{i+1}:{b}" for i, _a, b in mism[:4]),
-                f"{len(mism)} image(s) have different horizontal alignment.",
-                "Re-align image(s) to match PROD."))
+                "Image padding", "Low", title,
+                ", ".join(str(sim[i]["page"]) for i, *_ in mism[:4]),
+                ", ".join(f"#{i+1}:L{pl}/R{pr}pt" for i, pl, sl, pr, sr, _ in mism[:4]),
+                ", ".join(f"#{i+1}:L{sl}/R{sr}pt" for i, pl, sl, pr, sr, _ in mism[:4]),
+                f"{len(mism)} image(s) have different left/right padding (up to {worst}pt).",
+                "Adjust image margins to match PROD."))
 
 
 def _pctl(vals, q):
@@ -978,7 +1347,16 @@ def check_underline(s_all, findings):
 
 
 # ── orchestration ───────────────────────────────────────────────────────────
-def validate_style(prod_path, stage_path):
+def validate_style(prod_path, stage_path, mode="full"):
+    """Run the style validation.
+
+    mode="full"  — every check (typography, colour, spacing, images, …).
+    mode="sites" — image/layout only. AEM already governs typography & colour,
+                   so for Sites Validation we only flag what the CMS does NOT
+                   control: image sizes & alignment, oversized images/icons,
+                   bullet/paragraph spacing, too-small gap below an H1, and
+                   table / image breaking across page boundaries.
+    """
     prod_toc = get_toc(prod_path)
     stage_toc = get_toc(stage_path)
     prod_doc = fitz.open(prod_path)
@@ -987,6 +1365,10 @@ def validate_style(prod_path, stage_path):
     s_body = _doc_body_size(stage_doc)
     p_ranges = _toc_ranges_by_key(prod_toc, prod_doc.page_count)
     s_ranges = _toc_ranges_by_key(stage_toc, stage_doc.page_count)
+
+    # Check for encoding issues
+    prod_garbled = _is_pdf_garbled(prod_doc)
+    stage_garbled = _is_pdf_garbled(stage_doc)
 
     # Parse every page once, then assemble whole-document and per-section views
     # from the cache (avoids re-parsing pages for every section + info pass).
@@ -1022,33 +1404,115 @@ def validate_style(prod_path, stage_path):
     _emit(0.86, "running style checks")
 
     findings = []
-    check_heading_color(p_all, s_all, findings)
-    check_heading_size(geo, findings)
-    check_text_color(p_all, s_all, sections, findings)
-    p_info = analyze_info_callouts(prod_doc, p_cache)
-    s_info = analyze_info_callouts(stage_doc, s_cache)
-    check_info_callouts(p_info, s_info, findings)
-    check_paragraph_spacing(geo, findings)
+    sites = (mode == "sites")
+
+    # ── Check for encoding issues (informational; not relevant to sites) ──
+    if prod_garbled and not sites:
+        findings.append({
+            "category": "Encoding issue",
+            "severity": "Info",
+            "topic": "PROD PDF — custom special-character encoding",
+            "pages": "All",
+            "expected": "Standard Unicode text layer",
+            "actual": "Custom font encoding for special symbols (™, ©, ® and similar); OCR-assisted extraction used.",
+            "issue": "The PROD PDF uses custom font mappings for special characters such as trademark and copyright symbols. An OCR pass was used to improve extraction accuracy. Content results are not affected.",
+            "fix": "No action required. If specific symbols appear missing, rebuild the PDF with standard Unicode (NFKC) font encoding.",
+        })
+    if stage_garbled and not sites:
+        findings.append({
+            "category": "Encoding issue",
+            "severity": "Info",
+            "topic": "STAGE PDF — custom special-character encoding",
+            "pages": "All",
+            "expected": "Standard Unicode text layer",
+            "actual": "Custom font encoding for special symbols (™, ©, ® and similar); OCR-assisted extraction used.",
+            "issue": "The STAGE PDF uses custom font mappings for special characters such as trademark and copyright symbols. An OCR pass was used to improve extraction accuracy. Content results are not affected.",
+            "fix": "No action required. If specific symbols appear missing, rebuild the PDF with standard Unicode (NFKC) font encoding.",
+        })
+
+    # ── Image / layout checks — what AEM does NOT control (always run) ────────
+    check_paragraph_spacing(geo, findings)          # extra spacing between bullets
     check_space_above_image(geo, findings)
-    check_image_position(geo, findings)
-    check_table_layout(s_all, findings)
-    check_footer_alignment(s_all, findings)
-    check_bullet_paragraph_size(s_all, findings)
-    check_wrapped_text_padding(geo, findings)
-    check_hyperlinks(geo, p_all, s_all, findings)
-    check_underline(s_all, findings)
+    check_image_dimensions_and_alignment(geo, findings)  # image sizes & alignment
+    check_icon_sizes_and_alignment(geo, findings)        # oversized / mis-aligned icons
+    check_heading_below_spacing(geo, findings)      # too-small gap below an H1
+    check_image_padding(geo, findings)
+    check_table_layout(s_all, findings)             # table breaking across pages
+
+    # ── Typography / colour / link checks — AEM governs these. Skip for sites ─
+    if not sites:
+        check_heading_color(p_all, s_all, findings)
+        check_heading_size(geo, findings)
+        check_text_color(p_all, s_all, sections, findings)
+        p_info = analyze_info_callouts(prod_doc, p_cache)
+        s_info = analyze_info_callouts(stage_doc, s_cache)
+        check_info_callouts(p_info, s_info, findings)
+        check_footer_alignment(s_all, findings)
+        check_bullet_paragraph_size(s_all, findings)
+        check_wrapped_text_padding(geo, findings)
+        check_hyperlinks(geo, p_all, s_all, findings)
+        check_typography_spec(stage_doc, s_body, findings)
+
+    # ── All-pages global checks ──────────────────────────────────────────────
+    p_hdg, s_hdg, hdg_issues = check_heading_line_height_global(p_all, s_all, findings)
+    img_checked, img_issues   = check_image_dimensions_global(
+        p_cache, s_cache, prod_doc, stage_doc, findings)
+
+    # ── Document-level metrics (passed to build_report for the metrics panel) ─
+    p_imgs_total = sum(
+        1 for pno in range(1, prod_doc.page_count + 1)
+        if pno in p_cache
+        for im in _assemble(p_cache, pno, pno)["images"]
+        if max(im["rect"].width, im["rect"].height) > 80.0
+    )
+    s_imgs_total = sum(
+        1 for pno in range(1, stage_doc.page_count + 1)
+        if pno in s_cache
+        for im in _assemble(s_cache, pno, pno)["images"]
+        if max(im["rect"].width, im["rect"].height) > 80.0
+    )
+    doc_stats = {
+        "prod_pages":    prod_doc.page_count,
+        "stage_pages":   stage_doc.page_count,
+        "prod_headings": p_hdg,
+        "stage_headings": s_hdg,
+        "prod_images":   p_imgs_total,
+        "stage_images":  s_imgs_total,
+        "metrics": {
+            "Heading line height": {
+                "checked": s_hdg,
+                "issues":  hdg_issues,
+            },
+            "Image dimension": {
+                "checked": img_checked,
+                "issues":  img_issues,
+            },
+        },
+    }
 
     prod_doc.close()
     stage_doc.close()
-    return findings
+    return findings, doc_stats
 
 
 # ── report ──────────────────────────────────────────────────────────────────
 CATEGORY_ORDER = [
-    "Image position", "Space above image", "Heading style", "Paragraph spacing",
+    "Encoding issue", "Typography spec",
+    "Heading line height",
+    "Image dimension", "Icon size", "Image alignment", "Icon alignment", "Heading spacing below",
+    "Image padding", "Space above image", "Heading style", "Paragraph spacing",
     "Text colour", "Info / notice colour", "Table layout breaking", "Wrapped text padding",
-    "Footer page number", "Bullet vs paragraph size", "Hyperlink issue", "Underline to remove",
+    "Footer page number", "Bullet vs paragraph size", "Hyperlink issue",
 ]
+
+# Categories produced by mode="sites" (image / layout only — AEM governs the rest).
+SITES_CATEGORY_ORDER = [
+    "Heading line height", "Heading spacing below",
+    "Image dimension", "Icon size", "Image alignment", "Icon alignment",
+    "Image padding", "Space above image", "Paragraph spacing",
+    "Table layout breaking",
+]
+
 SEV_COLOR = {"High": colors.HexColor("#c62828"),
              "Medium": colors.HexColor("#e65100"),
              "Low": colors.HexColor("#1565c0")}
@@ -1058,63 +1522,161 @@ def _esc(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def build_report(prod_path, stage_path, findings, out_path):
+def build_report(prod_path, stage_path, findings, out_path, doc_stats=None,
+                 category_order=None):
+    cat_order = category_order or CATEGORY_ORDER
     doc = SimpleDocTemplate(out_path, pagesize=landscape(letter),
                             leftMargin=0.4*inch, rightMargin=0.4*inch,
                             topMargin=0.4*inch, bottomMargin=0.4*inch)
     ss = getSampleStyleSheet()
-    title_s = ParagraphStyle("T", parent=ss["Heading1"], fontSize=16, spaceAfter=4)
-    sub_s = ParagraphStyle("Sub", parent=ss["Normal"], fontSize=10, textColor=colors.grey, spaceAfter=2)
-    head_s = ParagraphStyle("H", parent=ss["Heading2"], fontSize=13, spaceBefore=10, spaceAfter=6)
-    hdr_s = ParagraphStyle("Hdr", parent=ss["Normal"], fontSize=9, leading=12,
-                           textColor=colors.whitesmoke, fontName="Helvetica-Bold")
-    cell_s = ParagraphStyle("Cell", parent=ss["Normal"], fontSize=8, leading=10)
-    topic_s = ParagraphStyle("Topic", parent=ss["Normal"], fontSize=8, leading=10, fontName="Helvetica-Bold")
-    fix_s = ParagraphStyle("Fix", parent=ss["Normal"], fontSize=8, leading=10, textColor=colors.HexColor("#2e7d32"))
+    title_s = ParagraphStyle("T",     parent=ss["Heading1"], fontSize=16, spaceAfter=4)
+    sub_s   = ParagraphStyle("Sub",   parent=ss["Normal"],   fontSize=10, textColor=colors.grey, spaceAfter=2)
+    head_s  = ParagraphStyle("H",     parent=ss["Heading2"], fontSize=13, spaceBefore=10, spaceAfter=6)
+    hdr_s   = ParagraphStyle("Hdr",   parent=ss["Normal"],   fontSize=9,  leading=12,
+                              textColor=colors.whitesmoke, fontName="Helvetica-Bold")
+    cell_s  = ParagraphStyle("Cell",  parent=ss["Normal"],   fontSize=8,  leading=10)
+    topic_s = ParagraphStyle("Topic", parent=ss["Normal"],   fontSize=8,  leading=10, fontName="Helvetica-Bold")
 
-    story = [Paragraph("Style Validation Report", title_s),
-             Paragraph(f"Production (expected): {os.path.basename(prod_path)}", sub_s),
-             Paragraph(f"Staging (actual):    {os.path.basename(stage_path)}", sub_s),
-             Spacer(1, 10)]
+    by_cat = {c: [f for f in findings if f["category"] == c] for c in cat_order}
 
-    # summary by category
-    by_cat = {c: [f for f in findings if f["category"] == c] for c in CATEGORY_ORDER}
-    sum_rows = [[Paragraph("<b>Style check</b>", hdr_s), Paragraph("<b>Issues</b>", hdr_s),
-                 Paragraph("<b>Highest severity</b>", hdr_s)]]
-    for c in CATEGORY_ORDER:
-        items = by_cat[c]
-        if items:
-            sev = next((s for s in ("High", "Medium", "Low") if any(i["severity"] == s for i in items)), "—")
-        else:
-            sev = "clean"
-        sev_para = Paragraph(f"<b>{sev}</b>", ParagraphStyle("sv", parent=cell_s,
-                              textColor=SEV_COLOR.get(sev, colors.HexColor("#2e7d32"))))
-        sum_rows.append([Paragraph(c, topic_s),
-                         Paragraph(str(len(items)) if items else "0", cell_s), sev_para])
-    sumt = Table(sum_rows, colWidths=[230, 70, 140], repeatRows=1)
-    sumt.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#37474f")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    story = [
+        Paragraph("Style Validation Report", title_s),
+        Paragraph(f"Production (expected): {os.path.basename(prod_path)}", sub_s),
+        Paragraph(f"Staging (actual):    {os.path.basename(stage_path)}", sub_s),
+        Spacer(1, 10),
+    ]
+
+    # ── Overall Metrics panel ────────────────────────────────────────────────
+    ds = doc_stats or {}
+    met = ds.get("metrics", {})
+
+    # Document stats row
+    doc_hdr_cols = ["", "Pages", "Headings", "Images (≥80pt)"]
+    doc_rows = [
+        [Paragraph(f"<b>{h}</b>", hdr_s) for h in doc_hdr_cols],
+        [Paragraph("<b>PROD</b>", topic_s),
+         Paragraph(str(ds.get("prod_pages",  "—")), cell_s),
+         Paragraph(str(ds.get("prod_headings","—")), cell_s),
+         Paragraph(str(ds.get("prod_images",  "—")), cell_s)],
+        [Paragraph("<b>STAGE</b>", topic_s),
+         Paragraph(str(ds.get("stage_pages",  "—")), cell_s),
+         Paragraph(str(ds.get("stage_headings","—")), cell_s),
+         Paragraph(str(ds.get("stage_images",  "—")), cell_s)],
+    ]
+    doc_tbl = Table(doc_rows, colWidths=[80, 80, 90, 100], repeatRows=1)
+    doc_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#455a64")),
+        ("GRID",       (0, 0), (-1, -1), 0.5, colors.grey),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
-        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
-    total = len(findings)
-    story.append(Paragraph(f"<b>{total}</b> style issue(s) found across "
-                           f"{sum(1 for c in CATEGORY_ORDER if by_cat[c])} of {len(CATEGORY_ORDER)} checks. "
-                           "PROD is the reference; fix STAGE to match.", sub_s))
-    story.append(Spacer(1, 6))
-    story.append(sumt)
 
-    # per-category detail
-    for c in CATEGORY_ORDER:
+    # Per-category pass/fail %
+    pass_color  = colors.HexColor("#2e7d32")
+    fail_color  = colors.HexColor("#c62828")
+    info_color  = colors.HexColor("#1565c0")
+    CHECKS_WITH_COUNTS = {"Heading line height", "Image dimension"}
+    cat_hdr_cols = ["Style check", "Checked", "Issues", "Passed", "Pass %", "Status"]
+    cat_rows = [[Paragraph(f"<b>{h}</b>", hdr_s) for h in cat_hdr_cols]]
+
+    total_checked_all = 0
+    total_issues_all  = 0
+
+    for c in cat_order:
+        items   = by_cat[c]
+        n_issue = len(items)
+        if c in CHECKS_WITH_COUNTS and c in met:
+            n_checked = met[c]["checked"]
+            n_issue   = met[c]["issues"]
+        else:
+            # Binary check: 1 item checked; 0 or 1 issue
+            n_checked = 1
+            n_issue   = 1 if items else 0
+
+        n_passed = max(0, n_checked - n_issue)
+        pct      = round(100 * n_passed / n_checked, 1) if n_checked else 100.0
+        total_checked_all += n_checked
+        total_issues_all  += n_issue
+
+        if n_checked == 0 or n_issue == 0:
+            status_txt   = "PASS"
+            status_color = pass_color
+        elif any(i["severity"] == "Info" for i in items) and not any(
+                i["severity"] in ("High","Medium","Low") for i in items):
+            status_txt   = "INFO"
+            status_color = info_color
+        elif n_issue < n_checked:
+            status_txt   = "PARTIAL"
+            status_color = colors.HexColor("#e65100")
+        else:
+            status_txt   = "FAIL"
+            status_color = fail_color
+
+        pct_color = pass_color if pct >= 90 else (colors.HexColor("#e65100") if pct >= 70 else fail_color)
+        cat_rows.append([
+            Paragraph(c, topic_s),
+            Paragraph(str(n_checked), cell_s),
+            Paragraph(str(n_issue),   cell_s),
+            Paragraph(str(n_passed),  cell_s),
+            Paragraph(f"<b>{pct}%</b>",
+                      ParagraphStyle("pct", parent=cell_s, textColor=pct_color)),
+            Paragraph(f"<b>{status_txt}</b>",
+                      ParagraphStyle("st", parent=cell_s, textColor=status_color)),
+        ])
+
+    # Totals row
+    total_passed = max(0, total_checked_all - total_issues_all)
+    overall_pct  = round(100 * total_passed / total_checked_all, 1) if total_checked_all else 100.0
+    ovr_color    = pass_color if overall_pct >= 90 else (colors.HexColor("#e65100") if overall_pct >= 70 else fail_color)
+    cat_rows.append([
+        Paragraph("<b>Overall</b>", topic_s),
+        Paragraph(f"<b>{total_checked_all}</b>", topic_s),
+        Paragraph(f"<b>{total_issues_all}</b>",  topic_s),
+        Paragraph(f"<b>{total_passed}</b>",       topic_s),
+        Paragraph(f"<b>{overall_pct}%</b>",
+                  ParagraphStyle("ovp", parent=topic_s, textColor=ovr_color)),
+        Paragraph(
+            f"<b>{'PASS' if overall_pct >= 90 else 'REVIEW'}</b>",
+            ParagraphStyle("ovs", parent=topic_s,
+                           textColor=pass_color if overall_pct >= 90 else fail_color)),
+    ])
+
+    cat_tbl = Table(cat_rows, colWidths=[190, 55, 55, 55, 55, 60], repeatRows=1)
+    cat_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0),   colors.HexColor("#37474f")),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#eceff1")),
+        ("GRID",       (0, 0), (-1, -1),  0.5, colors.grey),
+        ("VALIGN",     (0, 0), (-1, -1),  "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, colors.HexColor("#f5f5f5")]),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+
+    story += [
+        Paragraph("<b>Document Statistics</b>", sub_s),
+        Spacer(1, 4), doc_tbl, Spacer(1, 12),
+        Paragraph(
+            f"<b>Overall metrics — {overall_pct}% pass rate</b> "
+            f"({total_passed} of {total_checked_all} checks passed, "
+            f"{total_issues_all} issue(s) across "
+            f"{sum(1 for c in cat_order if by_cat[c])} of {len(cat_order)} categories). "
+            "PROD is the reference; fix STAGE to match.",
+            sub_s,
+        ),
+        Spacer(1, 4), cat_tbl, PageBreak(),
+    ]
+
+    # ── Per-category detail pages ────────────────────────────────────────────
+    for c in cat_order:
         items = by_cat[c]
-        story.append(PageBreak())
         story.append(Paragraph(f"{c}", head_s))
         if not items:
             story.append(Paragraph("No issues — STAGE matches PROD for this check.",
                                    ParagraphStyle("ok", parent=ss["Normal"], fontSize=9,
                                                   textColor=colors.HexColor("#2e7d32"))))
+            story.append(PageBreak())
             continue
         rows = [[Paragraph(f"<b>{h}</b>", hdr_s) for h in
                  ["#", "Topic", "Page(s)", "Sev", "Expected (PROD)", "Actual (STAGE)", "Issue & fix"]]]
@@ -1136,6 +1698,7 @@ def build_report(prod_path, stage_path, findings, out_path):
             ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ]))
         story.append(t)
+        story.append(PageBreak())
 
     doc.build(story)
     print(f"Report saved: {out_path}")
@@ -1144,7 +1707,7 @@ def build_report(prod_path, stage_path, findings, out_path):
 def main(prod_path, stage_path, out_path):
     print("Validating style (PROD = expected, STAGE = actual)...")
     _emit(0.01, "starting")
-    findings = validate_style(prod_path, stage_path)
+    findings, doc_stats = validate_style(prod_path, stage_path)
     by_cat = {}
     for f in findings:
         by_cat.setdefault(f["category"], 0)
@@ -1154,7 +1717,7 @@ def main(prod_path, stage_path, out_path):
         print(f"  {c:24} {by_cat.get(c, 0)}")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     _emit(0.95, "building report")
-    build_report(prod_path, stage_path, findings, out_path)
+    build_report(prod_path, stage_path, findings, out_path, doc_stats=doc_stats)
     _emit(1.0, "done")
     return findings
 

@@ -17,10 +17,18 @@ that pure-formatting rewrites are not counted as missing content.
 import sys
 import os
 import re
-import statistics
+import collections
 import statistics
 import unicodedata
 import hashlib
+
+# Configure local TESSDATA_PREFIX before importing fitz (PyMuPDF)
+_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_CUR_DIR)
+_LOCAL_TESSDATA = os.path.join(_PROJECT_ROOT, "tessdata")
+if os.path.isdir(_LOCAL_TESSDATA):
+    os.environ["TESSDATA_PREFIX"] = _LOCAL_TESSDATA
+
 import fitz
 from io import BytesIO
 try:
@@ -35,6 +43,33 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+
+# ── CJK report font ──────────────────────────────────────────────────────────
+# Helvetica (reportlab's default) has no CJK glyphs, so Chinese/Japanese/Korean
+# text renders as dots/blanks ("........") in the report. Register a Unicode font
+# that covers Latin + CJK once at import; _esc() wraps any CJK-bearing text in an
+# inline <font name=...> tag so only that text switches font (English unchanged).
+_CJK_FONT_NAME = None
+for _cand in (
+    ("ArialUnicode", "/Library/Fonts/Arial Unicode.ttf"),
+    ("ArialUnicode", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+):
+    try:
+        pdfmetrics.registerFont(TTFont(_cand[0], _cand[1]))
+        _CJK_FONT_NAME = _cand[0]
+        break
+    except Exception:
+        continue
+if _CJK_FONT_NAME is None:  # fall back to reportlab's built-in CID font (SC)
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        _CJK_FONT_NAME = "STSong-Light"
+    except Exception:
+        _CJK_FONT_NAME = None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -47,13 +82,12 @@ _MIN_BLOCK_BODY  = 10    # min chars for normal body-font blocks (> 8.5 pt, ≤ 
 _MIN_ONPAGE_AREA = 50    # pt²  — skip image placements smaller than ~7×7 pt on page
 _ICON_MAX_ONPAGE = 80    # pt   — max(bw,bh) on page ≤ this = Icon; larger = Content image
 _FAIL_ON_ICON_MISS = False  # icon-size matching is noisy across PDF exports; don't fail section on icon-only miss
+_VECTOR_ICON_MIN = 50    # vector drawings doc-wide ≥ this ⇒ STAGE renders icons as vector art (no raster to size-match)
 # Legacy aliases kept for any remaining code that references the old names
 _MIN_IMG_PIXELS  = _MIN_ONPAGE_AREA
 _ICON_MAX_DIM    = _ICON_MAX_ONPAGE
 CHAR_SHINGLE    = 18     # character window for shingle coverage
 MIN_FRAG_WORDS  = 3      # minimum uncovered word-run length to report (lowered to capture smaller missing fragments)
-VISUAL_PAGE_THRESHOLD = 0.82   # page-level visual similarity threshold (0-1)
-VISUAL_RENDER_SCALE   = 0.8    # render scale for visual compare (speed vs fidelity)
 
 # Optional progress reporting (installed by run_validator.py for the web UI).
 _PROGRESS_CB = None
@@ -97,23 +131,215 @@ _OSD_SCREEN_RE = re.compile(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Garbled PDF detection, Language detection, and Translation Integrity Checker
+# ────────────────────────────────────────────────────────────────────────────
+_DICTIONARY_SET = None
+
+def _load_dictionary():
+    global _DICTIONARY_SET
+    if _DICTIONARY_SET is not None:
+        return _DICTIONARY_SET
+    _DICTIONARY_SET = set()
+    try:
+        # Load macOS standard dictionary to filter OCR noise
+        if os.path.exists("/usr/share/dict/words"):
+            with open("/usr/share/dict/words", "r", encoding="utf-8") as f:
+                for w in f:
+                    w_stripped = w.strip().lower()
+                    if len(w_stripped) >= 4:
+                        _DICTIONARY_SET.add(w_stripped)
+    except Exception:
+        pass
+    return _DICTIONARY_SET
+
+
+_PUA_RE = re.compile(r"[\ue000-\uf8ff\U000f0000-\U000ffffd\U00100000-\U0010fffd]")
+
+# Common PUA \u2192 Unicode substitutions used by PDF/font vendors for special symbols
+_PUA_SUBST = {
+    "\uf8e8": "\u2122",  "\uf8e9": "\u00ae",  "\uf8ea": "\u00a9",  # Adobe PUA
+    "\uf0e4": "\u2122",  "\uf0a9": "\u00a9",  "\uf0ae": "\u00ae",  # Wingdings / Symbol PUA
+    "\uf020": " ",  "\uf0b7": "\u2022",  "\uf0d8": "\u2022",  # bullet variants
+    "\uf0a7": "\u00a7",  "\uf0b6": "\u00b6",
+}
+
+def _clean_pua(text: str) -> str:
+    """Replace known PUA \u2192 Unicode symbols; strip remaining PUA chars."""
+    out = []
+    for ch in text:
+        out.append(_PUA_SUBST.get(ch, "" if _PUA_RE.match(ch) else ch))
+    return "".join(out)
+
+
+def _is_text_garbled_string(text: str) -> bool:
+    if not text:
+        return False
+    # Raise threshold to 5 % \u2014 BenQ PDFs use custom fonts for bullets/symbols;
+    # a small fraction of PUA chars is normal and should NOT trigger OCR.
+    pua_chars = len(_PUA_RE.findall(text))
+    if len(text) > 50 and (pua_chars / len(text)) > 0.05:
+        return True
+    # CJK mixed with Georgian is a clear encoding corruption signal
+    if bool(re.search(r"[\u4e00-\u9fff]", text)) and bool(re.search(r"[\u10a0-\u10ff\u2d00-\u2d2f]", text)):
+        return True
+    return False
+
+
+def _is_pdf_garbled(doc) -> bool:
+    pua_count = 0
+    total_chars = 0
+    for i in range(min(doc.page_count, 5)):
+        text = doc[i].get_text()
+        total_chars += len(text)
+        pua_count += len(_PUA_RE.findall(text))
+        if bool(re.search(r"[\u4e00-\u9fff]", text)) and bool(re.search(r"[\u10a0-\u10ff\u2d00-\u2d2f]", text)):
+            return True
+
+    if total_chars == 0 and doc.page_count > 0:
+        return True  # fully scanned / image-only PDF
+    # Only trigger OCR when the majority of characters are private-use (truly corrupt)
+    if total_chars > 0 and (pua_count / total_chars) > 0.05:
+        return True
+    return False
+
+
+def _detect_language_string(text: str) -> str:
+    if not text:
+        return "eng"
+    jp_chars = len(re.findall(r"[\u3040-\u309f\u30a0-\u30ff]", text))
+    ko_chars = len(re.findall(r"[\uac00-\ud7af]", text))
+    cyrillic_chars = len(re.findall(r"[\u0400-\u04ff]", text))
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    
+    total = len(text)
+    if jp_chars > 5 or (total > 0 and jp_chars / total > 0.01):
+        return "jpn"
+    if ko_chars > 5 or (total > 0 and ko_chars / total > 0.01):
+        return "kor"
+    if cyrillic_chars > 5 or (total > 0 and cyrillic_chars / total > 0.01):
+        return "rus"
+    if cjk_chars > 10 or (total > 0 and cjk_chars / total > 0.02):
+        # Distinguish Traditional vs Simplified Chinese
+        trad_indicators = len(re.findall(r"[個為無這體樂設對開門與後會廠國]", text))
+        simp_indicators = len(re.findall(r"[个为无这体乐设对开门与后会厂国]", text))
+        if trad_indicators >= simp_indicators:
+            return "chi_tra"
+        else:
+            return "chi_sim"
+    return "eng"
+
+
+def _get_pdf_language(doc) -> str:
+    # 1. Try detecting language from this doc's native text if not garbled
+    txt = ""
+    for i in range(min(doc.page_count, 5)):
+        txt += doc[i].get_text()
+    if txt and not _is_text_garbled_string(txt):
+        return _detect_language_string(txt)
+        
+    # 2. If garbled, look for a sibling PDF in a "prod" or "stage" folder
+    doc_name = getattr(doc, "name", "")
+    if doc_name:
+        doc_dir = os.path.dirname(doc_name)
+        parent_dir = os.path.dirname(doc_dir)
+        sibling_dirs = ["prod", "stage"]
+        for s_dir in sibling_dirs:
+            target_dir = os.path.join(parent_dir, s_dir)
+            if os.path.isdir(target_dir):
+                for f in os.listdir(target_dir):
+                    if f.lower().endswith(".pdf") and os.path.join(target_dir, f) != doc_name:
+                        sibling_path = os.path.join(target_dir, f)
+                        try:
+                            sib_doc = fitz.open(sibling_path)
+                            sib_txt = ""
+                            for i in range(min(sib_doc.page_count, 5)):
+                                sib_txt += sib_doc[i].get_text()
+                            sib_doc.close()
+                            if sib_txt and not _is_text_garbled_string(sib_txt):
+                                return _detect_language_string(sib_txt)
+                        except Exception:
+                            pass
+                            
+        # 3. Fallback to filename clues
+        filename = os.path.basename(doc_name).lower()
+        if "tc" in filename or "traditional" in filename or "zh-tw" in filename or "zh_tw" in filename:
+            return "chi_tra"
+        if "cn" in filename or "simplified" in filename or "zh-cn" in filename or "zh_cn" in filename:
+            return "chi_sim"
+        if "ja" in filename or "jpn" in filename or "jp" in filename or "japanese" in filename:
+            return "jpn"
+        if "ko" in filename or "kor" in filename or "kr" in filename or "korean" in filename:
+            return "kor"
+        if "ru" in filename or "rus" in filename or "russian" in filename:
+            return "rus"
+        if "de" in filename or "deu" in filename or "german" in filename:
+            return "deu"
+        if "fr" in filename or "fra" in filename or "french" in filename:
+            return "fra"
+        if "es" in filename or "spa" in filename or "spanish" in filename:
+            return "spa"
+            
+    return "eng"
+
+
+_TECHNICAL_EXCLUSIONS = {
+    "benq", "hdmi", "usb", "type", "wifi", "led", "osd", "vga", "dvi", "dp", 
+    "hz", "ac", "dc", "pn", "max", "min", "url", "http", "https", "www", "pdf", 
+    "mode", "menu", "ips", "lcd", "rgb", "srgb", "dci", "p3", "hdr", "macos", 
+    "windows", "mac", "pc", "app", "store", "play", "google", "apple", "intel", 
+    "amd", "nvidia", "bluetooth", "ss", "id", "idh", "identity", "tft", "vesa", 
+    "os", "aem", "faq", "qa", "mindduo", "sw272", "sw242", "cf23"
+}
+
+def find_english_words_in_non_en(text: str) -> list:
+    words = re.findall(r"\b[a-zA-Z]{4,}\b", text)
+    dictionary = _load_dictionary()
+    unexpected = []
+    for w in words:
+        wl = w.lower()
+        if wl in _TECHNICAL_EXCLUSIONS:
+            continue
+        if w.isalpha() and wl in dictionary:
+            unexpected.append(w)
+    seen = set()
+    return [w for w in unexpected if not (w.lower() in seen or seen.add(w.lower()))]
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Low-level text utilities
 # ────────────────────────────────────────────────────────────────────────────
 def _normalize(text: str) -> str:
+    # Map known PUA chars (\u2122 \u00a9 \u00ae bullets \u2026) to proper Unicode before stripping.
+    text = _clean_pua(text)
+    # Strip any remaining unrecognised Private Use Area characters
+    text = _PUA_RE.sub("", text)
+    # Remove control characters except tab/newline
+    text = "".join(c for c in text if unicodedata.category(c) != "Cc" or c in "\t\n\r")
     text = re.sub(r"\.{2,}", " ", text)
     text = re.sub(r"\s+",    " ", text)
     return text.strip()
 
 
+
 def _canon(text: str) -> str:
     """Letters & digits only, NFKC-folded lowercase — for shingle coverage."""
+    text = _s_norm(text)
     text = unicodedata.normalize("NFKC", text).lower()
     return "".join(c for c in text if unicodedata.category(c)[0] in ("L", "N"))
 
 
 def _norm_key(text: str) -> str:
-    """Alphanumeric-only lowercase key for TOC matching."""
-    return re.sub(r"[^a-z0-9]", "", text.lower())
+    """Alphanumeric-only lowercase key for TOC matching.
+
+    Unicode-aware: keeps letters/digits of ANY script (NFKC-folded), not just
+    ASCII, so non-Latin titles (Chinese / Japanese / Korean, etc.) produce
+    distinct keys instead of all collapsing to "". For ASCII text this returns
+    exactly the same value as the old ``[^a-z0-9]``-strip, so English matching
+    is unchanged.
+    """
+    text = _s_norm(text)
+    text = unicodedata.normalize("NFKC", text).lower()
+    return "".join(c for c in text if unicodedata.category(c)[0] in ("L", "N"))
 
 
 def _strip_formatting(text: str) -> str:
@@ -131,8 +357,8 @@ def _strip_formatting(text: str) -> str:
     return text.strip()
 
 
-def _median_line_len(page) -> float:
-    d = page.get_text("dict")
+def _median_line_len(page, textpage=None) -> float:
+    d = page.get_text("dict", textpage=textpage)
     lens = []
     for b in d["blocks"]:
         if b.get("type") != 0:
@@ -151,6 +377,76 @@ def _keep(words):
     return [w for w in words if w and not _INT_RE.match(w)]
 
 
+# ── Language-aware tokenisation ──────────────────────────────────────────────
+# Whitespace tokenisation works for space-delimited scripts (Latin, Cyrillic …)
+# but not for CJK, where a whole paragraph is one space-free run. These helpers
+# emit one token per CJK ideograph/kana/hangul while leaving space-delimited
+# words whole. For pure-ASCII/Latin text _tokenize() == text.split(), so the
+# behaviour for English documents is byte-for-byte unchanged.
+_CJK_RE = re.compile(
+    "["
+    "぀-ヿ"      # Hiragana + Katakana
+    "㐀-䶿"      # CJK Ext A
+    "一-鿿"      # CJK Unified Ideographs
+    "豈-﫿"      # CJK Compatibility Ideographs
+    "가-힯"      # Hangul syllables
+    "]"
+)
+
+
+def _is_cjk_char(ch: str) -> bool:
+    return bool(ch) and bool(_CJK_RE.match(ch[0]))
+
+
+def _tokenize(text: str):
+    """Split text into comparison tokens, segmenting CJK runs per-character."""
+    toks = []
+    for chunk in text.split():
+        buf = ""
+        for ch in chunk:
+            if _is_cjk_char(ch):
+                if buf:
+                    toks.append(buf)
+                    buf = ""
+                toks.append(ch)
+            else:
+                buf += ch
+        if buf:
+            toks.append(buf)
+    return toks
+
+
+def _join_tokens(toks) -> str:
+    """Re-join tokens for display / substring checks — no space is inserted
+    around CJK characters so the result matches the original space-free text."""
+    out = []
+    for i, t in enumerate(toks):
+        if i and not (_is_cjk_char(toks[i - 1][-1]) or _is_cjk_char(t[0])):
+            out.append(" ")
+        out.append(t)
+    return "".join(out)
+
+
+# ── Chinese script normalisation (Traditional → Simplified) ──────────────────
+# A product's PROD and STAGE PDFs can use different Chinese scripts (e.g. CF23
+# PROD = Simplified, STAGE download = Traditional). Those are different code
+# points and never shingle-match. Folding both sides to Simplified via OpenCC
+# lets them compare. Applied ONLY to the comparison surfaces (_canon / _norm_key
+# / the lowercase phrase indexes) and gated on CJK presence, so the displayed
+# report text and all non-Chinese documents are untouched.
+try:
+    import opencc as _opencc
+    _T2S = _opencc.OpenCC("t2s")
+except Exception:
+    _T2S = None
+
+
+def _s_norm(text: str) -> str:
+    if _T2S is not None and text and _CJK_RE.search(text):
+        return _T2S.convert(text)
+    return text
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Navigation-page detection
 # ────────────────────────────────────────────────────────────────────────────
@@ -158,13 +454,49 @@ def _detect_nav_pages(doc) -> set:
     """Return 1-based page numbers that are TOC / navigation / index pages."""
     total  = doc.page_count
     result = set()
+
+    # Identify Q&A index pages from TOC to protect them from being skipped
+    qa_pages = set()
+    try:
+        toc = doc.get_toc()
+        if toc:
+            for idx, item in enumerate(toc):
+                title = item[1].lower()
+                if 'q&a' in title or 'qa index' in title:
+                    qa_start = item[2]
+                    next_start = None
+                    for next_item in toc[idx+1:]:
+                        if next_item[2] > qa_start:
+                            next_start = next_item[2]
+                            break
+                    end_page = next_start if next_start else qa_start + 2
+                    for p_num in range(qa_start, end_page):
+                        qa_pages.add(p_num)
+                    break
+    except Exception:
+        pass
+
+    use_ocr = _is_pdf_garbled(doc)
+    ocr_lang = _get_pdf_language(doc) if use_ocr else "eng"
+
     for i, p in enumerate(doc, 1):
-        text = p.get_text()
+        if i in qa_pages:
+            continue  # Do not treat Q&A index pages as navigation pages
+        tp = None
+        if use_ocr:
+            try:
+                tp = p.get_textpage_ocr(dpi=150, language=ocr_lang)
+                text = p.get_text(textpage=tp)
+            except Exception:
+                text = p.get_text()
+        else:
+            text = p.get_text()
+            
         if len(re.findall(r"\.{4,}", text)) >= 8:
             result.add(i)
         elif (i <= max(1, int(total * 0.10))
               and len(_NAV_INLINE_RE.findall(text)) >= 15
-              and _median_line_len(p) <= 50):
+              and _median_line_len(p, textpage=tp) <= 50):
             result.add(i)
     return result
 
@@ -184,7 +516,19 @@ def _extract_page_body_prod(page) -> str:
        Spans at 7–8.5 pt that are part of a regular content table (e.g. the Color Mode
        feature-availability matrix at 8 pt) are included.
     """
-    d = page.get_text("dict")
+    doc = page.parent
+    lang = _get_pdf_language(doc)
+    is_cjk = lang in ("chi_tra", "chi_sim", "jpn", "kor")
+    if _is_pdf_garbled(doc):
+        try:
+            tp = page.get_textpage_ocr(dpi=150, language=lang)
+            d = page.get_text("dict", textpage=tp)
+        except Exception as e:
+            print(f"OCR failed for PROD page {page.number}: {e}")
+            d = page.get_text("dict")
+    else:
+        d = page.get_text("dict")
+        
     parts = []
     for block in d["blocks"]:
         if block.get("type") != 0:
@@ -200,7 +544,7 @@ def _extract_page_body_prod(page) -> str:
         # blocks > 8.5 pt only need ≥ 10 chars so that short model labels like
         # "SW272 SW242" are included).
         if max_font <= 12.0:
-            limit = _MIN_BLOCK_CHARS if max_font <= _OSD_FONT_SOFT else _MIN_BLOCK_BODY
+            limit = _MIN_BLOCK_CHARS if max_font <= _OSD_FONT_SOFT else (_MIN_BLOCK_BODY if not is_cjk else 2)
             if len(block_txt) < limit:
                 continue
         # Skip repetitive icon-glyph substitution blocks, e.g. spans ["or","or","or"].
@@ -229,7 +573,17 @@ def _extract_page_body_prod(page) -> str:
 
 def _extract_page_body_stage(page) -> str:
     """Extract STAGE body text (no font filter — OSD text lives in images)."""
-    raw = page.get_text()
+    doc = page.parent
+    if _is_pdf_garbled(doc):
+        lang = _get_pdf_language(doc)
+        try:
+            tp = page.get_textpage_ocr(dpi=150, language=lang)
+            raw = page.get_text(textpage=tp)
+        except Exception as e:
+            print(f"OCR failed for STAGE page {page.number}: {e}")
+            raw = page.get_text()
+    else:
+        raw = page.get_text()
     return _normalize(_strip_formatting(raw))
 
 
@@ -249,8 +603,18 @@ def _derive_toc(doc):
     """
     # modal body-text size (lines >= 15 chars)
     sizes = {}
+    use_ocr = _is_pdf_garbled(doc)
+    ocr_lang = _get_pdf_language(doc) if use_ocr else "eng"
+
     for page in doc:
-        for b in page.get_text("dict").get("blocks", []):
+        tp = None
+        if use_ocr:
+            try:
+                tp = page.get_textpage_ocr(dpi=150, language=ocr_lang)
+            except Exception:
+                pass
+        d = page.get_text("dict", textpage=tp)
+        for b in d.get("blocks", []):
             if b.get("type") != 0:
                 continue
             for ln in b.get("lines", []):
@@ -265,7 +629,14 @@ def _derive_toc(doc):
     toc, seen = [], set()
     for pno in range(1, doc.page_count + 1):
         page = doc[pno - 1]
-        for b in page.get_text("dict").get("blocks", []):
+        tp = None
+        if use_ocr:
+            try:
+                tp = page.get_textpage_ocr(dpi=150, language=ocr_lang)
+            except Exception:
+                pass
+        d = page.get_text("dict", textpage=tp)
+        for b in d.get("blocks", []):
             if b.get("type") != 0:
                 continue
             for ln in b.get("lines", []):
@@ -300,14 +671,62 @@ def get_toc(pdf_path):
 # ────────────────────────────────────────────────────────────────────────────
 # Section extraction using TOC page ranges
 # ────────────────────────────────────────────────────────────────────────────
-def _find_sub(stream, needle, start):
-    n = len(needle)
+def _find_sub_canon(canon_stream, needle_canon, start_stream_idx, hi_stream_idx=None):
+    n = len(needle_canon)
     if not n:
-        return -1
-    for i in range(start, len(stream) - n + 1):
-        if stream[i:i + n] == needle:
-            return i
-    return -1
+        return None
+    
+    # 1. Contiguous word-level match
+    start_canon_idx = 0
+    while start_canon_idx < len(canon_stream) and canon_stream[start_canon_idx][1] < start_stream_idx:
+        start_canon_idx += 1
+        
+    if hi_stream_idx is not None:
+        hi_canon_idx = start_canon_idx
+        while hi_canon_idx < len(canon_stream) and canon_stream[hi_canon_idx][1] < hi_stream_idx:
+            hi_canon_idx += 1
+    else:
+        hi_canon_idx = len(canon_stream)
+        
+    for i in range(start_canon_idx, hi_canon_idx - n + 1):
+        match = True
+        for j in range(n):
+            if canon_stream[i + j][0] != needle_canon[j]:
+                match = False
+                break
+        if match:
+            return canon_stream[i][1], canon_stream[i + n - 1][1]
+            
+    # 2. Fallback to character-level substring match (handles merged words like "Systemmenu")
+    canon_stream_str_parts = []
+    char_to_stream_idx = []
+    for cw, orig_idx in canon_stream:
+        char_to_stream_idx.extend([orig_idx] * len(cw))
+        canon_stream_str_parts.append(cw)
+    canon_stream_str = "".join(canon_stream_str_parts)
+    
+    needle_str = "".join(needle_canon)
+    
+    start_char_idx = 0
+    while start_char_idx < len(char_to_stream_idx) and char_to_stream_idx[start_char_idx] < start_stream_idx:
+        start_char_idx += 1
+        
+    if hi_stream_idx is not None:
+        hi_char_idx = start_char_idx
+        while hi_char_idx < len(char_to_stream_idx) and char_to_stream_idx[hi_char_idx] < hi_stream_idx:
+            hi_char_idx += 1
+    else:
+        hi_char_idx = len(char_to_stream_idx)
+        
+    sub_str = canon_stream_str[start_char_idx:hi_char_idx]
+    pos_in_sub = sub_str.find(needle_str)
+    if pos_in_sub >= 0:
+        match_start_char = start_char_idx + pos_in_sub
+        match_end_char = match_start_char + len(needle_str) - 1
+        if match_start_char < len(char_to_stream_idx) and match_end_char < len(char_to_stream_idx):
+            return char_to_stream_idx[match_start_char], char_to_stream_idx[match_end_char]
+        
+    return None
 
 
 def extract_sections(pdf_path, is_prod: bool) -> dict:
@@ -329,7 +748,7 @@ def extract_sections(pdf_path, is_prod: bool) -> dict:
         page_start[i] = len(stream)
         body = (_extract_page_body_prod(page)
                 if is_prod else _extract_page_body_stage(page))
-        stream += body.split()
+        stream += _tokenize(body)
     doc.close()
 
     kept  = sorted(page_start)
@@ -344,17 +763,30 @@ def extract_sections(pdf_path, is_prod: bool) -> dict:
         after = [p for p in kept if p > base]
         return lo, (page_start[after[0]] if after else len(stream))
 
+    # Pre-build canon_stream for fast matching
+    canon_stream = []
+    for idx, t in enumerate(stream):
+        cw = _canon(t)
+        if cw:
+            canon_stream.append((cw, idx))
+
     located, pos = [], 0
     for level, title, pgno in toc:
-        needle      = _normalize(title).split()
+        needle_tokens = _tokenize(_normalize(title))
+        needle_canon = [w for w in (_canon(t) for t in needle_tokens) if w]
         lo, hi      = _window(pgno)
-        idx         = _find_sub(stream[:hi], needle, max(pos, lo))
-        if idx < 0:
-            idx     = _find_sub(stream, needle, lo)
-        if idx < 0:
-            idx     = _find_sub(stream, needle, pos)
-        if idx >= 0:
-            pos     = idx + len(needle)
+        
+        res         = _find_sub_canon(canon_stream, needle_canon, max(pos, lo), hi)
+        if res is None:
+            res     = _find_sub_canon(canon_stream, needle_canon, lo)
+        if res is None:
+            res     = _find_sub_canon(canon_stream, needle_canon, pos)
+            
+        if res is not None:
+            idx, end_idx = res
+            pos = end_idx + 1
+        else:
+            idx = -1
         located.append((idx, level, title, pgno))
 
     starts   = [l[0] for l in located if l[0] is not None and l[0] >= 0]
@@ -369,6 +801,7 @@ def extract_sections(pdf_path, is_prod: bool) -> dict:
     return sections
 
 
+
 # ────────────────────────────────────────────────────────────────────────────
 # Shingle-based content comparison
 # ────────────────────────────────────────────────────────────────────────────
@@ -379,26 +812,43 @@ def _build_stage_index(stage_pdf_path: str, nav_pages: set):
     first TOC heading (e.g. copyright body text) is still covered.
     """
     doc        = fitz.open(stage_pdf_path)
+    lang       = _get_pdf_language(doc)
+    is_cjk     = lang in ("chi_tra", "chi_sim", "jpn", "kor")
+    shingle_len = 8 if is_cjk else CHAR_SHINGLE
+
     all_words  = []
     raw_parts  = []
     for i, page in enumerate(doc, 1):
         if i in nav_pages:
             continue
         body = _extract_page_body_stage(page)
-        words = _keep(body.split())
+        words = _keep(_tokenize(body))
         all_words  += words
         raw_parts.append(body)
     doc.close()
     nospace = "".join(_canon(w) for w in all_words)
-    cset    = {nospace[i:i + CHAR_SHINGLE]
-               for i in range(len(nospace) - CHAR_SHINGLE + 1)}
-    full_lower = re.sub(r"\s+", " ", " ".join(raw_parts)).lower()
+    cset    = {nospace[i:i + shingle_len]
+               for i in range(len(nospace) - shingle_len + 1)}
+    full_lower = _s_norm(re.sub(r"\s+", " ", " ".join(raw_parts))).lower()
     return nospace, cset, full_lower
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # Image extraction and comparison
 # ────────────────────────────────────────────────────────────────────────────
+def _is_decorative(bw: float, bh: float) -> bool:
+    """True for thin rules / underlines / separator strips — not figures or icons.
+
+    These render very differently between PROD and STAGE (a 1-pt horizontal rule
+    in PROD may be a CSS border in STAGE) and would otherwise inflate the image
+    comparison with false misses. Anything with a tiny short edge (< 6 pt) or an
+    extreme aspect ratio (> 8:1) is treated as decoration, not real artwork.
+    """
+    mn = min(bw, bh)
+    ar = max(bw, bh) / max(mn, 0.1)
+    return mn < 6.0 or ar > 8.0
+
+
 def _page_onpage_images(page):
     """Return list of (bw_pt, bh_pt) for each valid image placement on the page.
 
@@ -406,6 +856,9 @@ def _page_onpage_images(page):
     encoded pixel dimensions.  This makes comparison resolution-independent: a
     PROD icon encoded at 212 px but displayed at 25 pt matches a Stage icon
     encoded at 421 px but also displayed at 25 pt.
+
+    Decorative rules / underlines (see _is_decorative) are skipped so they don't
+    masquerade as missing figures or icons.
 
     Deduplicates by rounded bbox position (same location = same placement).
     """
@@ -418,6 +871,8 @@ def _page_onpage_images(page):
         bw = bbox[2] - bbox[0]
         bh = bbox[3] - bbox[1]
         if bw <= 0 or bh <= 0 or bw * bh < _MIN_ONPAGE_AREA:
+            continue
+        if _is_decorative(bw, bh):
             continue
         key = (round(bbox[0]), round(bbox[1]), round(bbox[2]), round(bbox[3]))
         if key in seen:
@@ -456,1094 +911,147 @@ def _extract_section_images(pdf_path: str, nav_pages: set) -> dict:
     return result
 
 
-def _extract_stage_images_by_prod_sections(
-        stage_path: str, prod_toc: list, stage_toc: list, nav_pages: set) -> dict:
-    """Return {prod_title: [(page_no, bw_pt, bh_pt), ...]} for Stage.
-
-    Uses PROD section ordering for Stage page ranges (avoids Stage's granular
-    TOC causing empty section boundaries).  On-page pt dimensions used.
-    """
-    doc   = fitz.open(stage_path)
-    total = doc.page_count
-
-    stage_pg_map = {_norm_key(t): pg for _, t, pg in stage_toc}
-    matched = []
-    for _, title, _ in prod_toc:
-        key = _norm_key(title)
-        if key in stage_pg_map:
-            matched.append((title, stage_pg_map[key]))
-
-    result = {}
-    for i, (title, pg) in enumerate(matched):
-        end_pg = matched[i + 1][1] - 1 if i + 1 < len(matched) else total
-        end_pg = max(pg, end_pg)
-        imgs = []
-        for pno in range(pg, end_pg + 1):
-            if pno < 1 or pno > total or pno in nav_pages:
-                continue
-            for bw, bh in _page_onpage_images(doc[pno - 1]):
-                imgs.append((pno, bw, bh))
-        result[title] = imgs
-
-    doc.close()
-    return result
+def _dim_match(iw: int, sw: int, tol: float = 0.10) -> bool:
+    """True when Stage image width is within tol% of PROD image width."""
+    return abs(iw - sw) <= tol * max(iw, 1)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Visual image comparison
-# ────────────────────────────────────────────────────────────────────────────
-def _extract_image_from_pdf(pdf_path: str, page_no: int, img_bbox) -> bytes or None:
-    """Extract a single image from PDF page within bbox, return as PNG bytes."""
-    if not PIL_AVAILABLE:
+def _nearest(sizes: list, iw: float):
+    """Return the (w, h) in ``sizes`` closest to ``iw`` by width, or None if empty."""
+    if not sizes:
         return None
-    try:
-        doc = fitz.open(pdf_path)
-        if page_no < 1 or page_no > doc.page_count:
-            doc.close()
-            return None
-        page = doc[page_no - 1]
-        # Get the image region as a pixmap
-        pix = page.get_pixmap(clip=img_bbox, alpha=False)
-        img_bytes = pix.tobytes("png")
-        doc.close()
-        return img_bytes
-    except:
-        return None
+    return min(sizes, key=lambda s: abs(iw - s[0]))
 
 
-def _images_visually_similar(img1_bytes, img2_bytes, threshold: float = 0.90) -> bool:
-    """Compare two images visually using histogram comparison.
-    
-    Returns True if images are visually similar (similarity >= threshold).
-    Returns False if images are visually different or comparison fails.
+def _compare_image_sections(prod_imgs: dict,
+                             stage_all_icons: list,
+                             stage_all_content: list,
+                             stage_vector_count: int = 0) -> list:
+    """Compare PROD figures and icons against STAGE.
+
+    Content figures (max on-page dim > _ICON_MAX_ONPAGE):
+        Matched by COUNT, consume-based, against the whole STAGE document.
+        PROD and STAGE use different layout engines, so the *same* figure is
+        rendered at a different on-page size, and STAGE re-paginates / re-sections
+        content (its TOC is far more granular). Per-section exact-dimension
+        matching therefore produced false "missing" results even though STAGE had
+        the figure — just resized or under another heading. Instead every PROD
+        figure claims one STAGE figure document-wide (the nearest unclaimed size,
+        for display): it is PRESENT while STAGE still has figures left, and only
+        genuinely MISSING once STAGE runs out (STAGE truly has fewer figures than
+        PROD). A claimed figure whose size differs > 15 % is reported as Info
+        (resized / reorganised), which is not a defect.
+
+    Icons (max on-page dim ≤ _ICON_MAX_ONPAGE):
+        Icons are a *small reused set* (one NOTE / warning / connector glyph
+        appears on many pages), so PROD and STAGE have different icon-placement
+        *counts* purely from re-pagination — counts are NOT comparable and the
+        pool is non-consumed. While STAGE has raster icons the PROD icon is
+        PRESENT (an exact-size miss is Info — size drift across export pipelines,
+        never a section failure).
+
+        STAGE manuals exported from InDesign/FrameMaker frequently render icons
+        as *vector drawings* rather than raster images, so no raster icon is
+        extractable even though the icons are present. When STAGE has no raster
+        icons but carries substantial vector artwork (``stage_vector_count``),
+        icons are reported N/A — "vector-rendered, size check not applicable" —
+        instead of a misleading "missing". Decorative rules are filtered
+        upstream.
     """
-    if not PIL_AVAILABLE or not img1_bytes or not img2_bytes:
-        return True  # Can't determine, assume similar
-    try:
-        img1 = Image.open(BytesIO(img1_bytes)).convert("L")  # Grayscale
-        img2 = Image.open(BytesIO(img2_bytes)).convert("L")
-        
-        # Resize both to same size for comparison
-        size = (128, 128)
-        img1 = img1.resize(size)
-        img2 = img2.resize(size)
-        
-        # Compute histograms
-        hist1 = img1.histogram()
-        hist2 = img2.histogram()
-        
-        # Compare histograms using chi-square-like metric
-        diff = sum((h1 - h2) ** 2 for h1, h2 in zip(hist1, hist2))
-        similarity = 1.0 / (1.0 + diff / 1000000.0)  # Convert to 0-1 range
-        
-        return similarity >= threshold
-    except:
-        return True  # Can't determine, assume similar
-
-
-def _dim_match(iw: int, ih: int, sw: int, sh: int, tol: float = 0.10) -> bool:
-    """True when Stage image dims are within tol% of PROD image dims on both axes."""
-    return (abs(iw - sw) <= tol * max(iw, 1) and
-            abs(ih - sh) <= tol * max(ih, 1))
-
-
-def _compare_image_sections(prod_imgs: dict, stage_imgs: dict,
-                             stage_all_icons: list) -> list:
-    """Compare images section by section using consume-based dimension matching.
-
-    Content images (max(w,h) > _ICON_MAX_DIM):
-        Per-section consume: each PROD content image consumes one matching Stage
-        image with ±10% tolerance so duplicate dimensions are counted correctly.
-
-    Icons (max(w,h) ≤ _ICON_MAX_DIM):
-        Non-consume doc-wide check.  The same icon image object is shared across
-        many PROD sections (same xref reused per-page), so each Stage icon should
-        be able to satisfy multiple PROD sections' references.  A PROD icon is
-        PRESENT when any Stage icon of matching dimensions exists anywhere in the
-        document.  Total unique icon-dimension counts are compared globally via
-        icon_doc_summary.
-    """
-    prod_keys  = {_norm_key(t): (t, imgs) for t, imgs in prod_imgs.items()}
-    stage_keys = {_norm_key(t): (t, imgs) for t, imgs in stage_imgs.items()}
+    # STAGE renders its images as vector art (no extractable raster of that type)?
+    stage_vector_icons   = (not stage_all_icons)   and stage_vector_count >= _VECTOR_ICON_MIN
+    stage_vector_figures = (not stage_all_content) and stage_vector_count >= _VECTOR_ICON_MIN
+    # Document-wide STAGE figure pool, consumed across all sections in order.
+    content_pool = list(stage_all_content)
 
     rows = []
-    for nk, (title, p_imgs) in prod_keys.items():
-        _, s_imgs = stage_keys.get(nk, ("", []))
-
-        # Per-section mutable pool for content images (consume-based)
-        # Tuples are now (pno, bw, bh) with on-page pt dimensions
-        s_content_avail = [
-            (bw, bh) for _, bw, bh in s_imgs if max(bw, bh) > _ICON_MAX_ONPAGE
-        ]
-
+    for title, p_imgs in prod_imgs.items():
         dim_rows       = []
         n_cont_present = 0
         n_cont_missing = 0
         n_icon_present = 0
         n_icon_missing = 0
+        n_icon_na      = 0
+        n_cont_na      = 0
 
         for pno, iw, ih in p_imgs:
             is_content = max(iw, ih) > _ICON_MAX_ONPAGE
-            img_type   = "Content" if is_content else "Icon"
-            display_match = None
 
             if is_content:
-                # Consume from per-section content pool (15% tolerance for content)
-                match_idx = next(
-                    (i for i, (sw, sh) in enumerate(s_content_avail)
-                     if _dim_match(iw, ih, sw, sh, tol=0.15)),
-                    None,
-                )
-                match = s_content_avail.pop(match_idx) if match_idx is not None else None
-                display_match = match
-
+                near = _nearest(content_pool, iw)
+                if near is not None:
+                    content_pool.remove(near)
+                    # Claimed → figure exists in STAGE. Exact width match = Present,
+                    # otherwise Info (figure is present but resized/reorganised).
+                    status = "Present" if _dim_match(iw, near[0], tol=0.15) else "Info"
+                    display_match = near
+                    n_cont_present += 1
+                elif stage_vector_figures:
+                    # STAGE draws figures as vectors — raster size match N/A, present.
+                    status = "NA"
+                    display_match = None
+                    n_cont_na += 1
+                else:
+                    status = "Missing"          # STAGE ran out of figures — genuine
+                    display_match = None
+                    n_cont_missing += 1
+                dim_rows.append({
+                    "section": title, "prod_page": pno,
+                    "prod_w": iw, "prod_h": ih, "type": "Content",
+                    "status": status,
+                    "match_w": display_match[0] if display_match else None,
+                    "match_h": display_match[1] if display_match else None,
+                    "nearest_only": status == "Info",
+                })
             else:
-                # Non-consume doc-wide for icons (25% tolerance — different encodings
-                # may display at slightly different pt sizes)
-                match = next(
-                    ((sw, sh) for sw, sh in stage_all_icons
-                     if _dim_match(iw, ih, sw, sh, tol=0.25)),
-                    None,
-                )
-                if match:
-                    display_match = match
-                elif stage_all_icons:
-                    # Keep strict pass/fail logic, but still capture the nearest
-                    # visible Stage icon size for reporting clarity.
-                    display_match = min(
-                        stage_all_icons,
-                        key=lambda s: abs(iw - s[0]) + abs(ih - s[1]),
-                    )
+                if stage_all_icons:
+                    # Non-consume: STAGE has icons (a small set reused across
+                    # pages), so the PROD icon is present; an exact-size miss is
+                    # Info (size drift), never "missing".
+                    match = next(((sw, sh) for sw, sh in stage_all_icons
+                                  if _dim_match(iw, sw, tol=0.25)), None)
+                    display_match = match or _nearest(stage_all_icons, iw)
+                    status = "Present" if match else "Info"
+                    n_icon_present += 1
+                    nearest_only = not match
+                elif stage_vector_icons:
+                    # STAGE draws icons as vectors — raster size match N/A, present.
+                    status = "NA"
+                    display_match = None
+                    n_icon_na += 1
+                    nearest_only = False
+                else:
+                    # STAGE genuinely has no icons at all.
+                    status = "Missing" if _FAIL_ON_ICON_MISS else "Info"
+                    display_match = None
+                    n_icon_missing += 1
+                    nearest_only = False
+                dim_rows.append({
+                    "section": title, "prod_page": pno,
+                    "prod_w": iw, "prod_h": ih, "type": "Icon",
+                    "status": status,
+                    "match_w": display_match[0] if display_match else None,
+                    "match_h": display_match[1] if display_match else None,
+                    "nearest_only": nearest_only,
+                })
 
-            if match:
-                status = "Present"
-            else:
-                status = "Missing" if (is_content or _FAIL_ON_ICON_MISS) else "Info"
-            dim_rows.append({
-                "section":   title,
-                "prod_page": pno,
-                "prod_w":    iw,
-                "prod_h":    ih,
-                "type":      img_type,
-                "status":    status,
-                "match_w":   display_match[0] if display_match else None,
-                "match_h":   display_match[1] if display_match else None,
-                "nearest_only": bool(display_match and not match),
-            })
-
-            if is_content:
-                if match: n_cont_present += 1
-                else:     n_cont_missing += 1
-            else:
-                if match: n_icon_present += 1
-                else:     n_icon_missing += 1
-
-        # Section-level pass/fail is based on content images only.
-        # Icon comparisons remain in the report as informational because icon
-        # bboxes vary heavily across export pipelines and can create false misses.
-        if _FAIL_ON_ICON_MISS:
-            status_overall = "Fail" if n_cont_missing > 0 or n_icon_missing > 0 else "Pass"
-        else:
-            status_overall = "Fail" if n_cont_missing > 0 else "Pass"
+        # A section fails only when STAGE genuinely has fewer figures than PROD.
+        status_overall = "Fail" if n_cont_missing > 0 else "Pass"
         rows.append({
             "title":         title,
-            "prod_content":  n_cont_present + n_cont_missing,
+            "prod_content":  n_cont_present + n_cont_missing + n_cont_na,
             "found_content": n_cont_present,
             "miss_content":  n_cont_missing,
-            "prod_icons":    n_icon_present + n_icon_missing,
+            "na_content":    n_cont_na,
+            "prod_icons":    n_icon_present + n_icon_missing + n_icon_na,
             "found_icons":   n_icon_present,
             "miss_icons":    n_icon_missing,
+            "na_icons":      n_icon_na,
             "status":        status_overall,
             "dim_rows":      dim_rows,
         })
 
     return rows
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# Image layout, table counting, and text alignment (Part 4)
-# ────────────────────────────────────────────────────────────────────────────
-
-def _get_page_image_layout(page):
-    """Return a list of image rows on the page.
-
-    Each row is a list of dicts {align, w, h} sorted left-to-right.
-    Rows are sorted top-to-bottom.  Alignment:
-        'L' — image centre left of page centre (>20% margin)
-        'C' — image centre within ±20% of page centre
-        'R' — image centre right of page centre
-    Images smaller than _MIN_IMG_PIXELS are excluded.
-    """
-    pw  = page.rect.width
-    ph  = page.rect.height
-    pc  = pw / 2.0
-    tol = ph * 0.06   # 6% of page height = same-row tolerance
-
-    placed = []
-    for info in page.get_image_info():
-        bbox = info.get("bbox")
-        if not bbox or len(bbox) < 4:
-            continue
-        bw = bbox[2] - bbox[0]
-        bh = bbox[3] - bbox[1]
-        if bw <= 0 or bh <= 0 or bw * bh < _MIN_ONPAGE_AREA:
-            continue
-        placed.append({"bbox": bbox, "w": round(bw), "h": round(bh)})
-
-    if not placed:
-        return []
-
-    # Group by Y-centre
-    raw_rows = []
-    for img in sorted(placed, key=lambda d: (d["bbox"][1] + d["bbox"][3]) / 2):
-        yc    = (img["bbox"][1] + img["bbox"][3]) / 2
-        added = False
-        for row in raw_rows:
-            row_y = sum((d["bbox"][1] + d["bbox"][3]) / 2 for d in row) / len(row)
-            if abs(yc - row_y) < tol:
-                row.append(img)
-                added = True
-                break
-        if not added:
-            raw_rows.append([img])
-
-    result = []
-    for row in raw_rows:
-        row.sort(key=lambda d: d["bbox"][0])
-        items = []
-        for img in row:
-            cx = (img["bbox"][0] + img["bbox"][2]) / 2
-            if abs(cx - pc) <= pc * 0.20:
-                align = "C"
-            elif cx < pc:
-                align = "L"
-            else:
-                align = "R"
-            items.append({"align": align, "w": img["w"], "h": img["h"]})
-        result.append(items)
-
-    return result
-
-
-def _section_page_range(i, toc, total):
-    """Return (start_pg, end_pg) inclusive 1-based for toc entry i."""
-    lvl, _, pg = toc[i]
-    end_pg = total
-    for j in range(i + 1, len(toc)):
-        if toc[j][0] <= lvl:
-            end_pg = toc[j][2] - 1
-            break
-    return pg, end_pg
-
-
-def _stage_section_ranges(prod_toc, stage_toc, total):
-    """Return [(title, start_pg, end_pg)] for Stage using PROD section ordering."""
-    stage_pg_map = {_norm_key(t): pg for _, t, pg in stage_toc}
-    matched = []
-    for _, title, _ in prod_toc:
-        key = _norm_key(title)
-        if key in stage_pg_map:
-            matched.append((title, stage_pg_map[key]))
-    ranges = []
-    for i, (title, pg) in enumerate(matched):
-        end_pg = matched[i + 1][1] - 1 if i + 1 < len(matched) else total
-        ranges.append((title, pg, max(pg, end_pg)))
-    return ranges
-
-
-def _get_page_text_alignment(page):
-    """Return Counter of {'Left': n, 'Center': n, 'Right': n} for text blocks.
-
-    Blocks that span nearly the full page width are skipped (body paragraphs
-    appear full-width regardless of text justification and would all look
-    'center' under a naive x-center test).
-    """
-    from collections import Counter
-    pw  = page.rect.width
-    pc  = pw / 2.0
-    cnt = Counter()
-    for block in page.get_text("dict")["blocks"]:
-        if block.get("type") != 0:
-            continue
-        bbox = block["bbox"]
-        bw   = bbox[2] - bbox[0]
-        if bw < 30 or bw > pw * 0.90:   # skip tiny and full-width
-            continue
-        txt = "".join(
-            s.get("text", "")
-            for line in block.get("lines", [])
-            for s in line.get("spans", [])
-        ).strip()
-        if len(txt) < 8:
-            continue
-        bc         = (bbox[0] + bbox[2]) / 2
-        left_gap   = bbox[0]
-        right_gap  = pw - bbox[2]
-        if abs(bc - pc) < pw * 0.07 and bw < pw * 0.60:
-            cnt["Center"] += 1
-        elif right_gap < left_gap * 0.40 and bw < pw * 0.45:
-            cnt["Right"] += 1
-        else:
-            cnt["Left"] += 1
-    return cnt
-
-
-def _extract_layout_prod(pdf_path, nav_pages, toc):
-    """Single-pass extraction: image layout + tables + text alignment for PROD.
-
-    Returns (img_layout, tables, text_align) each {title: data}.
-    """
-    from collections import Counter
-    doc    = fitz.open(pdf_path)
-    total  = doc.page_count
-    img_layout = {}
-    tables     = {}
-    text_align = {}
-
-    for i in range(len(toc)):
-        _, title, _ = toc[i]
-        pg, end_pg  = _section_page_range(i, toc, total)
-        page_rows   = []
-        tab_list    = []
-        align_cnt   = Counter()
-
-        for pno in range(pg, end_pg + 1):
-            if pno < 1 or pno > total or pno in nav_pages:
-                continue
-            page = doc[pno - 1]
-            rows = _get_page_image_layout(page)
-            if rows:
-                page_rows.append((pno, rows))
-            try:
-                for t in page.find_tables().tables:
-                    if t.row_count > 1 or t.col_count > 1:
-                        tab_list.append((pno, t.row_count, t.col_count))
-            except Exception:
-                pass
-            align_cnt.update(_get_page_text_alignment(page))
-
-        img_layout[title] = page_rows
-        tables[title]     = tab_list
-        text_align[title] = dict(align_cnt)
-
-    doc.close()
-    return img_layout, tables, text_align
-
-
-def _extract_layout_stage(stage_path, prod_toc, stage_toc, nav_pages):
-    """Single-pass extraction: image layout + tables + text alignment for Stage."""
-    from collections import Counter
-    doc    = fitz.open(stage_path)
-    total  = doc.page_count
-    img_layout = {}
-    tables     = {}
-    text_align = {}
-
-    for title, pg, end_pg in _stage_section_ranges(prod_toc, stage_toc, total):
-        page_rows = []
-        tab_list  = []
-        align_cnt = Counter()
-
-        for pno in range(pg, end_pg + 1):
-            if pno < 1 or pno > total or pno in nav_pages:
-                continue
-            page = doc[pno - 1]
-            rows = _get_page_image_layout(page)
-            if rows:
-                page_rows.append((pno, rows))
-            try:
-                for t in page.find_tables().tables:
-                    if t.row_count > 1 or t.col_count > 1:
-                        tab_list.append((pno, t.row_count, t.col_count))
-            except Exception:
-                pass
-            align_cnt.update(_get_page_text_alignment(page))
-
-        img_layout[title] = page_rows
-        tables[title]     = tab_list
-        text_align[title] = dict(align_cnt)
-
-    doc.close()
-    return img_layout, tables, text_align
-
-
-def _fmt_rows(rows_list):
-    """Format image rows as a compact string (max 5 rows shown).
-
-    e.g. '3 rows — R1:3img(L,C,R) R2:1img(C) R3:2img(L,R)'
-    For longer lists: '8 rows — R1:3img(L,C,R) … R8:1img(C)'
-    """
-    if not rows_list:
-        return "—"
-    total = len(rows_list)
-    if total <= 5:
-        parts = [
-            f"R{i}:{len(r)}img({''.join(d['align'] for d in r)})"
-            for i, r in enumerate(rows_list, 1)
-        ]
-        return f"{total} row{'s' if total>1 else ''} — " + " ".join(parts)
-    first = [
-        f"R{i}:{len(r)}img({''.join(d['align'] for d in r)})"
-        for i, r in enumerate(rows_list[:3], 1)
-    ]
-    last_r  = rows_list[-1]
-    last_s  = f"R{total}:{len(last_r)}img({''.join(d['align'] for d in last_r)})"
-    return f"{total} rows — " + " ".join(first) + f" … {last_s}"
-
-
-def _fmt_tables(tab_list):
-    """Format table list as '3 tables: 4×3, 6×2, 3×3'."""
-    if not tab_list:
-        return "—"
-    dims = ", ".join(f"{r}×{c}" for _, r, c in tab_list)
-    return f"{len(tab_list)} table{'s' if len(tab_list)!=1 else ''}: {dims}"
-
-
-def _compare_layout(prod_layout, stage_layout, prod_tables, stage_tables,
-                    prod_align, stage_align):
-    """Return per-section layout comparison results."""
-    rows = []
-    for title in prod_layout:
-        p_pages   = prod_layout.get(title, [])
-        s_pages   = stage_layout.get(title, [])
-        p_tabs    = prod_tables.get(title, [])
-        s_tabs    = stage_tables.get(title, [])
-        p_al      = prod_align.get(title, {})
-        s_al      = stage_align.get(title, {})
-
-        # Flatten to row lists
-        p_rows = [row for _, page_rows in p_pages for row in page_rows]
-        s_rows = [row for _, page_rows in s_pages for row in page_rows]
-
-        issues = []
-
-        # Image row comparison
-        for i in range(max(len(p_rows), len(s_rows))):
-            if i >= len(p_rows):
-                issues.append(
-                    f"Img Row {i+1}: Stage extra "
-                    f"({len(s_rows[i])} img, aligns: {','.join(d['align'] for d in s_rows[i])})"
-                )
-            elif i >= len(s_rows):
-                issues.append(
-                    f"Img Row {i+1}: PROD has "
-                    f"{len(p_rows[i])} img ({','.join(d['align'] for d in p_rows[i])}) "
-                    f"— missing in Stage"
-                )
-            else:
-                p_r, s_r = p_rows[i], s_rows[i]
-                if len(p_r) != len(s_r):
-                    issues.append(
-                        f"Img Row {i+1}: count PROD {len(p_r)} ≠ Stage {len(s_r)} "
-                        f"(PROD aligns: {','.join(d['align'] for d in p_r)}, "
-                        f"Stage: {','.join(d['align'] for d in s_r)})"
-                    )
-                elif [d["align"] for d in p_r] != [d["align"] for d in s_r]:
-                    issues.append(
-                        f"Img Row {i+1}: alignment mismatch — "
-                        f"PROD {','.join(d['align'] for d in p_r)} ≠ "
-                        f"Stage {','.join(d['align'] for d in s_r)}"
-                    )
-
-        # Table comparison
-        if len(p_tabs) != len(s_tabs):
-            issues.append(
-                f"Table count: PROD {len(p_tabs)} ≠ Stage {len(s_tabs)}"
-            )
-        else:
-            for i, ((_, pr, pc_), (_, sr, sc)) in enumerate(zip(p_tabs, s_tabs), 1):
-                if pr != sr or pc_ != sc:
-                    issues.append(f"Table {i}: PROD {pr}×{pc_} ≠ Stage {sr}×{sc}")
-
-        # Text alignment
-        for atype in ("Center", "Right"):
-            pd_c = p_al.get(atype, 0)
-            sd_c = s_al.get(atype, 0)
-            if pd_c > 0 and sd_c == 0:
-                issues.append(
-                    f"Text alignment: PROD has {pd_c} {atype.lower()}-aligned "
-                    f"blocks, Stage has 0"
-                )
-            elif pd_c > 0 and abs(pd_c - sd_c) > max(2, pd_c * 0.5):
-                issues.append(
-                    f"Text alignment: {atype} blocks PROD {pd_c} ≠ Stage {sd_c}"
-                )
-
-        rows.append({
-            "title":         title,
-            "p_rows":        p_rows,
-            "s_rows":        s_rows,
-            "p_tabs":        p_tabs,
-            "s_tabs":        s_tabs,
-            "p_al":          p_al,
-            "s_al":          s_al,
-            "prod_row_desc": _fmt_rows(p_rows),
-            "stg_row_desc":  _fmt_rows(s_rows),
-            "prod_tab_desc": _fmt_tables(p_tabs),
-            "stg_tab_desc":  _fmt_tables(s_tabs),
-            "issues":        issues,
-            "status":        "Pass" if not issues else "Fail",
-        })
-
-    return rows
-
-
-def _toc_ranges_by_key(toc: list, total_pages: int) -> dict:
-    """Return {_norm_key(title): (start_page, end_page, title)} for TOC entries."""
-    out = {}
-    for i, (lvl, title, pg) in enumerate(toc):
-        end_pg = total_pages
-        for j in range(i + 1, len(toc)):
-            if toc[j][0] <= lvl:
-                end_pg = toc[j][2] - 1
-                break
-        key = _norm_key(title)
-        # Keep first occurrence if duplicate keys exist.
-        out.setdefault(key, (pg, max(pg, end_pg), title))
-    return out
-
-
-def _render_page_for_visual(doc, page_no: int):
-    """Render a PDF page to grayscale PIL image for visual comparison."""
-    if not PIL_AVAILABLE:
-        return None
-    try:
-        page = doc[page_no - 1]
-        mat = fitz.Matrix(VISUAL_RENDER_SCALE, VISUAL_RENDER_SCALE)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        mode = "RGB" if pix.n >= 3 else "L"
-        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-        return img.convert("L")
-    except Exception:
-        return None
-
-
-def _visual_similarity(img_a, img_b) -> float:
-    """Return visual similarity score in [0,1] using mean absolute difference."""
-    if not PIL_AVAILABLE or img_a is None or img_b is None:
-        return 1.0
-    try:
-        size = (360, 360)
-        a = img_a.resize(size)
-        b = img_b.resize(size)
-        diff = ImageChops.difference(a, b)
-        mad = ImageStat.Stat(diff).mean[0] / 255.0
-        return max(0.0, min(1.0, 1.0 - mad))
-    except Exception:
-        return 1.0
-
-
-def _compare_visual_sections(prod_path: str, stage_path: str, prod_toc: list,
-                             stage_toc: list, toc_results: list) -> list:
-    """Section-wise visual validation: expected PROD pages vs actual STAGE pages."""
-    if not PIL_AVAILABLE:
-        rows = []
-        for r in toc_results:
-            if r.get("toc_status") == "Extra in Stage":
-                continue
-            rows.append({
-                "title": r["title"],
-                "prod_range": str(r.get("prod_page", "-")),
-                "stage_range": str(r.get("stage_page", "-")),
-                "avg_score": 1.0,
-                "compared": 0,
-                "status": "Info",
-                "difference": "Visual engine unavailable (Pillow not installed)",
-            })
-        return rows
-
-    prod_doc = fitz.open(prod_path)
-    stage_doc = fitz.open(stage_path)
-    prod_ranges = _toc_ranges_by_key(prod_toc, prod_doc.page_count)
-    stage_ranges = _toc_ranges_by_key(stage_toc, stage_doc.page_count)
-
-    prod_cache = {}
-    stage_cache = {}
-
-    def cached_render(cache, doc, pno):
-        if pno not in cache:
-            cache[pno] = _render_page_for_visual(doc, pno)
-        return cache[pno]
-
-    rows = []
-    for r in toc_results:
-        if r.get("toc_status") == "Extra in Stage":
-            continue
-        title = r["title"]
-        key = _norm_key(title)
-
-        p_start, p_end, _ = prod_ranges.get(key, (None, None, title))
-        s_range = stage_ranges.get(key)
-        if p_start is None:
-            rows.append({
-                "title": title,
-                "prod_range": "-",
-                "stage_range": "-",
-                "avg_score": 0.0,
-                "compared": 0,
-                "status": "Fail",
-                "difference": "Expected section not found in PROD TOC range map",
-            })
-            continue
-
-        if not s_range:
-            rows.append({
-                "title": title,
-                "prod_range": f"p{p_start}-p{p_end}",
-                "stage_range": "Missing",
-                "avg_score": 0.0,
-                "compared": 0,
-                "status": "Fail",
-                "difference": "Section missing in STAGE",
-            })
-            continue
-
-        s_start, s_end, _ = s_range
-        p_pages = list(range(p_start, p_end + 1))
-        s_pages = list(range(s_start, s_end + 1))
-        comp_n = min(len(p_pages), len(s_pages))
-        scores = []
-        low = []
-        for i in range(comp_n):
-            pp = p_pages[i]
-            sp = s_pages[i]
-            sim = _visual_similarity(
-                cached_render(prod_cache, prod_doc, pp),
-                cached_render(stage_cache, stage_doc, sp),
-            )
-            scores.append(sim)
-            if sim < VISUAL_PAGE_THRESHOLD:
-                low.append((pp, sp, sim))
-
-        avg = sum(scores) / len(scores) if scores else 0.0
-        diffs = []
-        if len(p_pages) != len(s_pages):
-            diffs.append(f"page-count PROD {len(p_pages)} vs STAGE {len(s_pages)}")
-        if low:
-            sample = ", ".join(
-                f"p{pp}->p{sp} ({sim:.2f})" for pp, sp, sim in low[:3]
-            )
-            extra = f" +{len(low)-3} more" if len(low) > 3 else ""
-            diffs.append(f"visual mismatch {sample}{extra}")
-
-        rows.append({
-            "title": title,
-            "prod_range": f"p{p_start}-p{p_end}",
-            "stage_range": f"p{s_start}-p{s_end}",
-            "avg_score": round(avg, 3),
-            "compared": comp_n,
-            "status": "Pass" if not diffs else "Fail",
-            "difference": "Matched" if not diffs else "; ".join(diffs),
-        })
-
-    prod_doc.close()
-    stage_doc.close()
-    return rows
-
-
-_NOTICE_RE = re.compile(r"\b(NOTE|TIP|IMPORTANT|WARNING|CAUTION|INFO)\b", re.IGNORECASE)
-
-# Plain-English labels for each style bucket, used throughout the report.
-_STYLE_LABELS = {
-    "heading":    "Headings",
-    "subheading": "Sub-headings",
-    "body":       "Body text",
-    "notice":     "Notices (NOTE/TIP/etc.)",
-}
-
-
-def _doc_body_size(doc) -> float:
-    """Most common font size of running body text (lines ≥ 15 chars).
-
-    This is the per-document baseline. STAGE and PROD can render the whole
-    manual at slightly different absolute point sizes and with different font
-    *names* (PROD uses 'Roboto'/'Poppins'; STAGE uses 'Roboto-Bold' etc.), so
-    absolute pt thresholds and bold-name detection are unreliable. Classifying
-    every line by its size *ratio* to this baseline keeps the heading/body
-    decision consistent across both PDFs.
-    """
-    sizes = {}
-    for page in doc:
-        d = page.get_text("dict")
-        for b in d.get("blocks", []):
-            if b.get("type") != 0:
-                continue
-            for line in b.get("lines", []):
-                spans = line.get("spans", [])
-                txt = "".join(s.get("text", "") for s in spans).strip()
-                if len(txt) < 15:
-                    continue
-                mx = max((round(s.get("size", 0.0), 1) for s in spans), default=0.0)
-                if mx > 0:
-                    sizes[mx] = sizes.get(mx, 0) + 1
-    if not sizes:
-        return 10.0
-    return max(sizes.items(), key=lambda kv: kv[1])[0]
-
-
-def _style_class_rel(text: str, max_size: float, body_size: float) -> str:
-    """Classify a line by its size ratio to the document's own body size.
-
-    Size-only (no bold-name check) so the result is symmetric between PROD and
-    STAGE, which name their fonts differently.
-    """
-    t = (text or "").strip()
-    if not t:
-        return "other"
-    if _NOTICE_RE.search(t):
-        return "notice"
-    ratio = (max_size / body_size) if body_size > 0 else 1.0
-    if ratio >= 1.45:                       # ~18pt+ vs 12pt body → section title
-        return "heading"
-    if ratio >= 1.12:                       # ~13.5pt+ → sub-heading
-        return "subheading"
-    if ratio >= 0.85 and len(t) >= 15:      # 11–12pt running text → body
-        return "body"
-    return "other"
-
-
-def _extract_style_profile(doc, start_pg: int, end_pg: int, body_size: float) -> dict:
-    """Count heading/subheading/body/notice lines across a page range."""
-    counts = {"heading": 0, "subheading": 0, "body": 0, "notice": 0}
-    for pno in range(start_pg, end_pg + 1):
-        if pno < 1 or pno > doc.page_count:
-            continue
-        page = doc[pno - 1]
-        d = page.get_text("dict")
-        for b in d.get("blocks", []):
-            if b.get("type") != 0:
-                continue
-            for line in b.get("lines", []):
-                spans = line.get("spans", [])
-                txt = "".join(s.get("text", "") for s in spans).strip()
-                if not txt:
-                    continue
-                max_size = max((s.get("size", 0.0) for s in spans), default=0.0)
-                style = _style_class_rel(txt, max_size, body_size)
-                if style in counts:
-                    counts[style] += 1
-    counts["total"] = sum(counts[k] for k in ("heading", "subheading", "body", "notice"))
-    return counts
-
-
-def _pg_label(start: int, end: int) -> str:
-    """'page 3' or 'pages 6-7'."""
-    return f"page {start}" if start == end else f"pages {start}-{end}"
-
-
-def _extract_table_style_profile(doc, start_pg: int, end_pg: int) -> dict:
-    """Extract table text style metrics for a section.
-
-    Captures table count, median table-text font size, and alignment mix of
-    text blocks that fall inside detected table bboxes.
-    """
-    font_sizes = []
-    align = {"Left": 0, "Center": 0, "Right": 0}
-    table_count = 0
-
-    for pno in range(start_pg, end_pg + 1):
-        if pno < 1 or pno > doc.page_count:
-            continue
-        page = doc[pno - 1]
-        try:
-            found = page.find_tables().tables
-        except Exception:
-            found = []
-        if not found:
-            continue
-
-        blocks = [b for b in page.get_text("dict").get("blocks", []) if b.get("type") == 0]
-        for t in found:
-            bbox = getattr(t, "bbox", None)
-            if not bbox or len(bbox) < 4:
-                continue
-            table_count += 1
-            tx0, ty0, tx1, ty1 = bbox
-            tw = max(1.0, tx1 - tx0)
-            tc = (tx0 + tx1) / 2.0
-
-            for block in blocks:
-                bb = block.get("bbox", [0, 0, 0, 0])
-                bx0, by0, bx1, by1 = bb
-                # Keep blocks whose center falls inside the table region.
-                bc_x = (bx0 + bx1) / 2.0
-                bc_y = (by0 + by1) / 2.0
-                if not (tx0 <= bc_x <= tx1 and ty0 <= bc_y <= ty1):
-                    continue
-
-                bw = bx1 - bx0
-                txt = "".join(
-                    s.get("text", "")
-                    for line in block.get("lines", [])
-                    for s in line.get("spans", [])
-                ).strip()
-                if len(txt) < 2:
-                    continue
-
-                mx = max((s.get("size", 0.0)
-                          for line in block.get("lines", [])
-                          for s in line.get("spans", [])), default=0.0)
-                if mx > 0:
-                    font_sizes.append(round(mx, 2))
-
-                left_gap = max(0.0, bx0 - tx0)
-                right_gap = max(0.0, tx1 - bx1)
-                if abs(bc_x - tc) <= tw * 0.08 and bw < tw * 0.70:
-                    align["Center"] += 1
-                elif right_gap < left_gap * 0.45 and bw < tw * 0.60:
-                    align["Right"] += 1
-                else:
-                    align["Left"] += 1
-
-    return {
-        "table_count": table_count,
-        "font_median": round(float(statistics.median(font_sizes)), 2) if font_sizes else 0.0,
-        "align": align,
-        "sample_count": len(font_sizes),
-    }
-
-
-def _compare_style_sections(prod_path: str, stage_path: str, prod_toc: list,
-                            stage_toc: list, toc_results: list) -> list:
-    """Compare per-section style structure as pagination-invariant proportions.
-
-    Raw line counts can't be compared because STAGE re-paginates (PROD p3 →
-    STAGE p6-p7), so a section's lines spread across a different number of
-    pages. Instead we compare each bucket's *share* of the section's classified
-    lines, which is independent of how the content is paginated. Differences are
-    reported in plain English with the STAGE page(s) to fix.
-    """
-    prod_doc = fitz.open(prod_path)
-    stage_doc = fitz.open(stage_path)
-    prod_body = _doc_body_size(prod_doc)
-    stage_body = _doc_body_size(stage_doc)
-    prod_ranges = _toc_ranges_by_key(prod_toc, prod_doc.page_count)
-    stage_ranges = _toc_ranges_by_key(stage_toc, stage_doc.page_count)
-
-    # Share-difference tolerances (percentage points) and minimum line counts
-    # below which a section is too small to judge structurally.
-    SHARE_TOL = {"heading": 0.12, "subheading": 0.15, "body": 0.15}
-    NOTICE_TOL = 1          # allow ±1 notice before flagging
-    MIN_LINES = 6           # sections with fewer classified lines: count-only check
-    RANGE_RATIO_MAX = 2.2   # STAGE/PROD line-count ratio above which ranges are
-    RANGE_RATIO_MIN = 0.45  # too mismatched to compare (topic re-paginates)
-
-    def _breakdown(prof, pg_label, who):
-        return (
-            f"{who} {pg_label}<br/>"
-            f"Headings: {prof['heading']} &nbsp; Sub-headings: {prof['subheading']} &nbsp; "
-            f"Body text: {prof['body']} &nbsp; Notices: {prof['notice']}<br/>"
-            f"<font color='#777777'>({prof['total']} styled lines)</font>"
-        )
-
-    rows = []
-    for r in toc_results:
-        if r.get("toc_status") == "Extra in Stage":
-            continue
-
-        title = r["title"]
-        key = _norm_key(title)
-        p_range = prod_ranges.get(key)
-        s_range = stage_ranges.get(key)
-
-        if not p_range:
-            rows.append({
-                "title": title,
-                "expected": "PROD location for this topic could not be determined.",
-                "actual": "—",
-                "difference": "Skipped — no PROD page range to compare against.",
-                "diff_lines": ["Skipped — this topic has no PROD page range, so its style cannot be checked."],
-                "status": "Skipped",
-            })
-            continue
-
-        p_start, p_end, _ = p_range
-        p_prof = _extract_style_profile(prod_doc, p_start, p_end, prod_body)
-        p_tab_prof = _extract_table_style_profile(prod_doc, p_start, p_end)
-
-        if not s_range:
-            rows.append({
-                "title": title,
-                "expected": _breakdown(p_prof, _pg_label(p_start, p_end), "PROD"),
-                "actual": "This topic is missing from STAGE.",
-                "difference": "Whole section missing from STAGE — nothing to style.",
-                "diff_lines": [
-                    f"The entire '{title}' section is absent from STAGE, so none of its "
-                    f"{p_prof['total']} styled lines (incl. {p_prof['heading']} headings) exist to format."
-                ],
-                "status": "Fix",
-            })
-            continue
-
-        s_start, s_end, _ = s_range
-        s_prof = _extract_style_profile(stage_doc, s_start, s_end, stage_body)
-        s_tab_prof = _extract_table_style_profile(stage_doc, s_start, s_end)
-
-        p_pg = _pg_label(p_start, p_end)
-        s_pg = _pg_label(s_start, s_end)
-        diff_lines = []
-
-        p_total = max(p_prof["total"], 1)
-        s_total = max(s_prof["total"], 1)
-
-        # Range-mismatch guard: when STAGE's TOC range spans far more (or fewer)
-        # lines than PROD's, the topic's page mapping is unreliable — STAGE
-        # paginates it very differently, or several TOC entries share one page.
-        # Comparing style structure across such mismatched ranges produces noise,
-        # so report it as not-comparable instead of inventing differences.
-        big = max(p_prof["total"], s_prof["total"]) >= MIN_LINES
-        size_ratio = s_total / p_total
-        if big and (size_ratio > RANGE_RATIO_MAX or size_ratio < RANGE_RATIO_MIN):
-            rows.append({
-                "title": title,
-                "expected": _breakdown(p_prof, p_pg, "PROD"),
-                "actual": _breakdown(s_prof, s_pg, "STAGE"),
-                "difference": "Page ranges differ too much to compare reliably.",
-                "diff_lines": [
-                    f"Not compared: STAGE maps this topic to {s_pg} ({s_prof['total']} styled lines) "
-                    f"but PROD maps it to {p_pg} ({p_prof['total']} lines). The ranges are too "
-                    f"different (the topic re-paginates or shares a page in STAGE), so a reliable "
-                    f"style comparison isn't possible — verify {s_pg} by eye."
-                ],
-                "status": "Skipped",
-                "stage_pages": s_pg,
-            })
-            continue
-
-        big_enough = p_prof["total"] >= MIN_LINES and s_prof["total"] >= MIN_LINES
-
-        for k in ("heading", "subheading", "body"):
-            p_n, s_n = p_prof[k], s_prof[k]
-            label = _STYLE_LABELS[k]
-            if big_enough:
-                p_sh, s_sh = p_n / p_total, s_n / s_total
-                if abs(p_sh - s_sh) <= SHARE_TOL[k]:
-                    continue
-                direction = "more" if s_sh > p_sh else "fewer"
-                line = (
-                    f"{label}: STAGE has proportionally {direction} than PROD "
-                    f"(PROD {p_n} of {p_prof['total']} lines = {p_sh:.0%}, "
-                    f"STAGE {s_n} of {s_prof['total']} = {s_sh:.0%}). "
-                )
-            else:
-                if abs(p_n - s_n) <= 1:
-                    continue
-                line = f"{label}: PROD has {p_n}, STAGE has {s_n}. "
-
-            # Targeted fix hint per bucket.
-            if k == "body" and s_prof[k] < p_prof[k]:
-                line += (f"Body copy on STAGE {s_pg} looks re-styled as headings — "
-                         f"restore normal paragraph formatting.")
-            elif k == "heading":
-                line += (f"Check section/title formatting on STAGE {s_pg}.")
-            else:
-                line += (f"Review heading vs body sizing on STAGE {s_pg}.")
-            diff_lines.append(line)
-
-        # Notices: only a *shortfall* (STAGE has fewer callouts than PROD) is a
-        # real defect — a PROD callout that lost its NOTE/TIP styling. Extra
-        # STAGE matches are almost always menu words like "INFO"/"Information",
-        # so they're not flagged.
-        p_n, s_n = p_prof["notice"], s_prof["notice"]
-        if p_n - s_n > NOTICE_TOL:
-            diff_lines.append(
-                f"Notices (NOTE/TIP/IMPORTANT): PROD has {p_n}, STAGE has {s_n} — "
-                f"{p_n - s_n} callout(s) may be missing or no longer styled as a notice on STAGE {s_pg}."
-            )
-
-        # Table text style checks: font size and alignment inside tables.
-        if p_tab_prof["table_count"] or s_tab_prof["table_count"]:
-            if p_tab_prof["table_count"] != s_tab_prof["table_count"]:
-                diff_lines.append(
-                    f"Table count for style check: PROD has {p_tab_prof['table_count']}, STAGE has {s_tab_prof['table_count']} on {s_pg}."
-                )
-
-            if p_tab_prof["font_median"] > 0 and s_tab_prof["font_median"] > 0:
-                font_delta = round(s_tab_prof["font_median"] - p_tab_prof["font_median"], 2)
-                if abs(font_delta) > 0.8:
-                    diff_lines.append(
-                        f"Table font size: expected about {p_tab_prof['font_median']}pt in PROD, actual about {s_tab_prof['font_median']}pt in STAGE on {s_pg} (delta {font_delta:+}pt)."
-                    )
-
-            p_align_total = max(1, sum(p_tab_prof["align"].values()))
-            s_align_total = max(1, sum(s_tab_prof["align"].values()))
-            for akey, label in (("Left", "left-aligned"), ("Center", "center-aligned"), ("Right", "right-aligned")):
-                p_share = p_tab_prof["align"][akey] / p_align_total
-                s_share = s_tab_prof["align"][akey] / s_align_total
-                if abs(p_share - s_share) > 0.18:
-                    diff_lines.append(
-                        f"Table text alignment: expected more {label} table text like PROD ({p_share:.0%}), but STAGE shows {s_share:.0%} on {s_pg}."
-                    )
-
-        status = "Pass" if not diff_lines else "Fix"
-        if not diff_lines:
-            diff_lines = ["Style structure matches PROD."]
-
-        rows.append({
-            "title": title,
-            "expected": _breakdown(p_prof, p_pg, "PROD") +
-                        f"<br/>Table text: {p_tab_prof['table_count']} table(s), median font {p_tab_prof['font_median']}pt, "
-                        f"align L/C/R = {p_tab_prof['align']['Left']}/{p_tab_prof['align']['Center']}/{p_tab_prof['align']['Right']}",
-            "actual": _breakdown(s_prof, s_pg, "STAGE") +
-                      f"<br/>Table text: {s_tab_prof['table_count']} table(s), median font {s_tab_prof['font_median']}pt, "
-                      f"align L/C/R = {s_tab_prof['align']['Left']}/{s_tab_prof['align']['Center']}/{s_tab_prof['align']['Right']}",
-            "difference": "Matches PROD" if status == "Pass" else diff_lines[0],
-            "diff_lines": diff_lines,
-            "status": status,
-            "stage_pages": s_pg,
-        })
-
-    prod_doc.close()
-    stage_doc.close()
-    return rows
-
-
-def _image_context(doc, pno: int, xref: int):
-    """Return (xobj_name, page_context) for an image on a given PROD page.
-
-    xobj_name    — PDF XObject name or alt-text if present.
-    page_context — nearest text block by bbox; falls back to the page's
-                   leading heading + first descriptive sentences when no
-                   bbox is available (images embedded without position metadata).
-    """
-    try:
-        page = doc[pno - 1]
-    except Exception:
-        return "", ""
-
-    img_name = ""
-    img_bbox = None
-    for info in page.get_image_info():
-        if info.get("xref") == xref:
-            img_name = info.get("alt", "") or info.get("name", "")
-            img_bbox = info.get("bbox")
-            break
-
-    # Primary: find the nearest text block by spatial proximity
-    if img_bbox and (img_bbox[2] - img_bbox[0]) > 0:
-        iy_bottom = img_bbox[3]
-        iy_top    = img_bbox[1]
-        candidates = []
-        for b in page.get_text("blocks"):
-            if len(b) < 5 or b[6] != 0:
-                continue
-            txt = b[4].strip()
-            if not txt or len(txt) > 300:
-                continue
-            dist = min(abs(b[1] - iy_bottom), abs(b[3] - iy_top))
-            candidates.append((dist, txt))
-        if candidates:
-            return img_name, candidates[0][1][:200]
-
-    # Fallback: build context from the page's own text lines.
-    # Skip bare page-number tokens; keep the first heading + sentences.
-    lines = [
-        ln.strip()
-        for ln in page.get_text().splitlines()
-        if ln.strip() and not ln.strip().isdigit()
-    ]
-    context = " — ".join(lines[:4])[:250] if lines else ""
-    return img_name, context
 
 
 def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
@@ -1568,14 +1076,19 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
     for wi, cw in enumerate(cwords):
         char_word.extend([wi] * len(cw))
 
-    L = CHAR_SHINGLE
+    # Dynamically determine if CJK characters are dominant
+    is_cjk = False
+    if _CJK_RE.search(s) or (stage_full_lower and _CJK_RE.search(stage_full_lower)):
+        is_cjk = True
+    L = 8 if is_cjk else CHAR_SHINGLE
+
     if len(s) < L:
         if s and s in stage_ns:
             return 100.0, []
-        phrase = re.sub(r"\s+", " ", " ".join(words)).lower()
+        phrase = _s_norm(re.sub(r"\s+", " ", _join_tokens(words))).lower()
         if phrase in stage_full_lower:
             return 100.0, []
-        return 0.0, ([" ".join(words)] if len(words) >= MIN_FRAG_WORDS else [])
+        return 0.0, ([_join_tokens(words)] if len(words) >= MIN_FRAG_WORDS else [])
 
     covered_char = [False] * len(s)
     for p in range(len(s) - L + 1):
@@ -1601,11 +1114,11 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
                 i += 1
             frag = words[st:i]
             if len(frag) >= MIN_FRAG_WORDS:
-                phrase = re.sub(r"\s+", " ", " ".join(frag)).lower()
+                phrase = _s_norm(re.sub(r"\s+", " ", _join_tokens(frag))).lower()
                 if phrase in stage_full_lower:
                     pass  # covered
                 else:
-                    frag_text = " ".join(frag)
+                    frag_text = _join_tokens(frag)
                     reported  = True
 
                     # 1) Strip a single leading numbered-step marker ("4. ") and
@@ -1651,11 +1164,54 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
     return coverage, frags
 
 
+# ── Trademark / symbol integrity (™ ® ©) ─────────────────────────────────────
+# Conversion pipelines silently drop ™/®/© and the branded terms they sit on
+# ("USB-C™", "Eye-Care®"). PROD is the baseline, so STAGE should carry every
+# trademark PROD has. This is a doc-wide character/term check (independent of the
+# shingle matcher, which folds these symbols away).
+_TM_SYMBOLS = "™®©"
+_TM_TERM_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9\-/.]{0,24}?)\s*([™®©])")
+
+
+def _trademark_findings(prod_path, stage_path):
+    """Return (symbol_counts, dropped_terms).
+
+    symbol_counts: [(symbol, n_prod, n_stage), …] for ™ ® © where PROD has more.
+    dropped_terms: [(term_with_symbol, n_prod, base_present_in_stage), …] for
+                   branded terms whose exact symbol-bearing form is absent in STAGE.
+    """
+    def _full_text(path):
+        d = fitz.open(path)
+        try:
+            return "".join(pg.get_text() for pg in d)
+        finally:
+            d.close()
+
+    pt, st = _full_text(prod_path), _full_text(stage_path)
+    counts = [(s, pt.count(s), st.count(s)) for s in _TM_SYMBOLS
+              if pt.count(s) > st.count(s)]
+
+    prod_terms = collections.Counter(
+        f"{m.group(1)}{m.group(2)}" for m in _TM_TERM_RE.finditer(pt))
+    dropped = []
+    for term, n in sorted(prod_terms.items(), key=lambda kv: -kv[1]):
+        if term in st:
+            continue                       # STAGE keeps the symbol-bearing form
+        base = term[:-1].strip()           # term without its trailing symbol
+        dropped.append((term, n, bool(base) and base in st))
+    return counts, dropped
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Report helpers
 # ────────────────────────────────────────────────────────────────────────────
 def _esc(text):
-    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    esc = (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Render any CJK-bearing text with the Unicode font so it doesn't fall back
+    # to Helvetica (which lacks CJK glyphs and prints dots). English is untouched.
+    if _CJK_FONT_NAME and _CJK_RE.search(esc):
+        esc = f'<font name="{_CJK_FONT_NAME}">{esc}</font>'
+    return esc
 
 
 def _trunc(text, n=180):
@@ -1688,8 +1244,11 @@ def _highlight_notice_labels(text: str) -> str:
 
 
 def generate_report(prod_path, stage_path, toc_results, content_results,
-                    image_results, icon_doc_summary, layout_results,
-                    visual_results, style_results, report_path):
+                    image_results, icon_doc_summary, report_path,
+                    tm_counts=None, tm_dropped=None,
+                    prod_encoding_issue=False, stage_encoding_issue=False):
+    tm_counts = tm_counts or []
+    tm_dropped = tm_dropped or []
     doc = SimpleDocTemplate(
         report_path, pagesize=landscape(letter),
         leftMargin=0.4 * inch, rightMargin=0.4 * inch,
@@ -1721,7 +1280,39 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
     story.append(Paragraph("PDF Content Validation Report", title_s))
     story.append(Paragraph(f"Production: {os.path.basename(prod_path)}", sub_s))
     story.append(Paragraph(f"Staging:    {os.path.basename(stage_path)}", sub_s))
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 8))
+
+    if prod_encoding_issue or stage_encoding_issue:
+        note_style = ParagraphStyle(
+            "EncodingNote",
+            parent=styles["Normal"],
+            fontSize=9,
+            leading=13,
+            textColor=colors.HexColor("#1e3a5f"),
+        )
+        parts = []
+        if prod_encoding_issue:
+            parts.append("Production PDF")
+        if stage_encoding_issue:
+            parts.append("Staging PDF")
+        pdfs = " and ".join(parts)
+        msg = (
+            f"<b>Note:</b> {pdfs} contain custom-encoded special characters "
+            "(e.g. trademark ™, copyright ©, bullet symbols). "
+            "These were extracted with an OCR-assisted pass for improved accuracy. "
+            "Content comparison results are not affected."
+        )
+        note_table = Table([[Paragraph(msg, note_style)]], colWidths=[700])
+        note_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#e8f0fe")),
+            ("LINEBELOW",  (0,0), (-1,-1), 1.0, colors.HexColor("#90a4ae")),
+            ("TOPPADDING", (0,0), (-1,-1), 6),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+            ("LEFTPADDING", (0,0), (-1,-1), 12),
+            ("RIGHTPADDING", (0,0), (-1,-1), 12),
+        ]))
+        story.append(note_table)
+        story.append(Spacer(1, 10))
 
     # ═══════════════════════════════════════════
     # PART 1 — TOC Comparison
@@ -1860,9 +1451,9 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
     story.append(Paragraph("Part 3 — Image Differences (matching topics only)", head_s))
     story.append(Paragraph(
         f"Content images (max on-page dim > {_ICON_MAX_ONPAGE} pt): diagrams, photos — "
-        "compared per section, consume-based (±15% tolerance).  "
+        "compared per section, consume-based (±15% width tolerance).  "
         f"Icons (max on-page dim ≤ {_ICON_MAX_ONPAGE} pt): small symbols — "
-        "compared document-wide (±25% tolerance). Dimensions are ON-PAGE pt sizes (what reader sees).",
+        "compared document-wide (±25% width tolerance). Dimensions are ON-PAGE width pt sizes (what reader sees).",
         ParagraphStyle("Note3", parent=styles["Normal"], fontSize=8,
                        textColor=colors.grey, spaceAfter=4),
     ))
@@ -1881,7 +1472,12 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
         [Paragraph("All sections combined", cell_s),
          Paragraph(icon_doc_summary["status"],           icon_status_s),
          Paragraph(
-             f"Total icons: {icon_doc_summary['prod_total']} | Found: {icon_doc_summary['found_total']} | Missing: {icon_doc_summary['miss_total']}",
+             (f"Total icons: {icon_doc_summary['prod_total']} | "
+              f"Found: {icon_doc_summary['found_total']} | "
+              f"Missing: {icon_doc_summary['miss_total']}"
+              + (f" | N/A: {icon_doc_summary['na_total']} "
+                 "(STAGE renders icons as vector graphics — width match not applicable)"
+                 if icon_doc_summary.get("na_total") else "")),
              cell_s if icon_doc_summary["miss_total"] == 0 else miss_s
          )],
     ]
@@ -1896,6 +1492,40 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
         ("BOTTOMPADDING", (0,0), (-1,-1), 5),
     ]))
     story.append(icon_sum_t)
+    story.append(Spacer(1, 12))
+
+    # ── Trademark / symbol integrity table ──
+    tm_rows = [[Paragraph("<b>Trademark / symbol (™ ® ©)</b>", hdr_s),
+                Paragraph("<b>PROD</b>", hdr_s),
+                Paragraph("<b>STAGE</b>", hdr_s),
+                Paragraph("<b>Note</b>", hdr_s)]]
+    for sym, np_, ns in tm_counts:
+        tm_rows.append([Paragraph(f"Symbol {sym}", cell_s),
+                        Paragraph(str(np_), cell_s),
+                        Paragraph(str(ns), miss_s),
+                        Paragraph(f"STAGE missing {np_ - ns}", miss_s)])
+    for term, n, base in tm_dropped[:25]:
+        tm_rows.append([Paragraph(_esc(term), cell_s),
+                        Paragraph(str(n), cell_s),
+                        Paragraph("0", miss_s),
+                        Paragraph("base text present — symbol dropped"
+                                  if base else "term absent in STAGE", miss_s)])
+    if len(tm_rows) > 1:
+        tm_t = Table(tm_rows, colWidths=[230, 60, 60, 200])
+        tm_t.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#8e24aa")),
+            ("GRID",          (0,0), (-1,-1), 0.5, colors.grey),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING",    (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(Paragraph("<b>Trademark &amp; symbol integrity</b> "
+                               "(PROD baseline — STAGE should carry every ™/®/©)", topic_s))
+        story.append(Spacer(1, 4))
+        story.append(tm_t)
+    else:
+        story.append(Paragraph("<b>Trademark &amp; symbol integrity:</b> "
+                               "STAGE preserves all ™/®/© symbols from PROD.", cell_s))
     story.append(Spacer(1, 12))
 
     n_ipass = sum(1 for r in image_results if r["status"] == "Pass")
@@ -1932,41 +1562,35 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
         ss = pass_s if r["status"] == "Pass" else fail_s
         missing_rows = [dr for dr in r.get("dim_rows", []) if dr.get("status") == "Missing"]
 
-        def _missing_preview(rows, limit=4):
+        def _preview(rows, limit=4):
             if not rows:
                 return ""
-            bits = [f"p{dr['prod_page']} {dr['type']} {dr['prod_w']}x{dr['prod_h']}"
+            bits = [f"p{dr['prod_page']} {dr['type']} {dr['prod_w']} pt"
                     for dr in rows[:limit]]
             extra = len(rows) - limit
             if extra > 0:
                 bits.append(f"+{extra} more")
             return "; ".join(bits)
-        
-        # Generate clear comment for image status with visual difference indicators
+
+        # "Info" figures = present but resized/moved; "Info" icons = size mismatch.
+        info_fig  = sum(1 for dr in r["dim_rows"]
+                        if dr["type"] == "Content" and dr["status"] == "Info")
+        info_icon = sum(1 for dr in r["dim_rows"]
+                        if dr["type"] == "Icon" and dr["status"] == "Info")
+
         if r["status"] == "Pass":
-            if missing_rows:
-                comment = (
-                    "Info: icon-size mismatches detected; "
-                    f"exact refs -> {_missing_preview(missing_rows)}"
-                )
-            else:
-                comment = "✓ All images matching"
+            notes = []
+            if info_fig:
+                notes.append(f"{info_fig} figure(s) resized/moved (present)")
+            if info_icon:
+                notes.append(f"{info_icon} icon size diff(s) (info)")
+            comment = "✓ All figures present" + (f" — {'; '.join(notes)}" if notes else "")
         else:
-            comments = []
-            if r["miss_content"] > 0:
-                if r["miss_content"] == 1:
-                    comments.append(f"Content image visually different or missing")
-                else:
-                    comments.append(f"{r['miss_content']} content images visually different or missing")
-            if r["miss_icons"] > 0:
-                if r["miss_icons"] == 1:
-                    comments.append(f"Icon visually different or missing")
-                else:
-                    comments.append(f"{r['miss_icons']} icons visually different or missing")
-            if missing_rows:
-                comments.append(f"Exact refs -> {_missing_preview(missing_rows)}")
-            comment = " | ".join(comments) if comments else "✗ Images not matching"
-        
+            comment = (
+                f"{r['miss_content']} of {r['prod_content']} figure(s) missing — "
+                f"STAGE has fewer figures than PROD. Refs -> {_preview(missing_rows)}"
+            )
+
         img_rows.append([
             Paragraph(str(row_num),              cell_s),
             Paragraph(_esc(r["title"]),          topic_s),
@@ -1991,42 +1615,27 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                           ParagraphStyle("VizHeader", parent=styles["Heading2"], fontSize=10, textColor=colors.HexColor("#455a64"))))
     
     failed_sections = [r for r in image_results if r["status"] == "Fail"]
-    info_icon_sections = [
-        r for r in image_results
-        if r["status"] == "Pass" and any(dr.get("status") == "Missing" for dr in r.get("dim_rows", []))
-    ]
-    if failed_sections or info_icon_sections:
+    if failed_sections:
         viz_items = []
         for r in failed_sections:
-            if r["miss_content"] > 0:
-                if r["miss_content"] == 1:
-                    viz_items.append(f"• <b>{_esc(r['title'])}</b>: Content image(s) not matching - visual changes detected (added labels, layout changes, or missing elements)")
-                else:
-                    viz_items.append(f"• <b>{_esc(r['title'])}</b>: {r['miss_content']} content image(s) visually different - check for added labels or layout modifications")
-            if r["miss_icons"] > 0:
-                if r["miss_icons"] == 1:
-                    viz_items.append(f"• <b>{_esc(r['title'])}</b>: Icon element changed or missing visually in STAGE version")
-                else:
-                    viz_items.append(f"• <b>{_esc(r['title'])}</b>: {r['miss_icons']} icon(s) changed or missing visually")
-
-        for r in info_icon_sections:
-            missing_rows = [dr for dr in r.get("dim_rows", []) if dr.get("status") == "Missing"]
-            refs = [f"p{dr['prod_page']} {dr['type']} {dr['prod_w']}x{dr['prod_h']}"
-                    for dr in missing_rows[:4]]
-            more = len(missing_rows) - 4
+            miss = [dr for dr in r["dim_rows"] if dr["status"] == "Missing"]
+            refs = "; ".join(f"p{dr['prod_page']} {dr['prod_w']} pt"
+                             for dr in miss[:4])
+            more = len(miss) - 4
             suffix = f"; +{more} more" if more > 0 else ""
             viz_items.append(
-                f"• <b>{_esc(r['title'])}</b>: Info-only icon-size mismatch refs -> {'; '.join(refs)}{suffix}"
+                f"• <b>{_esc(r['title'])}</b>: {r['miss_content']} of {r['prod_content']} "
+                f"figure(s) have no counterpart in STAGE (STAGE has fewer figures than "
+                f"PROD overall) — refs -> {refs}{suffix}"
             )
-        
-        if viz_items:
-            story.append(Paragraph(
-                "<br/>".join(viz_items),
-                ParagraphStyle("VizList", parent=styles["Normal"], fontSize=8.5, textColor=colors.HexColor("#5d4037"), leading=12)
-            ))
+        story.append(Paragraph(
+            "<br/>".join(viz_items),
+            ParagraphStyle("VizList", parent=styles["Normal"], fontSize=8.5, textColor=colors.HexColor("#5d4037"), leading=12)
+        ))
     else:
         story.append(Paragraph(
-            "✓ All images across topics match visually between PROD and STAGE.",
+            "✓ Every PROD figure has a counterpart in STAGE. Size/section differences "
+            "(amber Info rows in Part 3b) are expected from STAGE re-rendering and are not defects.",
             ParagraphStyle("VizPass", parent=styles["Normal"], fontSize=8.5, textColor=colors.HexColor("#2e7d32"), leading=12)
         ))
     
@@ -2036,20 +1645,21 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
     story.append(PageBreak())
     story.append(Paragraph("Part 3b — Image Dimension Detail (PROD vs Stage)", head_s))
     story.append(Paragraph(
-        "Each row is one PROD image. "
-        "All dimensions are on-page pt sizes (not encoded pixel counts). "
-        "Stage Match shows the closest matching Stage image size (±15% content / ±25% icon). "
-        "Missing rows (red) apply to content images only. "
-        "Icon-only size mismatches are shown as Info (amber), not Fail. "
-        f"Content: max on-page dim > {_ICON_MAX_ONPAGE} pt (per section, consume-based). "
-        f"Icon: max on-page dim ≤ {_ICON_MAX_ONPAGE} pt (doc-wide match).",
+        "Each row is one PROD image. All dimensions are on-page width pt sizes. "
+        "Stage Match Width shows the closest STAGE image width. "
+        "<b>Present</b> (green): a matching STAGE image width exists. "
+        "<b>Info</b> (amber): the image exists in STAGE but width differs or moved to "
+        "another section (figures) or a width mismatch (icons) — not a defect. "
+        "<b>Missing</b> (red): STAGE genuinely has fewer figures than PROD. "
+        f"Figures: max on-page dim > {_ICON_MAX_ONPAGE} pt, matched by count "
+        f"document-wide. Icons: ≤ {_ICON_MAX_ONPAGE} pt, matched by width doc-wide.",
         ParagraphStyle("Note3b", parent=styles["Normal"], fontSize=8,
                        textColor=colors.grey, spaceAfter=8),
     ))
 
     det_hdr = [Paragraph(f"<b>{h}</b>", hdr_s) for h in [
         "#", "Section (PROD heading)", "PROD\nPage",
-        "Type", "PROD W×H (pt)", "Stage Match (pt)", "Status",
+        "Type", "PROD Width (pt)", "Stage Match Width (pt)", "Status",
     ]]
     det_rows = [det_hdr]
     row_num  = 0
@@ -2066,37 +1676,32 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             row_num += 1
             r_idx = len(det_rows)   # 0-based index into det_rows (header at 0)
 
-            is_missing = dr["status"] == "Missing"
-            is_icon_info = (is_missing and dr["type"] == "Icon" and not _FAIL_ON_ICON_MISS)
-            type_style = icon_dim_s if dr["type"] == "Icon" else (miss_s if is_missing else cell_s)
-            if is_icon_info:
-                stat_style = cell_s
-                status_text = "Info"
+            status_text = dr["status"]            # Present | Info | Missing
+            is_missing  = status_text == "Missing"
+            is_info     = status_text == "Info"
+            type_style  = icon_dim_s if dr["type"] == "Icon" else (miss_s if is_missing else cell_s)
+            if is_info:
+                stat_style, row_bg = cell_s, info_bg
             elif is_missing:
-                stat_style = miss_s
-                status_text = "Missing"
+                stat_style, row_bg = miss_s, miss_bg
             else:
-                stat_style = pass_s
-                status_text = "Present"
+                stat_style, row_bg = pass_s, pres_bg
 
             if dr["match_w"] is not None:
-                match_cell = Paragraph(f"{dr['match_w']}×{dr['match_h']}", cell_s)
+                match_cell = Paragraph(f"{dr['match_w']} pt", cell_s)
             else:
-                match_cell = Paragraph("—", cell_s if is_icon_info else miss_s)
+                match_cell = Paragraph("—", miss_s)
 
             det_rows.append([
                 Paragraph(str(row_num),                    cell_s),
                 Paragraph(_esc(dr["section"]),             topic_s),
                 Paragraph(str(dr["prod_page"]),            cell_s),
                 Paragraph(dr["type"],                      type_style),
-                Paragraph(f"{dr['prod_w']}×{dr['prod_h']}", cell_s),
+                Paragraph(f"{dr['prod_w']} pt",            cell_s),
                 match_cell,
                 Paragraph(status_text,                      stat_style),
             ])
-            if is_icon_info:
-                row_bg_styles.append((r_idx, info_bg))
-            else:
-                row_bg_styles.append((r_idx, miss_bg if is_missing else pres_bg))
+            row_bg_styles.append((r_idx, row_bg))
 
     det_t = Table(det_rows, colWidths=[22, 210, 38, 50, 70, 90, 60], repeatRows=1)
     ts_cmds = [
@@ -2111,296 +1716,73 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
     det_t.setStyle(TableStyle(ts_cmds))
     story.append(det_t)
 
-    # Parts 4 (Layout), 5 (Visual) and 6/6b (Style) are hidden from the report.
-    # Flip this flag to True to restore them; the building code below is kept intact.
-    _SHOW_PARTS_4_5_6 = False
-    if not _SHOW_PARTS_4_5_6:
-        doc.build(story)
-        print(f"Report saved: {report_path}")
-        return
-
     # ═══════════════════════════════════════════
-    # PART 4 — Layout Validation
+    # PART 4 — Language & Translation Integrity
     # ═══════════════════════════════════════════
-    story.append(PageBreak())
-    story.append(Paragraph("Part 4 — Layout Validation (Image Rows · Tables · Text Alignment)", head_s))
-    story.append(Paragraph(
-        "Expectation = what exists in PROD. Actual = what was detected in STAGE. "
-        "For each topic, compare image-row structure, table count/size, and text alignment. "
-        "L = left, C = centre, R = right. "
-        "If Difference says 'Matched', layout is OK. Otherwise it explains exactly what changed.",
-        ParagraphStyle("Note4", parent=styles["Normal"], fontSize=8,
-                       textColor=colors.grey, spaceAfter=6),
-    ))
+    # Open stage document to inspect language
+    try:
+        temp_sdoc = fitz.open(stage_path)
+        lang_stage = _get_pdf_language(temp_sdoc)
+        temp_sdoc.close()
+    except Exception:
+        lang_stage = "eng"
 
-    n_lpass = sum(1 for r in layout_results if r["status"] == "Pass")
-    n_lfail = sum(1 for r in layout_results if r["status"] == "Fail")
-    sum4 = [
-        [Paragraph("<b>Compared</b>", hdr_s),
-         Paragraph("<b>Pass</b>",     hdr_s),
-         Paragraph("<b>Fail</b>",     hdr_s)],
-        [Paragraph(str(len(layout_results)), topic_s),
-         Paragraph(str(n_lpass), pass_s),
-         Paragraph(str(n_lfail), fail_s)],
-    ]
-    st4 = Table(sum4, colWidths=[120, 80, 80])
-    st4.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#37474f")),
-        ("BACKGROUND",    (0,1), (-1,1), colors.HexColor("#eceff1")),
-        ("GRID",          (0,0), (-1,-1), 0.5, colors.grey),
-        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING",    (0,0), (-1,-1), 6),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-    ]))
-    story.append(st4)
-    story.append(Spacer(1, 10))
-
-    # Part 4 summary table — explicit Expected(PROD) vs Actual(STAGE)
-    lay_hdr = [Paragraph(f"<b>{h}</b>", hdr_s) for h in [
-        "#", "Topic", "Expected (PROD)", "Actual (STAGE)", "Difference", "Status",
-    ]]
-    lay_rows = [lay_hdr]
-    for row_num, r in enumerate(layout_results, 1):
-        ss   = pass_s if r["status"] == "Pass" else fail_s
-        p_al = r["p_al"]
-        s_al = r["s_al"]
-        p_c, p_r_ = p_al.get("Center", 0), p_al.get("Right", 0)
-        s_c, s_r_ = s_al.get("Center", 0), s_al.get("Right", 0)
-
-        expected_text = (
-            f"Img rows: {_esc(_trunc(r['prod_row_desc'], 90))}<br/>"
-            f"Tables: {_esc(_trunc(r['prod_tab_desc'], 70))}<br/>"
-            f"Align: C={p_c}, R={p_r_}"
-        )
-        actual_text = (
-            f"Img rows: {_esc(_trunc(r['stg_row_desc'], 90))}<br/>"
-            f"Tables: {_esc(_trunc(r['stg_tab_desc'], 70))}<br/>"
-            f"Align: C={s_c}, R={s_r_}"
-        )
-
-        if r["status"] == "Pass":
-            diff_text = "Matched"
-            diff_style = pass_s
-        else:
-            top_issue = r["issues"][0] if r.get("issues") else "Layout differs"
-            more = len(r.get("issues", [])) - 1
-            diff_text = _esc(_trunc(top_issue, 90))
-            if more > 0:
-                diff_text += f" (+{more} more)"
-            diff_style = miss_s
-
-        lay_rows.append([
-            Paragraph(str(row_num),                            cell_s),
-            Paragraph(_esc(r["title"]),                        topic_s),
-            Paragraph(expected_text,                            cell_s),
-            Paragraph(actual_text,                              cell_s),
-            Paragraph(diff_text,                                diff_style),
-            Paragraph(r["status"], ss),
-        ])
-
-    lay_t = Table(lay_rows,
-                  colWidths=[22, 130, 195, 195, 155, 55],
-                  repeatRows=1)
-    lay_t.setStyle(TableStyle([
-        ("BACKGROUND",     (0,0), (-1,0), colors.HexColor("#37474f")),
-        ("GRID",           (0,0), (-1,-1), 0.5, colors.grey),
-        ("VALIGN",         (0,0), (-1,-1), "TOP"),
-        ("TOPPADDING",     (0,0), (-1,-1), 3),
-        ("BOTTOMPADDING",  (0,0), (-1,-1), 3),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f5f5f5")]),
-    ]))
-    story.append(lay_t)
-
-    # ═══════════════════════════════════════════
-    # PART 5 — Visual Validation (Page Render Match)
-    # ═══════════════════════════════════════════
-    story.append(PageBreak())
-    story.append(Paragraph("Part 5 — Visual Validation (Expected PROD vs Actual STAGE)", head_s))
-    story.append(Paragraph(
-        "Each topic is visually compared by rendering PROD and STAGE pages and "
-        "matching pages by section order. Similarity score range: 0.00 to 1.00. "
-        f"Pass threshold: {VISUAL_PAGE_THRESHOLD:.2f}.",
-        ParagraphStyle("Note5", parent=styles["Normal"], fontSize=8,
-                       textColor=colors.grey, spaceAfter=6),
-    ))
-
-    n_vpass = sum(1 for r in visual_results if r["status"] == "Pass")
-    n_vfail = sum(1 for r in visual_results if r["status"] == "Fail")
-    sum5 = [
-        [Paragraph("<b>Compared</b>", hdr_s),
-         Paragraph("<b>Pass</b>",     hdr_s),
-         Paragraph("<b>Fail</b>",     hdr_s)],
-        [Paragraph(str(len(visual_results)), topic_s),
-         Paragraph(str(n_vpass), pass_s),
-         Paragraph(str(n_vfail), fail_s)],
-    ]
-    st5 = Table(sum5, colWidths=[120, 80, 80])
-    st5.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#37474f")),
-        ("BACKGROUND",    (0,1), (-1,1), colors.HexColor("#eceff1")),
-        ("GRID",          (0,0), (-1,-1), 0.5, colors.grey),
-        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING",    (0,0), (-1,-1), 6),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-    ]))
-    story.append(st5)
-    story.append(Spacer(1, 10))
-
-    v_hdr = [Paragraph(f"<b>{h}</b>", hdr_s) for h in [
-        "#", "Topic", "Expected (PROD pages)", "Actual (STAGE pages)",
-        "Compared", "Avg score", "Difference", "Status",
-    ]]
-    v_rows = [v_hdr]
-    for row_num, r in enumerate(visual_results, 1):
-        ss = pass_s if r["status"] == "Pass" else fail_s
-        diff_style = cell_s if r["status"] == "Pass" else miss_s
-        v_rows.append([
-            Paragraph(str(row_num), cell_s),
-            Paragraph(_esc(r["title"]), topic_s),
-            Paragraph(_esc(str(r["prod_range"])), cell_s),
-            Paragraph(_esc(str(r["stage_range"])), cell_s),
-            Paragraph(str(r["compared"]), cell_s),
-            Paragraph(f"{r['avg_score']:.3f}", cell_s),
-            Paragraph(_esc(_trunc(r["difference"], 120)), diff_style),
-            Paragraph(r["status"], ss),
-        ])
-
-    v_t = Table(v_rows,
-                colWidths=[22, 130, 105, 105, 52, 58, 250, 50],
-                repeatRows=1)
-    v_t.setStyle(TableStyle([
-        ("BACKGROUND",     (0,0), (-1,0), colors.HexColor("#37474f")),
-        ("GRID",           (0,0), (-1,-1), 0.5, colors.grey),
-        ("VALIGN",         (0,0), (-1,-1), "TOP"),
-        ("TOPPADDING",     (0,0), (-1,-1), 3),
-        ("BOTTOMPADDING",  (0,0), (-1,-1), 3),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f5f5f5")]),
-    ]))
-    story.append(v_t)
-
-    # ═══════════════════════════════════════════
-    # PART 6 — Style Validation (Headings · Sub-headings · Body · Notices)
-    # ═══════════════════════════════════════════
-    story.append(PageBreak())
-    story.append(Paragraph("Part 6 — Style Validation (Expected PROD vs Actual STAGE)", head_s))
-    story.append(Paragraph(
-        "For each topic this checks that STAGE keeps the same mix of section <b>headings</b>, "
-        "<b>sub-headings</b>, <b>body text</b> and <b>notice callouts</b> (NOTE / TIP / IMPORTANT) "
-        "as PROD. Because STAGE re-paginates content, lines are compared as a <i>proportion</i> of "
-        "each section, not as raw counts — so only genuine styling changes are flagged. "
-        "<b>Pass</b> = style matches PROD; <b>Fix</b> = a styling difference to correct on the listed "
-        "STAGE page; <b>Skipped</b> = section could not be located.",
-        ParagraphStyle("Note6", parent=styles["Normal"], fontSize=8,
-                       textColor=colors.grey, spaceAfter=6),
-    ))
-
-    n_spass = sum(1 for r in style_results if r["status"] == "Pass")
-    n_sfix  = sum(1 for r in style_results if r["status"] == "Fix")
-    n_sskip = sum(1 for r in style_results if r["status"] == "Skipped")
-    sum6 = [
-        [Paragraph("<b>Compared</b>", hdr_s),
-         Paragraph("<b>Pass</b>",     hdr_s),
-         Paragraph("<b>Needs fix</b>", hdr_s),
-         Paragraph("<b>Skipped</b>",  hdr_s)],
-        [Paragraph(str(len(style_results)), topic_s),
-         Paragraph(str(n_spass), pass_s),
-         Paragraph(str(n_sfix), fail_s),
-         Paragraph(str(n_sskip), cell_s)],
-    ]
-    st6 = Table(sum6, colWidths=[110, 80, 90, 80])
-    st6.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#37474f")),
-        ("BACKGROUND",    (0,1), (-1,1), colors.HexColor("#eceff1")),
-        ("GRID",          (0,0), (-1,-1), 0.5, colors.grey),
-        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING",    (0,0), (-1,-1), 6),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-    ]))
-    story.append(st6)
-    story.append(Spacer(1, 10))
-
-    s_hdr = [Paragraph(f"<b>{h}</b>", hdr_s) for h in [
-        "#", "Topic", "Expected (PROD)", "Actual (STAGE)", "What differs / how to fix", "Status",
-    ]]
-    s_rows = [s_hdr]
-    skip_s = ParagraphStyle("Skip", parent=styles["Normal"], fontSize=8, leading=11,
-                            textColor=colors.HexColor("#9e9e9e"), fontName="Helvetica-Bold")
-    smap6 = {"Pass": pass_s, "Fix": fail_s, "Skipped": skip_s}
-    for row_num, r in enumerate(style_results, 1):
-        ss = smap6.get(r["status"], cell_s)
-        diff_style = cell_s if r["status"] == "Pass" else miss_s
-        detail = "<br/>".join(
-            f"• {_esc(_trunc(x, 130))}" for x in r.get("diff_lines", [])[:2]
-        )
-        if len(r.get("diff_lines", [])) > 2:
-            detail += f"<br/><i>+{len(r['diff_lines']) - 2} more (see Part 6b)</i>"
-        s_rows.append([
-            Paragraph(str(row_num), cell_s),
-            Paragraph(_esc(r["title"]), topic_s),
-            Paragraph(r["expected"], cell_s),
-            Paragraph(r["actual"], cell_s),
-            Paragraph(detail if detail else _esc(r["difference"]), diff_style),
-            Paragraph(r["status"], ss),
-        ])
-
-    s_t = Table(s_rows,
-                colWidths=[20, 110, 190, 190, 215, 47],
-                repeatRows=1)
-    s_t.setStyle(TableStyle([
-        ("BACKGROUND",     (0,0), (-1,0), colors.HexColor("#37474f")),
-        ("GRID",           (0,0), (-1,-1), 0.5, colors.grey),
-        ("VALIGN",         (0,0), (-1,-1), "TOP"),
-        ("TOPPADDING",     (0,0), (-1,-1), 3),
-        ("BOTTOMPADDING",  (0,0), (-1,-1), 3),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f5f5f5")]),
-    ]))
-    story.append(s_t)
-
-    # Part 6b — full fix list for topics that need a style fix
-    style_fixes = [r for r in style_results if r["status"] == "Fix"]
-    if style_fixes:
+    if lang_stage != "eng":
         story.append(PageBreak())
-        story.append(Paragraph("Part 6b — Style Fixes Needed (full detail)", head_s))
+        story.append(Paragraph("Part 4 — Language &amp; Translation Integrity (Localization Bugs)", head_s))
         story.append(Paragraph(
-            "Every styling difference for each flagged topic, in plain language, with the STAGE "
-            "page to correct. PROD is the reference; make STAGE match it.",
-            ParagraphStyle("Note6b", parent=styles["Normal"], fontSize=8,
+            "Flags any English words found in the non-English guide outside the cover page (page 1) "
+            "as translation or localization bugs. Technical terms (like HDMI, USB) are excluded.",
+            ParagraphStyle("Note4", parent=styles["Normal"], fontSize=8,
                            textColor=colors.grey, spaceAfter=8),
         ))
-
-        s2_hdr = [Paragraph(f"<b>{h}</b>", hdr_s) for h in [
-            "#", "Topic", "PROD page", "STAGE page", "What to fix",
-        ]]
-        s2_rows = [s2_hdr]
-        for row_num, r in enumerate(style_fixes, 1):
-            full_diff = "<br/>".join(f"• {_esc(line)}" for line in r.get("diff_lines", []))
-            # Pull the bare "page N" tokens back out of the breakdown blocks.
-            prod_pg = r["expected"].split("<br/>")[0].replace("PROD ", "")
-            actual_first = r["actual"].split("<br/>")[0]
-            stage_pg = actual_first.replace("STAGE ", "") if actual_first.startswith("STAGE ") else "—"
-            s2_rows.append([
-                Paragraph(str(row_num), cell_s),
-                Paragraph(_esc(r["title"]), topic_s),
-                Paragraph(_esc(prod_pg), cell_s),
-                Paragraph(_esc(stage_pg), cell_s),
-                Paragraph(full_diff if full_diff else "—", miss_s),
-            ])
-
-        s2_t = Table(s2_rows,
-                     colWidths=[20, 130, 70, 70, 480],
-                     repeatRows=1)
-        s2_t.setStyle(TableStyle([
-            ("BACKGROUND",     (0,0), (-1,0), colors.HexColor("#37474f")),
-            ("GRID",           (0,0), (-1,-1), 0.5, colors.grey),
-            ("VALIGN",         (0,0), (-1,-1), "TOP"),
-            ("TOPPADDING",     (0,0), (-1,-1), 3),
-            ("BOTTOMPADDING",  (0,0), (-1,-1), 3),
-            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#fff3e0")]),
-        ]))
-        story.append(s2_t)
+        
+        # Extract all text from page 2 to the end of STAGE PDF
+        try:
+            stage_doc = fitz.open(stage_path)
+            use_ocr = _is_pdf_garbled(stage_doc)
+            full_text = ""
+            for i in range(1, stage_doc.page_count):
+                page = stage_doc[i]
+                if use_ocr:
+                    try:
+                        tp = page.get_textpage_ocr(dpi=150, language=lang_stage)
+                        text = page.get_text(textpage=tp)
+                    except Exception:
+                        text = page.get_text()
+                else:
+                    text = page.get_text()
+                full_text += text + " "
+            stage_doc.close()
+            unexpected_words = find_english_words_in_non_en(full_text)
+        except Exception as e:
+            print(f"Failed to scan English words in stage PDF: {e}")
+            unexpected_words = []
+        
+        if unexpected_words:
+            t_hdr = [Paragraph(f"<b>{h}</b>", hdr_s) for h in ["#", "Localization Bug / Translation Issue", "Comment"]]
+            t_rows = [t_hdr]
+            for idx, w in enumerate(unexpected_words, 1):
+                t_rows.append([
+                    Paragraph(str(idx), cell_s),
+                    Paragraph(f"English word <font color='#c62828'><b>“{_esc(w)}”</b></font> found", topic_s),
+                    Paragraph("Should be translated to the target language (outside cover page).", cell_s)
+                ])
+            t_table = Table(t_rows, colWidths=[30, 250, 380], repeatRows=1)
+            t_table.setStyle(TableStyle([
+                ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#c62828")), # red header for bugs
+                ("GRID",          (0,0), (-1,-1), 0.5, colors.grey),
+                ("VALIGN",        (0,0), (-1,-1), "TOP"),
+                ("TOPPADDING",    (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+                ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, colors.HexColor("#fff8f8")]),
+            ]))
+            story.append(t_table)
+        else:
+            story.append(Paragraph(
+                "✓ PASS: No unexpected English words found outside the cover page.",
+                ParagraphStyle("LangPass", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#2e7d32"))
+            ))
 
     doc.build(story)
     print(f"Report saved: {report_path}")
@@ -2410,6 +1792,40 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
 # Main validation logic
 # ────────────────────────────────────────────────────────────────────────────
 def validate(prod_path, stage_path, report_path):
+    # ── Pre-extract all stage page texts for heading search ──
+    print("Pre-extracting STAGE page texts...")
+    stage_doc = fitz.open(stage_path)
+    stage_page_texts = []
+    use_ocr = _is_pdf_garbled(stage_doc)
+    lang_stage = _get_pdf_language(stage_doc)
+    for i in range(stage_doc.page_count):
+        page = stage_doc[i]
+        if use_ocr:
+            try:
+                tp = page.get_textpage_ocr(dpi=150, language=lang_stage)
+                text = page.get_text(textpage=tp)
+            except Exception:
+                text = page.get_text()
+        else:
+            text = page.get_text()
+        stage_page_texts.append(text)
+    stage_doc.close()
+
+    def _find_heading_in_texts(title, page_texts):
+        title_norm = _canon(title)
+        if not title_norm:
+            return None
+        title_tok = _join_tokens(_tokenize(title_norm))
+        title_clean = "".join(c for c in title_tok if unicodedata.category(c)[0] in ("L", "N"))
+        if not title_clean:
+            return None
+        for pidx, p_text in enumerate(page_texts):
+            p_text_norm = _join_tokens(_tokenize(_canon(p_text)))
+            p_text_clean = "".join(c for c in p_text_norm if unicodedata.category(c)[0] in ("L", "N"))
+            if title_clean in p_text_clean:
+                return pidx + 1
+        return None
+
     # ── TOC comparison ──
     _emit(0.02, "reading TOC")
     print("Reading TOC...")
@@ -2428,13 +1844,24 @@ def validate(prod_path, stage_path, report_path):
                 "title": title, "level": lvl,
                 "prod_page": pg, "stage_page": stage_keys[k][2],
                 "toc_status": "Match",
+                "note": ""
             })
         else:
-            toc_results.append({
-                "title": title, "level": lvl,
-                "prod_page": pg, "stage_page": "-",
-                "toc_status": "Missing in Stage",
-            })
+            pno = _find_heading_in_texts(title, stage_page_texts)
+            if pno is not None:
+                toc_results.append({
+                    "title": title, "level": lvl,
+                    "prod_page": pg, "stage_page": pno,
+                    "toc_status": "Match",
+                    "note": f"Heading found inside page: {pno}"
+                })
+            else:
+                toc_results.append({
+                    "title": title, "level": lvl,
+                    "prod_page": pg, "stage_page": "-",
+                    "toc_status": "Missing in Stage",
+                    "note": ""
+                })
     n_step_bookmarks = 0
     for lvl, title, pg in stage_toc:
         if _norm_key(title) not in prod_keys:
@@ -2446,6 +1873,7 @@ def validate(prod_path, stage_path, report_path):
                 "title": title, "level": lvl,
                 "prod_page": "-", "stage_page": pg,
                 "toc_status": "Extra in Stage",
+                "note": ""
             })
     if n_step_bookmarks:
         print(f"  (excluded {n_step_bookmarks} numbered step bookmarks from Extra in Stage)")
@@ -2485,24 +1913,33 @@ def validate(prod_path, stage_path, report_path):
         title = r["title"]
         key   = _norm_key(title)
         pc    = prod_sections.get(title, "")
-        prod_words = _keep(pc.split())
+        prod_words = _keep(_tokenize(pc))
         
         # ── Handle "Missing in Stage" topics ──
         if r["toc_status"] == "Missing in Stage":
-            # Entire section is missing from Stage
-            status = "Fail"
-            coverage = 0.0
-            missing = []
-            if prod_words:
-                # Report ALL PROD content as missing
-                missing = [" ".join(prod_words)]
+            if not prod_words:
+                content_results.append({
+                    "title":      title,
+                    "level":      r["level"],
+                    "status":     "NO CONTENT",
+                    "prod_page":  r["prod_page"],
+                    "stage_page": r["stage_page"],
+                    "coverage":   100.0,
+                    "missing":    [],
+                })
+                continue
+
+            coverage, missing = _section_missing(
+                prod_words, stage_ns, stage_cset, stage_full_lower,
+                stage_section_lower="")
+            status = "Pass" if not missing else "Fail"
             content_results.append({
                 "title":      title,
                 "level":      r["level"],
                 "status":     status,
                 "prod_page":  r["prod_page"],
                 "stage_page": r["stage_page"],
-                "coverage":   coverage,
+                "coverage":   round(coverage, 1),
                 "missing":    missing,
             })
             continue
@@ -2525,7 +1962,7 @@ def validate(prod_path, stage_path, report_path):
         sc    = stage_sections.get(title) or stage_lookup.get(key) or ""
         coverage, missing = _section_missing(
             prod_words, stage_ns, stage_cset, stage_full_lower,
-            stage_section_lower=(sc or "").lower())
+            stage_section_lower=_s_norm(sc or "").lower())
 
         status = "Pass" if not missing else "Fail"
         content_results.append({
@@ -2557,102 +1994,106 @@ def validate(prod_path, stage_path, report_path):
     prod_nav = {1} | _detect_nav_pages(prod_doc)
     prod_doc.close()
     prod_imgs  = _extract_section_images(prod_path, prod_nav)
-    stage_imgs = _extract_stage_images_by_prod_sections(
-        stage_path, prod_toc, stage_toc, stage_nav)
 
-    # Build document-wide Stage icon list using on-page pt dimensions.
-    # Icons shift between sections in Stage (finer TOC), so icons are matched
-    # against the entire Stage document rather than per-section boundaries.
-    print("Building Stage icon index (document-wide, on-page pts)...")
+    # Build document-wide Stage pools of icons and figures (on-page pt sizes).
+    # STAGE re-paginates and re-sections content (much finer TOC), so figures
+    # and icons are matched against the whole STAGE document rather than fragile
+    # per-section page ranges.  Decorative rules are already filtered upstream.
+    print("Building Stage image index (document-wide, on-page pts)...")
     _sdoc = fitz.open(stage_path)
-    stage_all_icons = []
+    stage_all_icons   = []
+    stage_all_content = []
+    stage_vector_count = 0
     for i, page in enumerate(_sdoc, 1):
         if i in stage_nav:
             continue
         for bw, bh in _page_onpage_images(page):
             if max(bw, bh) <= _ICON_MAX_ONPAGE:
                 stage_all_icons.append((bw, bh))
+            else:
+                stage_all_content.append((bw, bh))
+        # Vector artwork (used to tell "images are vector-drawn" from "images
+        # genuinely missing" when STAGE has no extractable raster of that type).
+        # Only needed as a fallback — skip the (costly) drawings scan once we
+        # already have both raster pools populated.
+        if not (stage_all_icons and stage_all_content):
+            stage_vector_count += len(page.get_drawings())
     _sdoc.close()
-    print(f"  Stage icons doc-wide: {len(stage_all_icons)} placements")
+    prod_content_total = sum(
+        1 for imgs in prod_imgs.values()
+        for _, bw, bh in imgs if max(bw, bh) > _ICON_MAX_ONPAGE
+    )
+    print(f"  Stage icons doc-wide: {len(stage_all_icons)} | "
+          f"figures PROD {prod_content_total} vs STAGE {len(stage_all_content)}")
 
     _emit(0.64, "comparing images")
-    print("Comparing images by on-page pt dimensions (content ±15%, icon ±25%)...")
-    image_results = _compare_image_sections(prod_imgs, stage_imgs, stage_all_icons)
+    print("Comparing figures by count (doc-wide) and icons by size (±25%)...")
+    image_results = _compare_image_sections(
+        prod_imgs, stage_all_icons, stage_all_content, stage_vector_count)
     n_ip = sum(1 for r in image_results if r["status"] == "Pass")
     n_if = sum(1 for r in image_results if r["status"] == "Fail")
     print(f"  Pass={n_ip} | Fail={n_if}")
     if n_if:
-        print("  FAIL details:")
+        print("  FAIL details (STAGE has fewer figures than PROD here):")
         for r in image_results:
             if r["status"] == "Fail":
-                mc, mi = r["miss_content"], r["miss_icons"]
-                parts  = []
-                if mc: parts.append(f"Content missing={mc}/{r['prod_content']}")
-                if mi: parts.append(f"Icons missing={mi}/{r['prod_icons']}")
-                print(f"    {r['title']!r}: {' | '.join(parts)}")
+                print(f"    {r['title']!r}: figures missing="
+                      f"{r['miss_content']}/{r['prod_content']}")
     icon_doc_summary = {
         "prod_total":  sum(r["prod_icons"] for r in image_results),
         "found_total": sum(r["found_icons"] for r in image_results),
         "miss_total":  sum(r["miss_icons"]  for r in image_results),
+        "na_total":    sum(r.get("na_icons", 0) for r in image_results),
+        "vector":      bool(stage_vector_count) and not stage_all_icons,
         "status":      "Info" if not _FAIL_ON_ICON_MISS else (
             "Pass" if all(r["miss_icons"] == 0 for r in image_results) else "Fail"
         ),
     }
+    print(f"  Icons: available {icon_doc_summary['prod_total']} | "
+          f"found {icon_doc_summary['found_total']} | "
+          f"missing {icon_doc_summary['miss_total']} | "
+          f"vector-N/A {icon_doc_summary['na_total']}")
 
-    # ── Layout / table / alignment extraction ──
-    _emit(0.72, "extracting layout")
-    print("Extracting image layout, tables, and text alignment (PROD)...")
-    prod_img_layout, prod_tables, prod_text_align = _extract_layout_prod(
-        prod_path, prod_nav, prod_toc)
-    print("Extracting image layout, tables, and text alignment (Stage)...")
-    stg_img_layout, stg_tables, stg_text_align = _extract_layout_stage(
-        stage_path, prod_toc, stage_toc, stage_nav)
+    # ── Trademark / symbol integrity (™ ® ©) ──
+    _emit(0.66, "checking trademarks")
+    tm_counts, tm_dropped = _trademark_findings(prod_path, stage_path)
+    if tm_counts or tm_dropped:
+        print("  Trademark/symbol issues:")
+        for sym, np_, ns in tm_counts:
+            print(f"    {sym}: PROD {np_} vs STAGE {ns} (STAGE missing {np_ - ns})")
+        for term, n, base in tm_dropped[:20]:
+            print(f"    dropped {term!r} (PROD x{n}; base text "
+                  f"{'present' if base else 'absent'} in STAGE)")
 
-    print("Comparing layout...")
-    layout_results = _compare_layout(
-        prod_img_layout, stg_img_layout,
-        prod_tables,     stg_tables,
-        prod_text_align, stg_text_align,
-    )
-    n_lp = sum(1 for r in layout_results if r["status"] == "Pass")
-    n_lf = sum(1 for r in layout_results if r["status"] == "Fail")
-    print(f"  Layout Pass={n_lp} | Fail={n_lf}")
-
-    # ── Visual page-render validation ──
-    _emit(0.84, "comparing visuals")
-    print("Comparing visual render similarity (Expected PROD vs Actual STAGE)...")
-    visual_results = _compare_visual_sections(
-        prod_path, stage_path, prod_toc, stage_toc, toc_results
-    )
-    n_vp = sum(1 for r in visual_results if r["status"] == "Pass")
-    n_vf = sum(1 for r in visual_results if r["status"] == "Fail")
-    print(f"  Visual Pass={n_vp} | Fail={n_vf}")
-
-    _emit(0.90, "comparing style")
-    print("Comparing style structure (headings/sub-headings/body/notices, by proportion)...")
-    style_results = _compare_style_sections(
-        prod_path, stage_path, prod_toc, stage_toc, toc_results
-    )
-    n_sp = sum(1 for r in style_results if r["status"] == "Pass")
-    n_sf = sum(1 for r in style_results if r["status"] == "Fix")
-    n_sk = sum(1 for r in style_results if r["status"] == "Skipped")
-    print(f"  Style Pass={n_sp} | Needs fix={n_sf} | Skipped={n_sk}")
-    if n_sf:
-        print("  Style fixes needed:")
-        for r in style_results:
-            if r["status"] == "Fix":
-                print(f"    • {r['title']}")
-                for ln in r.get("diff_lines", []):
-                    print(f"        - {ln}")
 
     # ── Generate PDF ──
     _emit(0.95, "building report")
     print("Generating report PDF...")
+    
+    prod_doc = fitz.open(prod_path)
+    prod_garbled = _is_pdf_garbled(prod_doc)
+    prod_doc.close()
+
+    stage_doc = fitz.open(stage_path)
+    stage_garbled = _is_pdf_garbled(stage_doc)
+    stage_doc.close()
+
     generate_report(prod_path, stage_path, toc_results, content_results,
-                    image_results, icon_doc_summary, layout_results,
-                    visual_results, style_results, report_path)
+                    image_results, icon_doc_summary, report_path,
+                    tm_counts, tm_dropped,
+                    prod_encoding_issue=prod_garbled,
+                    stage_encoding_issue=stage_garbled)
     _emit(1.0, "done")
     print("Done.")
+
+    return {
+        "toc_match":    n_m,
+        "toc_missing":  n_mi,
+        "toc_extra":    n_e,
+        "content_pass": sum(1 for r in content_results if r["status"] == "Pass"),
+        "content_fail": sum(1 for r in content_results if r["status"] == "Fail"),
+        "report":       report_path,
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────────

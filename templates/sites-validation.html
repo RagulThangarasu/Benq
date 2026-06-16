@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Sites Validation</title>
+    <style>
+      :root {
+        --bg: linear-gradient(180deg,#f7fbfb 0%,#f0f8f9 100%);
+        --card: #ffffff;
+        --muted: #6b7280;
+        --text: #0b1220;
+        --primary-start: #0ea5a4;
+        --primary-end: #3b82f6;
+        --accent: #fb923c;
+        --border: rgba(11,18,23,0.12);
+        --border-soft: rgba(11,18,23,0.06);
+        --ok: #047857;  --okbg: rgba(16,185,129,0.12);
+        --bad: #b91c1c; --badbg: rgba(239,68,68,0.10);
+        --warn: #854d0e; --warnbg: rgba(234,179,8,0.12);
+        --info: #1e40af; --infobg: rgba(59,130,246,0.10);
+        font-family: Inter, system-ui, sans-serif;
+        color: var(--text);
+        background: var(--bg);
+        font-size: 15px;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 0; }
+
+      /* ── Top header bar ── */
+      .top-bar {
+        background: #ffffff;
+        color: var(--text);
+        padding: 24px 28px 10px;
+        display: flex;
+        align-items: flex-end;
+        gap: 16px;
+        flex-wrap: wrap;
+        border-bottom: 1px solid var(--border);
+      }
+      .branding-title {
+        font-size: 32px;
+        font-weight: 700;
+        line-height: normal; /* "line height is common" */
+        margin-bottom: 14px; /* paragraph spacing 14px */
+        font-family: inherit; /* remaining common */
+        letter-spacing: -0.02em;
+        color: var(--text);
+      }
+      .top-bar .nav-links {
+        margin-left: auto;
+        display: flex;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+      .top-bar .nav-links a {
+        color: var(--primary-end);
+        text-decoration: none;
+        font-weight: 600;
+        font-size: 0.95rem;
+        padding: 6px 12px;
+        border-radius: 8px;
+        background: var(--border-soft);
+        transition: background 150ms ease, color 150ms ease;
+      }
+      .top-bar .nav-links a:hover {
+        background: var(--primary-start);
+        color: #fff;
+      }
+
+      /* ── Tab bar ── */
+      .tab-bar {
+        display: flex;
+        gap: 0;
+        background: #ffffff;
+        padding: 0 28px;
+        border-bottom: 1px solid var(--border);
+      }
+      .tab-btn {
+        padding: 12px 24px;
+        border: none;
+        background: none;
+        color: var(--muted);
+        font-size: 0.95rem;
+        font-weight: 700;
+        cursor: pointer;
+        border-bottom: 3px solid transparent;
+        margin-bottom: -1px;
+        transition: color 150ms, border-color 150ms;
+      }
+      .tab-btn:hover {
+        color: var(--text);
+      }
+      .tab-btn.active {
+        color: var(--primary-start);
+        border-bottom-color: var(--primary-start);
+      }
+
+      /* ── Main 2-column layout ── */
+      .main-wrap {
+        display: flex;
+        height: calc(100vh - 128px);
+        overflow: hidden;
+      }
+
+      /* ── Left sidebar: Q&A Index ── */
+      .qa-sidebar { width:330px; min-width:280px; background:#fff; border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; flex-shrink:0; }
+      .qa-header { padding:14px 16px 10px; border-bottom:1px solid var(--border); background:linear-gradient(180deg,#f8fafb,#fff); flex-shrink:0; }
+      .qa-header .qa-label { font-size:0.78rem; font-weight:800; color:var(--muted); text-transform:uppercase; letter-spacing:0.6px; margin-bottom:6px; }
+      .qa-header .qa-desc { font-size:0.82rem; color:var(--muted); line-height:1.35; }
+      .qa-toc { flex:1; overflow-y:auto; padding:6px 0; }
+      .qa-toc .empty { color:var(--muted); padding:16px; font-size:0.88rem; }
+      .qa-item { display:flex; align-items:center; gap:7px; padding:6px 14px; cursor:pointer; font-size:0.85rem; border-left:3px solid transparent; transition:background 80ms ease; }
+      .qa-item:hover { background:#f0f8f9; }
+      .qa-item.active { background:#e6f6f6; border-left-color:var(--primary-start); font-weight:700; }
+      .qa-item .dot { width:8px; height:8px; border-radius:50%; flex:none; background:#cbd5e1; }
+      .qa-item.s-pass .dot { background:var(--ok); }
+      .qa-item.s-fail .dot { background:var(--bad); }
+      .qa-item.s-skip .dot { background:var(--warn); }
+      .qa-item .title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .qa-item .status-tag { font-size:0.72rem; font-weight:800; padding:2px 7px; border-radius:999px; flex-shrink:0; }
+      .qa-item .status-tag.pass { background:var(--okbg); color:var(--ok); }
+      .qa-item .status-tag.fail { background:var(--badbg); color:var(--bad); }
+      .qa-item .status-tag.skip { background:var(--warnbg); color:var(--warn); }
+      .qa-item .status-tag.missing { background:#fef3c7; color:#92400e; }
+      .qa-summary-strip { padding:10px 14px; border-top:1px solid var(--border); background:#f8fafc; flex-shrink:0; font-size:0.82rem; display:none; }
+      .qa-summary-strip .stat { display:inline-block; margin-right:10px; font-weight:700; }
+      .qa-summary-strip .stat.ok { color:var(--ok); }
+      .qa-summary-strip .stat.bad { color:var(--bad); }
+      .qa-summary-strip .stat.warn { color:var(--warn); }
+      .qa-summary-strip .toc-status { display:inline-block; padding:3px 9px; border-radius:999px; font-size:0.78rem; font-weight:800; }
+      .qa-summary-strip .toc-status.complete { background:var(--okbg); color:var(--ok); }
+      .qa-summary-strip .toc-status.incomplete { background:var(--badbg); color:var(--bad); }
+
+      /* ── Style sidebar ── */
+      .style-sidebar { width:330px; min-width:280px; background:#fff; border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; flex-shrink:0; }
+      .style-sidebar-header { padding:14px 16px 10px; border-bottom:1px solid var(--border); background:linear-gradient(180deg,#f8fafb,#fff); }
+      .style-sidebar-header .sl { font-size:0.78rem; font-weight:800; color:var(--muted); text-transform:uppercase; letter-spacing:0.6px; margin-bottom:4px; }
+      .style-metrics { flex:1; overflow-y:auto; padding:10px 14px; }
+      .metric-row { display:flex; justify-content:space-between; align-items:center; padding:7px 0; border-bottom:1px solid var(--border-soft); font-size:0.85rem; }
+      .metric-row:last-child { border-bottom:none; }
+      .metric-label { color:var(--muted); font-weight:600; }
+      .metric-val { font-weight:800; }
+      .metric-val.ok { color:var(--ok); }
+      .metric-val.bad { color:var(--bad); }
+      .metric-val.warn { color:var(--warn); }
+
+      /* ── Right content area ── */
+      .content-area { flex:1; overflow-y:auto; padding:22px 28px; }
+
+      .card { background:linear-gradient(180deg,#ffffff,#fbfdff); border-radius:14px; padding:22px; box-shadow:0 12px 36px rgba(11,18,32,0.06); border:1px solid var(--border-soft); margin-bottom:20px; }
+      label { display:block; margin-bottom:8px; font-size:0.95rem; font-weight:700; color:var(--text); }
+      select.form-select, input[type=text] { width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:10px; background:#fbfdff; font-size:0.95rem; margin-bottom:16px; }
+      input[type=file] { font-size:0.92rem; }
+      button { min-width:120px; border:none; border-radius:10px; font-weight:700; cursor:pointer; padding:10px 14px; font-size:0.95rem; transition:transform 100ms ease,box-shadow 100ms ease; }
+      button:hover:not(:disabled) { transform:translateY(-1px); box-shadow:0 8px 24px rgba(2,6,23,0.12); }
+      button:disabled { opacity:0.45; cursor:not-allowed; }
+      button.cta { background:linear-gradient(90deg,#0b1220,#111827); color:#ffffff; }
+      button.dl-btn { background:linear-gradient(90deg,#0ea5a4,#3b82f6); color:#fff; }
+      button.style-run-btn { background:linear-gradient(90deg,#7c3aed,#4f46e5); color:#fff; }
+      .notice { margin-top:14px; padding:12px 14px; border-radius:12px; background:linear-gradient(180deg,#f8fafc,#ffffff); border:1px solid var(--border-soft); color:var(--muted); font-size:0.92rem; }
+
+      /* Content report table */
+      table.report { width:100%; border-collapse:collapse; font-size:0.88rem; }
+      table.report th, table.report td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border-soft); vertical-align:top; }
+      table.report th { background:#f1f5f9; font-weight:700; position:sticky; top:0; z-index:1; }
+      table.report tr:hover { background:#f8fafc; }
+      table.report tr[data-status="fail"] { background:rgba(239,68,68,0.03); }
+
+      /* Style check results */
+      .style-results-grid { display:grid; gap:12px; }
+      .style-cat-card { border-radius:12px; border:1px solid var(--border-soft); overflow:hidden; }
+      .style-cat-hdr { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; cursor:pointer; background:linear-gradient(180deg,#f8fafc,#f1f5f9); user-select:none; }
+      .style-cat-hdr .cat-name { font-weight:700; font-size:0.9rem; }
+      .style-cat-hdr .cat-badges { display:flex; gap:6px; align-items:center; }
+      .style-cat-body { display:none; padding:0 14px 12px; }
+      .style-cat-body.open { display:block; }
+      .style-issue-row { border-left:3px solid #e5e7eb; padding:8px 0 8px 12px; margin:8px 0; font-size:0.84rem; }
+      .style-issue-row.sev-high { border-left-color:#ef4444; }
+      .style-issue-row.sev-medium { border-left-color:#f97316; }
+      .style-issue-row.sev-low { border-left-color:#3b82f6; }
+      .style-issue-row.sev-info { border-left-color:#94a3b8; }
+      .style-issue-topic { font-weight:700; margin-bottom:3px; }
+      .style-issue-pages { font-size:0.78rem; color:var(--muted); margin-bottom:4px; }
+      .style-issue-detail { color:#374151; line-height:1.45; }
+      .style-issue-fix { color:#047857; font-size:0.82rem; margin-top:4px; }
+
+      /* Severity + pass badges */
+      .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:0.78rem; font-weight:700; }
+      .badge.pass { background:#dcfce7; color:#166534; }
+      .badge.fail { background:#fee2e2; color:#991b1b; }
+      .badge.skip { background:#fef9c3; color:#854d0e; }
+      .badge.error { background:#fef9c3; color:#854d0e; }
+      .badge.missing { background:#fef3c7; color:#92400e; }
+      .badge.info { background:#dbeafe; color:#1e40af; }
+      .badge.sev-high { background:#fee2e2; color:#991b1b; }
+      .badge.sev-medium { background:#ffedd5; color:#9a3412; }
+      .badge.sev-low { background:#dbeafe; color:#1e40af; }
+      .badge.sev-info { background:#f1f5f9; color:#475569; }
+
+      .pill-summary { display:inline-block; padding:6px 12px; border-radius:999px; font-weight:700; margin-right:8px; font-size:0.85rem; margin-bottom:6px; }
+      .missing-text { color:var(--muted); font-size:0.8rem; }
+
+      /* Overall pass % ring */
+      .pass-ring-wrap { display:flex; align-items:center; gap:18px; padding:14px; background:linear-gradient(135deg,#0b1220,#1e293b); border-radius:14px; margin-bottom:16px; color:#e2e8f0; }
+      .pass-ring-val { font-size:2.4rem; font-weight:900; line-height:1; }
+      .pass-ring-val.ok { color:#4ade80; }
+      .pass-ring-val.warn { color:#fbbf24; }
+      .pass-ring-val.bad { color:#f87171; }
+      .pass-ring-label { font-size:0.82rem; color:#94a3b8; margin-top:3px; }
+
+      /* Category summary strip */
+      .cat-summary-table { width:100%; border-collapse:collapse; font-size:0.84rem; margin-bottom:14px; }
+      .cat-summary-table th { background:#1e293b; color:#e2e8f0; padding:7px 10px; text-align:left; }
+      .cat-summary-table td { padding:6px 10px; border-bottom:1px solid var(--border-soft); }
+      .cat-summary-table tr:last-child td { border-bottom:none; }
+      .cat-summary-table .pct-cell { font-weight:800; }
+
+      /* Progress bar */
+      .prog-bar-wrap { background:#e5e7eb; border-radius:999px; height:10px; overflow:hidden; margin-top:10px; }
+      .prog-bar-fill { height:100%; border-radius:999px; background:linear-gradient(90deg,#0ea5a4,#3b82f6); transition:width 300ms ease; }
+
+      /* AEM auth bar */
+      .auth-bar { padding:14px 16px; border-radius:12px; background:#0b1220; color:#e6eef8; margin-bottom:18px; }
+      .auth-status { display:flex; align-items:center; gap:8px; font-size:0.9rem; font-weight:600; margin-bottom:10px; }
+      .auth-status .dot { width:9px; height:9px; border-radius:50%; background:#ef4444; display:inline-block; }
+      .auth-status .dot.on { background:#22c55e; }
+      .auth-form { display:grid; grid-template-columns:1.4fr 1fr 1fr auto; gap:8px; }
+      .auth-form input { margin-bottom:0; background:#0f1724; border:1px solid rgba(255,255,255,0.15); color:#e6eef8; padding:10px 12px; border-radius:10px; font-size:0.95rem; }
+      .auth-form input::placeholder { color:#94a3b8; }
+      .auth-form button { background:linear-gradient(90deg,#0ea5a4,#3b82f6); color:#fff; }
+      .auth-msg { margin-top:8px; font-size:0.85rem; min-height:1em; }
+      @media (max-width:720px) { .auth-form { grid-template-columns:1fr; } }
+
+      @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+      .fade-in { animation:fadeIn 0.3s ease; }
+      .tab-panel { display:none; height:100%; }
+      .tab-panel.active { display:flex; }
+
+      @media (max-width:900px) {
+        .main-wrap { flex-direction:column; height:auto; }
+        .qa-sidebar,.style-sidebar { width:100%; min-width:auto; max-height:260px; border-right:none; border-bottom:1px solid var(--border); }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Top bar -->
+    <div class="top-bar">
+      <div class="branding-title">Sites Validation</div>
+      <div class="nav-links">
+        <a href="/guide">📖 Guide</a>
+        <a href="/">🏠 Home</a>
+      </div>
+    </div>
+
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="content">📄 Content Validation</button>
+      <button class="tab-btn" data-tab="style">🎨 Style Validation</button>
+    </div>
+
+    <div class="main-wrap">
+      <!-- ═══════════════════════════════════════════════
+           CONTENT TAB
+      ════════════════════════════════════════════════ -->
+      <div class="tab-panel active" id="tab-content">
+        <!-- Left: Q&A Index -->
+        <div class="qa-sidebar" id="qaSidebar">
+          <div class="qa-header" style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+            <div>
+              <div class="qa-label">Q&A Index</div>
+              <div class="qa-desc" style="max-width:180px;">TOC sections with status.</div>
+            </div>
+            <button type="button" class="cta" id="qaIndexBtn" style="font-size:0.75rem; padding:6px 10px; min-width:auto; white-space:nowrap; background:linear-gradient(90deg,#0ea5a4,#3b82f6); color:#fff; border-radius:8px;">Validate All</button>
+          </div>
+          <div class="qa-toc" id="qaToc">
+            <div class="empty">Run a validation to see the Q&A Index.</div>
+          </div>
+          <div class="qa-summary-strip" id="qaSummary"></div>
+        </div>
+
+        <!-- Right: Content form -->
+        <div class="content-area">
+          <!-- AEM auth -->
+          <div class="auth-bar" id="authBar">
+            <div class="auth-status" id="authStatus">
+              <span class="dot" id="authDot"></span>
+              <span id="authText">Not signed in to AEM</span>
+              <button type="button" id="signOutBtn" style="display:none; min-width:auto; padding:5px 10px; font-size:0.8rem;">Sign out</button>
+            </div>
+            <form id="loginForm" class="auth-form">
+              <input type="text" id="aemUrl" placeholder="AEM URL — e.g. https://author.benq.com" required />
+              <input type="text" id="aemUser" placeholder="Username" autocomplete="username" required />
+              <input type="password" id="aemPass" placeholder="Password" autocomplete="current-password" required />
+              <button type="submit" id="loginBtn">Sign in &amp; save session</button>
+            </form>
+            <div id="authMsg" class="auth-msg"></div>
+          </div>
+
+          <div class="card">
+            <form id="siteValidateForm">
+              <label for="pdfSelect">Select PROD PDF:</label>
+              <select id="pdfSelect" name="pdf" class="form-select">
+                <option value="all">All PDFs</option>
+                <optgroup label="en-us (English)" id="en-us-group"></optgroup>
+                <optgroup label="Other Languages" id="other-lang-group"></optgroup>
+              </select>
+
+              <div style="display:flex;align-items:center;gap:10px;margin:-6px 0 14px;">
+                <span style="font-size:0.82rem;color:var(--muted);font-weight:600;">— or —</span>
+                <label for="pdfFile" style="margin:0;font-weight:600;font-size:0.95rem;">Upload PDF:</label>
+                <input type="file" id="pdfFile" name="pdf_file" accept="application/pdf,.pdf" style="margin:0;width:auto;flex:1;" />
+                <span style="font-size:0.78rem;color:var(--muted);">(overrides selection above)</span>
+              </div>
+
+              <label for="authorUrl">Author URL:</label>
+              <input type="text" id="authorUrl" name="url" placeholder="e.g. http://157.245.100.121:4502/content/…/en-us/…" />
+              <p class="missing-text" style="margin:-8px 0 14px;">All pages under this path are crawled. Each PDF TOC section's content is validated against the site.</p>
+
+              <button type="submit" id="validateBtn" class="cta">Validate Content</button>
+            </form>
+
+            <div id="resultArea" style="margin-top:20px; display:none;">
+              <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+                <h3 id="reportTitle" style="margin:0;">Validation Report</h3>
+                <button type="button" id="downloadReportBtn" class="dl-btn" style="display:none;">⬇ Download PDF report</button>
+              </div>
+              <div id="summary" style="margin:12px 0;"></div>
+              <div id="resultContent"></div>
+            </div>
+          </div>
+        </div>
+      </div><!-- /tab-content -->
+
+      <!-- ═══════════════════════════════════════════════
+           STYLE TAB
+      ════════════════════════════════════════════════ -->
+      <div class="tab-panel" id="tab-style">
+        <!-- Left: Style metrics sidebar -->
+        <div class="style-sidebar" id="styleSidebar">
+          <div class="style-sidebar-header">
+            <div class="sl">Style Check Summary</div>
+            <div style="font-size:0.8rem;color:var(--muted);">Pass % per category</div>
+          </div>
+          <div class="style-metrics" id="styleMetrics">
+            <div class="empty" style="color:var(--muted);font-size:0.84rem;padding:12px 0;">Run a style check to see metrics here.</div>
+          </div>
+        </div>
+
+        <!-- Right: Style form + results -->
+        <div class="content-area">
+          <div class="card">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px;">
+              <div style="width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#7c3aed,#4f46e5);display:flex;align-items:center;justify-content:center;font-size:1.3rem;">🎨</div>
+              <div>
+                <div style="font-weight:800;font-size:1rem;">Image &amp; Layout vs AEM Site</div>
+                <div style="font-size:0.82rem;color:var(--muted);">Renders the live AEM pages and checks image sizes vs the PDF, oversized &amp; cut-off images, table breaking, and typography against the BenQ spec.</div>
+              </div>
+            </div>
+
+            <form id="styleForm">
+              <label for="stylePdfSelect">PROD PDF (reference):</label>
+              <select id="stylePdfSelect" name="pdf" class="form-select">
+                <option value="all">— select a PDF —</option>
+                <optgroup label="en-us (English)" id="style-en-us-group"></optgroup>
+                <optgroup label="Other Languages" id="style-other-lang-group"></optgroup>
+              </select>
+              <div style="display:flex;align-items:center;gap:10px;margin:-6px 0 14px;">
+                <span style="font-size:0.82rem;color:var(--muted);font-weight:600;">— or —</span>
+                <label for="stylePdfFile" style="margin:0;font-weight:600;font-size:0.95rem;">Upload PDF:</label>
+                <input type="file" id="stylePdfFile" name="pdf_file" accept="application/pdf,.pdf" style="margin:0;width:auto;flex:1;" />
+                <span style="font-size:0.78rem;color:var(--muted);">(overrides selection)</span>
+              </div>
+
+              <label for="styleAuthorUrl">AEM Author URL <span style="color:var(--bad);">*</span></label>
+              <input type="text" id="styleAuthorUrl" name="url" placeholder="e.g. http://157.245.100.121:4502/content/…/en-us/…" required />
+              <p class="missing-text" style="margin:-8px 0 14px;">All pages under this path are rendered in a headless browser and checked against the PROD PDF. Sign in to AEM (header on the Content tab) first.</p>
+
+              <!-- What gets checked info box -->
+              <div style="margin:14px 0;padding:12px 14px;background:#f8fafc;border-radius:10px;border:1px solid var(--border-soft);">
+                <div style="font-weight:700;font-size:0.85rem;margin-bottom:8px;color:#1e293b;">✅ What gets validated — live AEM site vs PROD PDF</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:0.82rem;color:var(--muted);">
+                  <span>• <strong>Typography spec</strong> — rendered H1/H2/H3 &amp; body font sizes</span>
+                  <span>• <strong>Line height</strong> — all headings &amp; bullet points</span>
+                  <span>• <strong>Image dimensions</strong> vs the matching PDF figure</span>
+                  <span>• Oversized images (wider than the content column)</span>
+                  <span>• Images cut off / overflowing their container</span>
+                  <span>• Table breaking (table overflows the page width)</span>
+                  <span>• Text alignment (left vs centre/right/justify)</span>
+                  <span>• Image alignment (with or without surrounding images)</span>
+                </div>
+                <div style="font-size:0.76rem;color:var(--muted);margin-top:8px;font-style:italic;">Each page under the AEM URL is rendered in a headless browser to measure real on-screen dimensions.</div>
+              </div>
+
+              <div style="display:flex;gap:10px;align-items:center;">
+                <button type="submit" id="styleRunBtn" class="style-run-btn">🎨 Run Style Check</button>
+                <button type="button" id="styleDlBtn" class="dl-btn" style="display:none;">⬇ Download PDF report</button>
+              </div>
+            </form>
+
+            <!-- Progress -->
+            <div id="styleProgress" style="margin-top:18px;display:none;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <span id="styleProgressMsg" style="font-size:0.88rem;color:var(--muted);">Analysing…</span>
+                <span id="styleProgressPct" style="font-weight:700;font-size:0.88rem;"></span>
+              </div>
+              <div class="prog-bar-wrap"><div class="prog-bar-fill" id="styleProgFill" style="width:0%;"></div></div>
+            </div>
+
+            <!-- Results -->
+            <div id="styleResults" style="margin-top:20px;display:none;"></div>
+          </div>
+        </div>
+      </div><!-- /tab-style -->
+    </div><!-- /main-wrap -->
+
+    <script>
+      /* ─────────────────────────────────────────────────────
+         Tab switching
+      ───────────────────────────────────────────────────── */
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+          document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+          btn.classList.add('active');
+          document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+        });
+      });
+
+      /* ─────────────────────────────────────────────────────
+         Utilities
+      ───────────────────────────────────────────────────── */
+      function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
+          ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+      }
+      async function downloadFile(url, fallbackName, btn) {
+        const orig = btn ? btn.textContent : null;
+        if (btn) { btn.disabled = true; btn.textContent = 'Preparing…'; }
+        try {
+          const res = await fetch(url);
+          if (!res.ok) { let m='HTTP '+res.status; try{m=(await res.json()).error||m;}catch(e){} throw new Error(m); }
+          const cd = res.headers.get('Content-Disposition') || '';
+          const nm = (/filename="?([^"]+)"?/.exec(cd)||[])[1] || fallbackName;
+          const blob = await res.blob();
+          const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: nm });
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+        } catch (e) { alert('Download failed: ' + e.message); }
+        finally { if (btn) { btn.disabled = false; btn.textContent = orig; } }
+      }
+
+      /* ─────────────────────────────────────────────────────
+         Content tab — PDF list
+      ───────────────────────────────────────────────────── */
+      async function loadPdfs() {
+        try {
+          const data = await (await fetch('/download/products')).json();
+          const enGrp    = document.getElementById('en-us-group');
+          const otherGrp = document.getElementById('other-lang-group');
+          const sEnGrp    = document.getElementById('style-en-us-group');
+          const sOtherGrp = document.getElementById('style-other-lang-group');
+          data.products.forEach(p => {
+            const isEn = p.product.includes('_EN') || p.product.includes('_en');
+            const mk = () => Object.assign(document.createElement('option'), { value: p.product, textContent: p.product + ' (' + p.pdf_name + ')' });
+            (isEn ? enGrp : otherGrp).appendChild(mk());
+            (isEn ? sEnGrp : sOtherGrp).appendChild(mk());
+          });
+        } catch (e) { console.error('Failed to load products', e); }
+      }
+
+      /* ─────────────────────────────────────────────────────
+         Content tab — validation
+      ───────────────────────────────────────────────────── */
+      document.getElementById('downloadReportBtn').addEventListener('click', e => {
+        downloadFile('/sites-validation/report', 'sites_validation_report.pdf', e.currentTarget);
+      });
+
+      document.getElementById('siteValidateForm').addEventListener('submit', async e => {
+        e.preventDefault();
+        const btn = document.getElementById('validateBtn');
+        const resultArea = document.getElementById('resultArea');
+        const resultContent = document.getElementById('resultContent');
+        const summary = document.getElementById('summary');
+        document.getElementById('reportTitle').textContent = 'Content Validation Report — by TOC';
+        btn.disabled = true; btn.textContent = 'Validating...';
+        resultArea.style.display = 'block';
+        document.getElementById('downloadReportBtn').style.display = 'none';
+        summary.innerHTML = '';
+        resultContent.innerHTML = '<div class="notice"><i>Crawling all pages and validating each PDF TOC section…</i></div>';
+        document.getElementById('qaToc').innerHTML = '<div class="empty" style="text-align:center;">⏳ Validating…</div>';
+        document.getElementById('qaSummary').style.display = 'none';
+
+        const fd = new FormData();
+        fd.append('pdf', document.getElementById('pdfSelect').value);
+        fd.append('url', document.getElementById('authorUrl').value);
+        const pf = document.getElementById('pdfFile').files[0];
+        if (pf) fd.append('pdf_file', pf);
+
+        try {
+          const res = await fetch('/sites-validation/run', { method:'POST', body:fd });
+          const data = await res.json();
+          if (!res.ok) {
+            summary.innerHTML = '';
+            resultContent.innerHTML = `<div class="notice" style="color:#991b1b">Error: ${data.error || 'Validation failed'}</div>`;
+            document.getElementById('qaToc').innerHTML = '<div class="empty">Validation failed. Try again.</div>';
+          } else { renderReport(data); renderQaIndex(data); }
+        } catch (err) {
+          resultContent.innerHTML = `<div class="notice" style="color:#991b1b">Request failed: ${err.message}</div>`;
+          document.getElementById('qaToc').innerHTML = '<div class="empty">Request failed. Try again.</div>';
+        } finally {
+          btn.disabled = false; btn.textContent = 'Validate Content';
+        }
+      });
+
+      /* ─────────────────────────────────────────────────────
+         Content tab — AEM auth
+      ───────────────────────────────────────────────────── */
+      function setAuthState(authed, baseUrl, expiresIn) {
+        const dot=document.getElementById('authDot'), text=document.getElementById('authText');
+        const form=document.getElementById('loginForm'), signOut=document.getElementById('signOutBtn');
+        if (authed) {
+          dot.classList.add('on');
+          let suffix = baseUrl ? ' — '+baseUrl : '';
+          if (expiresIn!=null) suffix += ' (expires in '+Math.round(expiresIn/3600)+'h)';
+          text.textContent = 'Signed in to AEM' + suffix;
+          form.style.display = 'none'; signOut.style.display = 'inline-block';
+        } else {
+          dot.classList.remove('on'); text.textContent = 'Not signed in to AEM';
+          form.style.display = 'grid'; signOut.style.display = 'none';
+        }
+      }
+      async function refreshSession() {
+        try { const d=await (await fetch('/sites-validation/session')).json(); setAuthState(d.authenticated,d.base_url,d.expires_in); }
+        catch(e) { setAuthState(false); }
+      }
+      document.getElementById('loginForm').addEventListener('submit', async e => {
+        e.preventDefault();
+        const btn=document.getElementById('loginBtn'), msg=document.getElementById('authMsg');
+        btn.disabled=true; btn.textContent='Signing in…';
+        msg.style.color='#94a3b8'; msg.textContent='Authenticating with AEM…';
+        try {
+          const res=await fetch('/sites-validation/login',{ method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({ aem_url:document.getElementById('aemUrl').value, username:document.getElementById('aemUser').value, password:document.getElementById('aemPass').value }) });
+          const data=await res.json();
+          if (!res.ok) { msg.style.color='#fca5a5'; msg.textContent=data.error||'Sign in failed.'; }
+          else { msg.style.color='#86efac'; msg.textContent=data.message||'Session saved.'; document.getElementById('aemPass').value=''; setAuthState(true,data.base_url,data.expires_in); }
+        } catch(err) { msg.style.color='#fca5a5'; msg.textContent='Request failed: '+err.message; }
+        finally { btn.disabled=false; btn.textContent='Sign in & save session'; }
+      });
+      document.getElementById('signOutBtn').addEventListener('click', async () => {
+        await fetch('/sites-validation/logout',{method:'POST'}); document.getElementById('authMsg').textContent=''; setAuthState(false);
+      });
+
+      /* ─────────────────────────────────────────────────────
+         Content tab — Q&A Index render
+      ───────────────────────────────────────────────────── */
+      function renderQaIndex(data) {
+        const tocEl=document.getElementById('qaToc'), sumEl=document.getElementById('qaSummary');
+        const results=data.results||[], s=data.summary||{}, tocStatus=data.toc_status||s.toc_status||'unknown';
+        if (!results.length) { tocEl.innerHTML='<div class="empty">No TOC sections found.</div>'; sumEl.style.display='none'; return; }
+        tocEl.innerHTML = results.map((r,i) => {
+          const status=r.status||'skip';
+          const cls=status==='pass'?'s-pass':status==='fail'?'s-fail':'s-skip';
+          const tagCls=status==='pass'?'pass':status==='fail'?'fail':(r.on_site===false?'missing':'skip');
+          const tagLabel=status==='pass'?'PASS':status==='fail'?'FAIL':(r.on_site===false?'MISSING':'SKIP');
+          return `<div class="qa-item ${cls} fade-in" data-idx="${i}" style="animation-delay:${i*15}ms">
+            <span class="dot"></span>
+            <span class="title" title="${esc(r.nav_item)}">${esc(r.nav_item)}</span>
+            <span class="status-tag ${tagCls}">${tagLabel}</span>
+          </div>`;
+        }).join('');
+        tocEl.querySelectorAll('.qa-item').forEach(el => {
+          el.addEventListener('click', () => {
+            tocEl.querySelectorAll('.qa-item').forEach(x=>x.classList.remove('active'));
+            el.classList.add('active');
+            const row=document.querySelector(`table.report tr[data-row-idx="${el.dataset.idx}"]`);
+            if (row) { row.scrollIntoView({behavior:'smooth',block:'center'}); row.style.background='#eff6ff'; setTimeout(()=>{row.style.background='';},1500); }
+          });
+        });
+        const tocCls=tocStatus==='complete'?'complete':'incomplete';
+        const tocLabel=tocStatus==='complete'?'✓ COMPLETE':'✗ INCOMPLETE';
+        sumEl.innerHTML=`<span class="toc-status ${tocCls}">${tocLabel}</span><span class="stat ok">✓ ${s.passed||0}</span><span class="stat bad">✗ ${s.failed||0}</span><span class="stat warn">⊘ ${s.skipped||0}</span><span style="color:var(--muted);">of ${results.length} sections</span>`;
+        sumEl.style.display='block';
+      }
+
+      /* ─────────────────────────────────────────────────────
+         Content tab — report table render
+      ───────────────────────────────────────────────────── */
+      function renderReport(data) {
+        const summary=document.getElementById('summary'), out=document.getElementById('resultContent');
+        document.getElementById('downloadReportBtn').style.display = data.report_available?'inline-block':'none';
+        const s=data.summary||{total:0,passed:0,failed:0};
+        const refVal=(data.pdf_names||[]).join(', ')||'—';
+        const tocStatus=data.toc_status||s.toc_status||'unknown';
+        const tocCls=tocStatus==='complete'?'background:#dcfce7;color:#166534;':'background:#fee2e2;color:#991b1b;';
+        const tocLabel=tocStatus==='complete'?'✓ TOC Complete':'✗ TOC Incomplete';
+        summary.innerHTML =
+          `<span class="pill-summary" style="${tocCls}">${tocLabel}</span>` +
+          `<span class="pill-summary" style="background:#e2e8f0;color:#0b1220;">PDF: ${esc(refVal)}</span>` +
+          `<span class="pill-summary" style="background:#dcfce7;color:#166534;">${s.passed} passed</span>` +
+          `<span class="pill-summary" style="background:#fee2e2;color:#991b1b;">${s.failed} failed</span>` +
+          (s.skipped?`<span class="pill-summary" style="background:#fef9c3;color:#854d0e;">${s.skipped} skipped</span>`:'') +
+          `<span class="pill-summary" style="background:#e2e8f0;color:#0b1220;">${s.total} TOC sections</span>` +
+          (s.pages_crawled!=null?`<span class="pill-summary" style="background:#e2e8f0;color:#0b1220;">${s.pages_crawled} pages crawled</span>`:'');
+        const rows=(data.results||[]).map((r,i) => {
+          const status=r.status||'error', cov=(r.coverage_pct!=null)?r.coverage_pct+'%':'—';
+          let badgeCls=status, badgeLabel=status.toUpperCase();
+          if (r.on_site===false&&status!=='pass'){badgeCls='missing';badgeLabel='MISSING';}
+          let label=r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener" style="color:var(--primary-end);text-decoration:none;font-weight:600;">${esc(r.nav_item)}</a>`:
+            `${esc(r.nav_item)}${r.on_site===false?' <span style="color:#b45309;font-size:0.78rem;">(no site page)</span>':''}`;
+          if (r.note&&status!=='pass') label+=`<div style="font-size:0.75rem;color:var(--muted);margin-top:2.5px;">${esc(r.note)}</div>`;
+          const detail=r.error?`<span class="missing-text">${esc(r.error)}</span>`:
+            (r.missing_sample&&r.missing_sample.length?
+              `<span class="missing-text">${r.missing_count} missing: ${esc(r.missing_sample.join(' · '))}${(r.missing_count>r.missing_sample.length)?' …':''}</span>`:
+              `<span class="missing-text" style="color:#047857;">✓ All PDF content found on site</span>`);
+          return `<tr data-row-idx="${i}" data-status="${status}">
+            <td style="text-align:center;color:var(--muted);font-size:0.82rem;">${i+1}</td>
+            <td>${label}</td>
+            <td><span class="badge ${badgeCls}">${badgeLabel}</span></td>
+            <td style="text-align:center;">${cov}</td>
+            <td>${r.matched_words!=null?r.matched_words+' / '+r.site_words:(r.site_words!=null?r.site_words:'—')}</td>
+            <td>${detail}</td>
+          </tr>`;
+        }).join('');
+        out.innerHTML=`<table class="report"><thead><tr>
+          <th style="width:36px;">#</th><th>TOC Section</th><th style="width:80px;">Status</th>
+          <th style="width:90px;">Coverage</th><th>Covered / PDF Words</th><th>Missing content</th>
+        </tr></thead><tbody>${rows}</tbody></table>`;
+      }
+
+      document.getElementById('qaIndexBtn').addEventListener('click', () => {
+        document.getElementById('siteValidateForm').requestSubmit();
+      });
+
+      /* ─────────────────────────────────────────────────────
+         Style tab — run + progress + render
+      ───────────────────────────────────────────────────── */
+      let _stylePoller = null;
+
+      document.getElementById('styleDlBtn').addEventListener('click', e => {
+        downloadFile('/sites-validation/style/report', 'style_validation_report.pdf', e.currentTarget);
+      });
+
+      document.getElementById('styleForm').addEventListener('submit', async e => {
+        e.preventDefault();
+        const runBtn  = document.getElementById('styleRunBtn');
+        const dlBtn   = document.getElementById('styleDlBtn');
+        const progWrap= document.getElementById('styleProgress');
+        const progMsg = document.getElementById('styleProgressMsg');
+        const progPct = document.getElementById('styleProgressPct');
+        const progFill= document.getElementById('styleProgFill');
+        const results = document.getElementById('styleResults');
+
+        runBtn.disabled = true; runBtn.textContent = '⏳ Running…';
+        dlBtn.style.display = 'none';
+        progWrap.style.display = 'block';
+        progFill.style.width = '0%';
+        progMsg.textContent = 'Uploading PDFs…';
+        progPct.textContent = '';
+        results.style.display = 'none';
+        document.getElementById('styleMetrics').innerHTML =
+          '<div style="color:var(--muted);font-size:0.84rem;padding:12px 0;">Running…</div>';
+
+        const fd = new FormData(document.getElementById('styleForm'));
+        try {
+          const res = await fetch('/sites-validation/style/run', { method:'POST', body:fd });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'Failed to start style check.');
+        } catch (err) {
+          progMsg.textContent = 'Error: ' + err.message;
+          progFill.style.width = '0%'; runBtn.disabled = false; runBtn.textContent = '🎨 Run Style Check';
+          return;
+        }
+
+        // Poll progress
+        if (_stylePoller) clearInterval(_stylePoller);
+        _stylePoller = setInterval(async () => {
+          try {
+            const p = await (await fetch('/sites-validation/style/progress')).json();
+            const pct = Math.min(p.pct, 100);
+            progFill.style.width = pct + '%';
+            progPct.textContent  = pct + '%';
+            progMsg.textContent  = p.msg || 'Analysing…';
+
+            if (p.done) {
+              clearInterval(_stylePoller); _stylePoller = null;
+              runBtn.disabled = false; runBtn.textContent = '🎨 Run Style Check';
+              if (p.error) {
+                progMsg.textContent = '❌ Error: ' + p.error;
+              } else {
+                progMsg.textContent = '✅ Style check complete';
+                dlBtn.style.display = 'inline-block';
+                await loadStyleResults();
+              }
+            }
+          } catch (err) {
+            clearInterval(_stylePoller); _stylePoller = null;
+            progMsg.textContent = 'Polling error: ' + err.message;
+            runBtn.disabled = false; runBtn.textContent = '🎨 Run Style Check';
+          }
+        }, 800);
+      });
+
+      /* ─────────────────────────────────────────────────────
+         Style tab — load & render results from report PDF info
+         (We re-poll /progress which carries enough info;
+          for richer data we expose a /sites-validation/style/summary endpoint)
+      ───────────────────────────────────────────────────── */
+      async function loadStyleResults() {
+        // Fetch summary JSON for the last style run
+        try {
+          const res = await fetch('/sites-validation/style/summary');
+          if (!res.ok) { renderStyleFallback(); return; }
+          const data = await res.json();
+          renderStyleResults(data);
+        } catch (e) { renderStyleFallback(); }
+      }
+
+      function renderStyleFallback() {
+        const results = document.getElementById('styleResults');
+        results.style.display = 'block';
+        results.innerHTML = `<div class="notice" style="background:#f0fdf4;border-color:#bbf7d0;color:#166534;">
+          ✅ Style check complete. <b>Download the PDF report</b> above for the full breakdown (typography, heading line heights, image dimensions, spacing and more).
+        </div>`;
+        document.getElementById('styleMetrics').innerHTML =
+          '<div style="color:var(--muted);font-size:0.84rem;padding:12px 0;">Open the PDF report for detailed metrics.</div>';
+      }
+
+      function sevClass(s) {
+        return ({High:'sev-high',Medium:'sev-medium',Low:'sev-low',Info:'sev-info'}[s]||'sev-info');
+      }
+      function pctColor(pct) {
+        return pct >= 90 ? 'ok' : pct >= 70 ? 'warn' : 'bad';
+      }
+
+      function renderStyleResults(data) {
+        const results  = document.getElementById('styleResults');
+        const metricsEl= document.getElementById('styleMetrics');
+        results.style.display = 'block';
+
+        const overall  = data.overall_pct || 0;
+        const categories = data.categories || [];
+        const ovClass  = pctColor(overall);
+
+        // Overall ring
+        let html = `<div class="pass-ring-wrap">
+          <div>
+            <div class="pass-ring-val ${ovClass}">${overall}%</div>
+            <div class="pass-ring-label">Overall pass rate</div>
+          </div>
+          <div style="flex:1;">
+            <div style="font-size:0.85rem;color:#94a3b8;">
+              ${esc(data.prod_name||'')} <span style="opacity:.5;">vs</span> ${esc(data.stage_name||'')}
+            </div>
+            <div style="font-size:0.82rem;color:#64748b;margin-top:4px;">
+              ${data.total_checked||0} checks · ${data.total_issues||0} issues · ${data.total_passed||0} passed
+            </div>
+            <div style="font-size:0.82rem;margin-top:6px;">
+              <span style="color:#4ade80;">●</span> ${data.prod_pages||'?'} pages rendered &nbsp;
+              <span style="color:#fb923c;">●</span> ${data.prod_images||'?'} images checked &nbsp;
+              <span style="color:#a78bfa;">●</span> ${data.prod_headings||'?'} tables checked
+              ${data.stage_pages?` &nbsp;<span style="color:#f87171;">●</span> ${data.stage_pages} pages failed to render`:''}
+            </div>
+          </div>
+        </div>`;
+
+        // Category accordion
+        html += `<div class="style-results-grid">`;
+        categories.forEach((cat, ci) => {
+          const pct    = cat.pass_pct;
+          const pcls   = pctColor(pct);
+          const issues = cat.issues || [];
+          const n      = issues.length;
+          const status = n === 0 ? '<span class="badge pass">PASS</span>'
+                       : (cat.severity==='Info' ? '<span class="badge info">INFO</span>'
+                       : `<span class="badge fail">${n} issue${n>1?'s':''}</span>`);
+          html += `<div class="style-cat-card fade-in" style="animation-delay:${ci*30}ms">
+            <div class="style-cat-hdr" onclick="this.nextElementSibling.classList.toggle('open')">
+              <span class="cat-name">${esc(cat.name)}</span>
+              <span class="cat-badges">
+                ${status}
+                <span class="badge" style="background:${pct>=90?'#dcfce7':pct>=70?'#fef9c3':'#fee2e2'};color:${pct>=90?'#166534':pct>=70?'#854d0e':'#991b1b'};">${pct}%</span>
+                <span style="font-size:0.8rem;color:var(--muted);">${cat.checked} checked</span>
+                <span style="font-size:1rem;color:var(--muted);">›</span>
+              </span>
+            </div>
+            <div class="style-cat-body ${ci===0&&n>0?'open':''}">`;
+          if (n === 0) {
+            html += `<div style="padding:10px 0;font-size:0.84rem;color:var(--ok);">✓ No issues — STAGE matches PROD for this check.</div>`;
+          } else {
+            issues.slice(0,50).forEach(iss => {
+              const sc = sevClass(iss.severity||'Low');
+              html += `<div class="style-issue-row ${sc}">
+                <div class="style-issue-topic">${esc(iss.topic)}</div>
+                <div class="style-issue-pages">📄 Page(s): ${esc(iss.pages)} &nbsp;|&nbsp; <span class="badge ${sc}">${esc(iss.severity)}</span></div>
+                <div class="style-issue-detail">
+                  <b>Expected:</b> ${esc(iss.expected)}<br/>
+                  <b>Actual:</b> ${esc(iss.actual)}<br/>
+                  ${esc(iss.issue)}
+                </div>
+                <div class="style-issue-fix">💡 Fix: ${esc(iss.fix)}</div>
+              </div>`;
+            });
+            if (n > 50) html += `<div style="font-size:0.82rem;color:var(--muted);padding:6px 0;">… and ${n-50} more. See the PDF report for all issues.</div>`;
+          }
+          html += `</div></div>`;
+        });
+        html += `</div>`;
+        results.innerHTML = html;
+
+        // Sidebar metrics
+        let mHtml = '';
+        categories.forEach(cat => {
+          const pct  = cat.pass_pct;
+          const pcls = pctColor(pct);
+          mHtml += `<div class="metric-row">
+            <span class="metric-label">${esc(cat.name)}</span>
+            <span class="metric-val ${pcls}">${pct}%</span>
+          </div>`;
+        });
+        metricsEl.innerHTML = mHtml || '<div style="color:var(--muted);font-size:0.84rem;">No data.</div>';
+      }
+
+      /* init */
+      loadPdfs();
+      refreshSession();
+    </script>
+  </body>
+</html>
