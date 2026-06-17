@@ -786,12 +786,23 @@ def check_image_dimensions_and_alignment(sections, findings):
             
         for i, (pi, si) in enumerate(zip(pim, sim)):
             pw_val, sw_val = round(pi["rect"].width, 1), round(si["rect"].width, 1)
-            if abs(pw_val - sw_val) > 5.0 and (abs(pw_val - sw_val) / max(pw_val, 1)) > 0.10:
+            ph_val, sh_val = round(pi["rect"].height, 1), round(si["rect"].height, 1)
+            w_diff = abs(pw_val - sw_val)
+            h_diff = abs(ph_val - sh_val)
+            bad_w = w_diff > 5.0 and (w_diff / max(pw_val, 1)) > 0.10
+            bad_h = h_diff > 5.0 and (h_diff / max(ph_val, 1)) > 0.10
+            if bad_w or bad_h:
+                dim_note = []
+                if bad_w:
+                    dim_note.append(f"W: PROD {pw_val}pt → STAGE {sw_val}pt")
+                if bad_h:
+                    dim_note.append(f"H: PROD {ph_val}pt → STAGE {sh_val}pt")
                 findings.append(_f(
                     "Image dimension", "Medium", title, str(si["page"]),
-                    f"Image #{i+1} width ~{pw_val}pt", f"Image #{i+1} width ~{sw_val}pt",
-                    f"Image #{i+1} has a width of {sw_val}pt in STAGE vs {pw_val}pt in PROD.",
-                    f"Resize the image in STAGE to match PROD width of {pw_val}pt."))
+                    f"Image #{i+1} W:{pw_val}pt × H:{ph_val}pt",
+                    f"Image #{i+1} W:{sw_val}pt × H:{sh_val}pt",
+                    f"Image #{i+1} has dimension mismatch: " + "; ".join(dim_note) + ".",
+                    f"Resize the image in STAGE to match PROD W:{pw_val}pt × H:{ph_val}pt."))
             
             pa, sa = _align(pi["rect"], pi["pw"]), _align(si["rect"], si["pw"])
             pcx = (pi["rect"].x0 + pi["rect"].x1) / 2 / pi["pw"]
@@ -815,12 +826,23 @@ def check_icon_sizes_and_alignment(sections, findings):
             
         for i, (pi, si) in enumerate(zip(pim, sim)):
             pw_val, sw_val = round(pi["rect"].width, 1), round(si["rect"].width, 1)
-            if abs(pw_val - sw_val) > 3.0 and (abs(pw_val - sw_val) / max(pw_val, 1)) > 0.15:
+            ph_val, sh_val = round(pi["rect"].height, 1), round(si["rect"].height, 1)
+            w_diff = abs(pw_val - sw_val)
+            h_diff = abs(ph_val - sh_val)
+            bad_w = w_diff > 3.0 and (w_diff / max(pw_val, 1)) > 0.15
+            bad_h = h_diff > 3.0 and (h_diff / max(ph_val, 1)) > 0.15
+            if bad_w or bad_h:
+                dim_note = []
+                if bad_w:
+                    dim_note.append(f"W: PROD {pw_val}pt → STAGE {sw_val}pt")
+                if bad_h:
+                    dim_note.append(f"H: PROD {ph_val}pt → STAGE {sh_val}pt")
                 findings.append(_f(
                     "Icon size", "Medium", title, str(si["page"]),
-                    f"Icon #{i+1} width ~{pw_val}pt", f"Icon #{i+1} width ~{sw_val}pt",
-                    f"Icon #{i+1} has a width of {sw_val}pt in STAGE vs {pw_val}pt in PROD.",
-                    f"Resize the icon in STAGE to match PROD width of {pw_val}pt."))
+                    f"Icon #{i+1} W:{pw_val}pt × H:{ph_val}pt",
+                    f"Icon #{i+1} W:{sw_val}pt × H:{sh_val}pt",
+                    f"Icon #{i+1} has dimension mismatch: " + "; ".join(dim_note) + ".",
+                    f"Resize the icon in STAGE to match PROD W:{pw_val}pt × H:{ph_val}pt."))
             
             pa, sa = _align(pi["rect"], pi["pw"]), _align(si["rect"], si["pw"])
             pcx = (pi["rect"].x0 + pi["rect"].x1) / 2 / pi["pw"]
@@ -991,6 +1013,118 @@ def check_image_padding(sections, findings):
                 ", ".join(f"#{i+1}:L{sl}/R{sr}pt" for i, pl, sl, pr, sr, _ in mism[:4]),
                 f"{len(mism)} image(s) have different left/right padding (up to {worst}pt).",
                 "Adjust image margins to match PROD."))
+
+
+# ── Row-grouping helper (shared by layout consistency) ────────────────────────
+_ROW_Y_TOL = 15.0   # pt — images within this vertical distance are "same row"
+
+
+def _group_images_into_rows(images, min_dim=0.0):
+    """Group images into visual rows based on vertical proximity.
+
+    Returns a list of rows, where each row is a list of images sorted left-to-right.
+    Only images whose max(width, height) > min_dim are considered.
+    """
+    filtered = sorted(
+        [im for im in images if max(im["rect"].width, im["rect"].height) > min_dim],
+        key=lambda im: (im["page"], im["rect"].y0, im["rect"].x0),
+    )
+    if not filtered:
+        return []
+
+    rows = []
+    cur_row = [filtered[0]]
+    for im in filtered[1:]:
+        prev = cur_row[-1]
+        # Same page and within Y tolerance → same row
+        if im["page"] == prev["page"] and abs(im["rect"].y0 - prev["rect"].y0) <= _ROW_Y_TOL:
+            cur_row.append(im)
+        else:
+            rows.append(sorted(cur_row, key=lambda x: x["rect"].x0))
+            cur_row = [im]
+    if cur_row:
+        rows.append(sorted(cur_row, key=lambda x: x["rect"].x0))
+    return rows
+
+
+def check_image_layout_consistency(sections, findings):
+    """End-to-end image layout validation: if PROD has N images in a row,
+    STAGE must have N images in that same row. Also validates total image count
+    per section and detects missing/extra rows.
+
+    This covers:
+    - Image count mismatch per section (PROD 5 images, STAGE 3)
+    - Row structure mismatch (PROD has 3 images in row 2, STAGE has 2)
+    - Missing / extra image rows
+    """
+    for title, p_feat, s_feat in sections:
+        # Only consider real content images (>= 20pt, which catches both icons & figures)
+        p_rows = _group_images_into_rows(p_feat["images"], min_dim=20.0)
+        s_rows = _group_images_into_rows(s_feat["images"], min_dim=20.0)
+
+        p_total = sum(len(r) for r in p_rows)
+        s_total = sum(len(r) for r in s_rows)
+
+        # ── 1. Total image count mismatch per section ──
+        if p_total > 0 and s_total == 0:
+            findings.append(_f(
+                "Image layout", "High", title, "—",
+                f"{p_total} image(s) in {len(p_rows)} row(s)",
+                "0 images",
+                f"STAGE is missing all {p_total} image(s) that PROD has in this section.",
+                "Restore the missing images to match PROD layout."))
+            continue
+        if p_total == 0:
+            continue
+
+        if abs(p_total - s_total) > 0:
+            sev = "High" if abs(p_total - s_total) >= 2 else "Medium"
+            stage_pages = sorted({im["page"] for r in s_rows for im in r})
+            pg_str = ", ".join(str(p) for p in stage_pages[:6]) or "—"
+            findings.append(_f(
+                "Image layout", sev, title, pg_str,
+                f"{p_total} image(s)", f"{s_total} image(s)",
+                f"Image count mismatch: PROD has {p_total} image(s) but STAGE has {s_total}.",
+                "Add or remove images in STAGE to match the PROD count."))
+
+        # ── 2. Row-by-row comparison ──
+        # Only compare when both sides have rows
+        n_common = min(len(p_rows), len(s_rows))
+        for row_idx in range(n_common):
+            p_row = p_rows[row_idx]
+            s_row = s_rows[row_idx]
+            p_count = len(p_row)
+            s_count = len(s_row)
+
+            if p_count != s_count:
+                s_pg = s_row[0]["page"] if s_row else "—"
+                findings.append(_f(
+                    "Image layout", "Medium", title, str(s_pg),
+                    f"Row {row_idx+1}: {p_count} image(s)",
+                    f"Row {row_idx+1}: {s_count} image(s)",
+                    f"Image row {row_idx+1} has {p_count} image(s) in PROD but {s_count} in STAGE.",
+                    f"Adjust row {row_idx+1} in STAGE to have {p_count} image(s) matching PROD."))
+
+        # ── 3. Missing / extra rows ──
+        if len(p_rows) > len(s_rows):
+            for row_idx in range(len(s_rows), len(p_rows)):
+                p_row = p_rows[row_idx]
+                findings.append(_f(
+                    "Image layout", "High", title, "—",
+                    f"Row {row_idx+1}: {len(p_row)} image(s)",
+                    "Row missing",
+                    f"STAGE is missing image row {row_idx+1} (PROD has {len(p_row)} image(s) in this row).",
+                    f"Add image row {row_idx+1} to STAGE with {len(p_row)} image(s)."))
+        elif len(s_rows) > len(p_rows):
+            for row_idx in range(len(p_rows), len(s_rows)):
+                s_row = s_rows[row_idx]
+                s_pg = s_row[0]["page"] if s_row else "—"
+                findings.append(_f(
+                    "Image layout", "Medium", title, str(s_pg),
+                    "No such row in PROD",
+                    f"Row {row_idx+1}: {len(s_row)} extra image(s)",
+                    f"STAGE has an extra image row {row_idx+1} with {len(s_row)} image(s) not in PROD.",
+                    f"Remove the extra image row {row_idx+1} from STAGE or verify it is intentional."))
 
 
 def _pctl(vals, q):
@@ -1220,6 +1354,67 @@ def check_wrapped_text_padding(sections, findings):
             ))
 
 
+def check_table_cell_padding(s_all, findings):
+    """Flag table cells in STAGE that have improper padding (too close to cell borders)."""
+    # Group lines by page for fast lookup
+    lines_by_page = {}
+    for l in s_all.get("lines", []):
+        lines_by_page.setdefault(l["page"], []).append(l)
+
+    issues_by_page = {}
+    for tbl in s_all.get("tables", []):
+        pg = tbl["page"]
+        page_lines = lines_by_page.get(pg, [])
+        bad_cells = []
+        for idx, cell in enumerate(tbl.get("cells") or []):
+            if cell.width < 15 or cell.height < 10:
+                continue
+            cell_lines = []
+            for ln in page_lines:
+                r = ln["rect"]
+                cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+                if cell.x0 <= cx <= cell.x1 and cell.y0 <= cy <= cell.y1 and len(ln["text"].strip()) >= 2:
+                    cell_lines.append(ln)
+            if not cell_lines:
+                continue
+
+            # Calculate padding (distance from text bbox to cell borders)
+            lp = min(max(0.0, ln["rect"].x0 - cell.x0) for ln in cell_lines)
+            tp = min(max(0.0, ln["rect"].y0 - cell.y0) for ln in cell_lines)
+            bp = min(max(0.0, cell.y1 - ln["rect"].y1) for ln in cell_lines)
+
+            # Improper if padding is extremely small (< 2.5 pt left, < 2.0 pt top/bottom)
+            is_bad = False
+            reasons = []
+            if lp < 2.5:
+                is_bad = True
+                reasons.append(f"left ({round(lp, 1)}pt)")
+            if tp < 2.0:
+                is_bad = True
+                reasons.append(f"top ({round(tp, 1)}pt)")
+            if bp < 2.0:
+                is_bad = True
+                reasons.append(f"bottom ({round(bp, 1)}pt)")
+
+            if is_bad:
+                bad_cells.append((idx + 1, ", ".join(reasons)))
+
+        if bad_cells:
+            issues_by_page.setdefault(pg, []).extend(bad_cells)
+
+    for pg, bads in sorted(issues_by_page.items()):
+        preview = ", ".join(f"cell #{c} {r}" for c, r in bads[:4])
+        if len(bads) > 4:
+            preview += f" (+{len(bads)-4} more)"
+        findings.append(_f(
+            "Table cell padding", "Low", f"Table cells on page {pg}", str(pg),
+            "Proper cell padding (at least 3.0pt left, 2.0pt top/bottom)",
+            f"{len(bads)} cell(s) have improper padding: {preview}",
+            f"{len(bads)} table cell(s) on page {pg} have text too close to their border, causing poor readability.",
+            "Adjust cell padding in the table styles so that text has at least 3-4pt of breathing room from the cell edges."
+        ))
+
+
 def check_hyperlinks(sections, p_all, s_all, findings):
     # document-level URI comparison
     p_uris = {l["uri"] for l in p_all["links"] if l["kind"] == fitz.LINK_URI and l["uri"]}
@@ -1437,7 +1632,9 @@ def validate_style(prod_path, stage_path, mode="full"):
     check_icon_sizes_and_alignment(geo, findings)        # oversized / mis-aligned icons
     check_heading_below_spacing(geo, findings)      # too-small gap below an H1
     check_image_padding(geo, findings)
+    check_image_layout_consistency(sections, findings)  # row-by-row image count/arrangement
     check_table_layout(s_all, findings)             # table breaking across pages
+    check_table_cell_padding(s_all, findings)        # improper cell padding check
 
     # ── Typography / colour / link checks — AEM governs these. Skip for sites ─
     if not sites:
@@ -1499,9 +1696,10 @@ def validate_style(prod_path, stage_path, mode="full"):
 CATEGORY_ORDER = [
     "Encoding issue", "Typography spec",
     "Heading line height",
-    "Image dimension", "Icon size", "Image alignment", "Icon alignment", "Heading spacing below",
+    "Image dimension", "Icon size", "Image alignment", "Icon alignment",
+    "Image layout", "Heading spacing below",
     "Image padding", "Space above image", "Heading style", "Paragraph spacing",
-    "Text colour", "Info / notice colour", "Table layout breaking", "Wrapped text padding",
+    "Text colour", "Info / notice colour", "Table cell padding", "Table layout breaking", "Wrapped text padding",
     "Footer page number", "Bullet vs paragraph size", "Hyperlink issue",
 ]
 
@@ -1509,8 +1707,8 @@ CATEGORY_ORDER = [
 SITES_CATEGORY_ORDER = [
     "Heading line height", "Heading spacing below",
     "Image dimension", "Icon size", "Image alignment", "Icon alignment",
-    "Image padding", "Space above image", "Paragraph spacing",
-    "Table layout breaking",
+    "Image layout", "Image padding", "Space above image", "Paragraph spacing",
+    "Table cell padding", "Table layout breaking",
 ]
 
 SEV_COLOR = {"High": colors.HexColor("#c62828"),
