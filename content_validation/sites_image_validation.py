@@ -30,6 +30,8 @@ SITES_IMAGE_CATEGORY_ORDER = [
     "Typography spec",
     "Line height",
     "Image dimension",
+    "Image padding",
+    "Space above image",
     "Oversized image",
     "Image cut off",
     "Table breaking",
@@ -62,6 +64,11 @@ _PAGE_JS = r"""
     document.body;
   const mr = main.getBoundingClientRect();
   const docW = document.documentElement.clientWidth;
+
+    const px = (v) => {
+        const n = parseFloat(v);
+        return Number.isFinite(n) ? n : 0;
+    };
 
   const clippedBy = (el) => {
     // True if any ancestor hides overflow and the element pokes outside it.
@@ -97,9 +104,29 @@ _PAGE_JS = r"""
     return 'offset';
   };
 
+    // Nearest text block above an image (with horizontal overlap) gives
+    // practical "space above image" in rendered px.
+    const textRects = [...main.querySelectorAll('p, li, h1, h2, h3')]
+        .filter(e => (e.textContent || '').trim().length > 15)
+        .map(e => e.getBoundingClientRect());
+
+    const gapAboveImage = (r) => {
+        let best = null;
+        for (const tr of textRects) {
+            if (tr.bottom > r.top + 1) continue;
+            const overlap = Math.max(0, Math.min(r.right, tr.right) - Math.max(r.left, tr.left));
+            if (overlap < Math.min(80, r.width * 0.35)) continue;
+            const gap = r.top - tr.bottom;
+            if (best === null || gap < best) best = gap;
+        }
+        return best === null ? null : Math.round(best);
+    };
+
   const images = [...main.querySelectorAll('img')].map(img => {
     const r = img.getBoundingClientRect();
     const cs = getComputedStyle(img);
+        const leftGap = Math.max(0, r.left - mr.left);
+        const rightGap = Math.max(0, mr.right - r.right);
     return {
       alt: img.getAttribute('alt') || '',
       src: (img.currentSrc || img.src || '').split('/').pop(),
@@ -107,12 +134,19 @@ _PAGE_JS = r"""
       naturalW: img.naturalWidth || 0, naturalH: img.naturalHeight || 0,
       left: Math.round(r.left - mr.left),
       right: Math.round(r.right - mr.left),
+            gapLeft: Math.round(leftGap),
+            gapRight: Math.round(rightGap),
+            gapAbove: gapAboveImage(r),
       overflowsRight: r.right > mr.right + 2 || r.right > docW + 2,
       overflowsLeft: r.left < mr.left - 2,
       widerThanMain: r.width > mr.width + 2,
       clipped: clippedBy(img),
       display: cs.display, float: cs.cssFloat,
       marginAuto: cs.marginLeft === 'auto' && cs.marginRight === 'auto',
+            marginTop: Math.round(px(cs.marginTop)),
+            marginBottom: Math.round(px(cs.marginBottom)),
+            marginLeft: Math.round(px(cs.marginLeft)),
+            marginRight: Math.round(px(cs.marginRight)),
       align: imgAlign(img, r, cs),
     };
   }).filter(im => im.w >= 16 && im.h >= 16);
@@ -322,6 +356,80 @@ def _check_alignment(rendered, findings):
                 "Set the text alignment to left.",
             ))
 
+
+def _check_spacing_and_padding(rendered, findings):
+    """Rendered image spacing/padding checks: horizontal padding + vertical gap."""
+    for rec in rendered:
+        data = rec.get("data") or {}
+        imgs = data.get("images", [])
+        if not imgs:
+            continue
+
+        pad_flagged = False
+        gap_flagged = False
+
+        for im in imgs:
+            name = im.get("alt") or im.get("src") or "image"
+            align = im.get("align")
+            lg = im.get("gapLeft")
+            rg = im.get("gapRight")
+            ga = im.get("gapAbove")
+
+            # Horizontal padding expectations by alignment.
+            if not pad_flagged and align == "left" and lg is not None and lg > 24:
+                pad_flagged = True
+                findings.append(_f(
+                    "Image padding", "Low", name, rec["title"],
+                    "Left-aligned image starts near the content edge (<= 24px)",
+                    f"left gap {lg}px (right gap {rg}px)",
+                    f"Image “{name}” has extra left padding ({lg}px), so it does not align "
+                    f"with the content column.",
+                    "Reduce left margin/padding so the image aligns with the content edge.",
+                ))
+            elif not pad_flagged and align == "right" and rg is not None and rg > 24:
+                pad_flagged = True
+                findings.append(_f(
+                    "Image padding", "Low", name, rec["title"],
+                    "Right-aligned image ends near the content edge (<= 24px)",
+                    f"right gap {rg}px (left gap {lg}px)",
+                    f"Image “{name}” has extra right padding ({rg}px), so right alignment "
+                    f"looks offset from the content edge.",
+                    "Reduce right margin/padding so right alignment matches the content edge.",
+                ))
+            elif not pad_flagged and align == "center" and lg is not None and rg is not None and abs(lg - rg) > 24:
+                pad_flagged = True
+                findings.append(_f(
+                    "Image padding", "Low", name, rec["title"],
+                    "Centered image has similar left/right padding",
+                    f"left {lg}px vs right {rg}px",
+                    f"Image “{name}” is marked centered but has unbalanced side padding "
+                    f"({lg}px vs {rg}px).",
+                    "Balance left/right spacing or use consistent centering rules.",
+                ))
+
+            # Vertical spacing above images should not be too tight or too loose.
+            if not gap_flagged and ga is not None and (ga < 8 or ga > 120):
+                gap_flagged = True
+                findings.append(_f(
+                    "Space above image", "Low", name, rec["title"],
+                    "~8px to 120px from nearby text above",
+                    f"{ga}px above image",
+                    f"Image “{name}” has unusual top spacing ({ga}px) from the text above.",
+                    "Adjust top margin/padding above the image to keep spacing consistent.",
+                ))
+
+        # Page-level consistency: similar images should not have very uneven top spacing.
+        gaps = sorted(g for g in (im.get("gapAbove") for im in imgs) if isinstance(g, (int, float)))
+        if len(gaps) >= 2 and (gaps[-1] - gaps[0]) > 72:
+            findings.append(_f(
+                "Space above image", "Low", "Inconsistent image spacing", rec["title"],
+                "Consistent top spacing across images on the same page",
+                f"range {gaps[0]}px to {gaps[-1]}px",
+                f"Images on “{rec['title']}” have inconsistent vertical spacing above them "
+                f"({gaps[0]}–{gaps[-1]}px).",
+                "Use a consistent top spacing rule for image blocks on this page.",
+            ))
+
         # (b) Image alignment. Flag images that sit at an odd offset (neither
         #     flush-left to the column nor centred), and inconsistent alignment
         #     when a page mixes left/centre/right images.
@@ -443,6 +551,7 @@ def validate_site_vs_pdf(pdf_path, pages, auth_token, progress_cb=None):
     findings = []
     _check_typography(rendered, findings)
     _check_line_height(rendered, findings)
+    _check_spacing_and_padding(rendered, findings)
     _check_alignment(rendered, findings)
     _check_images(rendered, findings)
     _check_tables(rendered, findings)

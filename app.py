@@ -2296,6 +2296,8 @@ def sites_style_summary():
     pages_n = stats.get("pages_rendered", 0)
     base_checked = {
         "Image dimension":   stats.get("images_checked", 0),
+        "Image padding":     stats.get("images_checked", 0),
+        "Space above image": stats.get("images_checked", 0),
         "Oversized image":   stats.get("images_checked", 0),
         "Image cut off":     stats.get("images_checked", 0),
         "Image alignment":   stats.get("images_checked", 0),
