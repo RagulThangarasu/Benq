@@ -191,9 +191,15 @@
           <form id="validateForm" action="{{ url_for('validate') }}" method="post">
             <fieldset style="border:1px solid #e2e8f0; border-radius:16px; padding:18px;">
               <legend style="font-weight:700;">Mode</legend>
-              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="content" checked /> Content validation</label>
+              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="new" checked /> <strong>New</strong> validation &mdash; PDF &#8644; PDF comparison, issues only (content missing/extra, encoding &amp; garbling, figure labels read optically). Reported as HTML <em>and</em> PDF, every difference boxed on both pages.</label>
+              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="content_visual" /> <strong>Content + Visual</strong> &mdash; one pass, two lanes (content tree diff + layout/visual checks)</label>
+              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="content" /> Content validation</label>
               <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="style" /> Style validation</label>
               <label class="option" style="display:block;"><input type="radio" name="mode" value="both" /> Both (content + style)</label>
+              <label class="option" style="display:block; margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb;">
+                <input type="checkbox" name="html_report" id="html_report" value="1" />
+                <strong>Also produce an HTML report</strong> &mdash; applies to whichever mode is selected above. Opens in the browser; the PDF is downloaded as usual.
+              </label>
             </fieldset>
             <div class="actions cta" style="margin-top: 18px;">
               <button id="validateButton" type="submit" class="primary">Validate queue</button>
@@ -282,9 +288,26 @@
 
         filtered.forEach(item => {
           const tr = document.createElement('tr');
-          const prodPreview = (item.prod_files || []).slice(0,5).map(f => f.split('/').pop()).join(', ');
-          const stagePreview = (item.stage_files || []).slice(0,5).map(f => f.split('/').pop()).join(', ');
-          const filesCell = `PROD: ${prodPreview || '-'}<br/>STAGE: ${stagePreview || '-'}${(item.prod_files && item.prod_files.length>5) || (item.stage_files && item.stage_files.length>5) ? ' <span style="color:#6b7280; font-size:0.85rem;">(more...)</span>' : ''}`;
+          const esc = t => String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+          let filesCell;
+          if (item.file_pairs && item.file_pairs.length) {
+            // Show the pairing itself: which PROD file is compared with which
+            // STAGE file, and anything left over on either side.
+            const rows = item.file_pairs.map(fp =>
+              `<div style="margin:2px 0;">`
+              + `<span style="color:#6b7280; font-size:0.8rem;">PROD</span> <strong>${esc(fp.prod)}</strong>`
+              + ` <span style="color:#6b7280;">&rarr;</span> `
+              + `<span style="color:#6b7280; font-size:0.8rem;">STAGE</span> <strong>${esc(fp.stage)}</strong>`
+              + `</div>`).join('');
+            const left = (item.unpaired || []).length
+              ? `<div style="color:#b45309; margin-top:4px;">Not paired, will not be validated: ${(item.unpaired || []).map(esc).join(', ')}</div>`
+              : '';
+            filesCell = `<div style="color:#374151;">${item.file_pairs.length} file pair(s):</div>${rows}${left}`;
+          } else {
+            const prodPreview = (item.prod_files || []).slice(0,5).map(f => f.split('/').pop()).join(', ');
+            const stagePreview = (item.stage_files || []).slice(0,5).map(f => f.split('/').pop()).join(', ');
+            filesCell = `PROD: ${esc(prodPreview || '-')}<br/>STAGE: ${esc(stagePreview || '-')}${(item.prod_files && item.prod_files.length>5) || (item.stage_files && item.stage_files.length>5) ? ' <span style="color:#6b7280; font-size:0.85rem;">(more...)</span>' : ''}`;
+          }
           const checked = selectedIds.has(item.id) ? 'checked' : '';
           tr.innerHTML = `
             <td><input type="checkbox" class="queue-check" data-id="${item.id}" ${checked} /></td>
@@ -340,16 +363,23 @@
         setTimeout(() => { try { div.remove(); } catch (e) {} }, 8000);
       }
 
+      // Switching mode drops the selection as well as the caption. Resetting only
+      // the caption left the old files still attached to the hidden input, so the
+      // panel read "No files selected" while an append would still have sent them.
       prodMode.addEventListener('change', () => {
         const useFolder = prodMode.value === 'folder';
         prodFolderInput.style.display = useFolder ? 'block' : 'none';
         prodFileInput.style.display = useFolder ? 'none' : 'block';
+        prodFolderInput.value = '';
+        prodFileInput.value = '';
         prodPreview.textContent = 'No files selected.';
       });
       stageMode.addEventListener('change', () => {
         const useFolder = stageMode.value === 'folder';
         stageFolderInput.style.display = useFolder ? 'block' : 'none';
         stageFileInput.style.display = useFolder ? 'none' : 'block';
+        stageFolderInput.value = '';
+        stageFileInput.value = '';
         stagePreview.textContent = 'No files selected.';
       });
 
@@ -360,10 +390,14 @@
         return prodFiles && prodFiles.length > 0 && stageFiles && stageFiles.length > 0;
       }
 
+      // Auto-append fires on a change to either side, so picking PROD and then
+      // STAGE reaches it twice, and re-picking one side afterwards reaches it
+      // again — each time queueing the same pair over. It runs once per complete
+      // selection, and never while a previous append is still in flight.
+      let appendInFlight = false;
       function maybeAutoAppend() {
-        if (bothSidesHaveFiles()) {
-          appendPair();
-        }
+        if (appendInFlight || !bothSidesHaveFiles()) return;
+        appendPair();
       }
 
       prodFolderInput.addEventListener('change', maybeAutoAppend);
@@ -379,6 +413,8 @@
       });
 
       async function appendPair() {
+        if (appendInFlight) return;
+        appendInFlight = true;
         appendButton.disabled = true;
         appendButton.textContent = 'Appending...';
         const form = new FormData();
@@ -400,11 +436,20 @@
           }
           renderQueue(data.queue);
           showMessage('info', 'Folder pair appended');
-          // Keep the selected folder inputs populated until the user clears the queue
+          // The pair now lives in the queue, so the pickers go back to empty.
+          // Leaving them populated made the panel disagree with the queue and
+          // let the next change to either side append the same pair again.
+          prodFolderInput.value = '';
+          prodFileInput.value = '';
+          stageFolderInput.value = '';
+          stageFileInput.value = '';
+          prodPreview.textContent = 'No files selected.';
+          stagePreview.textContent = 'No files selected.';
         } catch (error) {
           showMessage('error', 'Unable to append folder pair: ' + error.message);
           console.error('Unable to append folder pair:', error);
         } finally {
+          appendInFlight = false;
           appendButton.disabled = false;
           appendButton.textContent = 'Append';
         }
@@ -468,11 +513,25 @@
       // Prevent validate if queue empty
       const validateForm = document.querySelector('form[action="{{ url_for('validate') }}"]');
       if (validateForm) {
+        const validateButton = document.getElementById('validateButton');
+        const modeInputs = validateForm.querySelectorAll('input[name="mode"]');
+        let validationSubmitting = false;
+        const updateValidationAction = () => {
+          const mode = validateForm.querySelector('input[name="mode"]:checked')?.value;
+          validateButton.textContent = mode === 'content_visual'
+            ? 'Extract + validate queue'
+            : 'Validate queue';
+        };
+        modeInputs.forEach(input => input.addEventListener('change', updateValidationAction));
+        updateValidationAction();
         validateForm.addEventListener('submit', async (ev) => {
           ev.preventDefault();
+          if (validationSubmitting) return;
+          validationSubmitting = true;
           const q = await fetchQueue();
           if (!q || q.length === 0) {
             alert('No appended folder pairs to validate. Please append folders first.');
+            validationSubmitting = false;
             return;
           }
           // Disable button and show progress
@@ -502,13 +561,14 @@
           let pollId = null;
           // Poll /progress until the background job reports finished; resolves
           // with the final progress object.
-          function pollUntilDone() {
+          function pollUntilDone(runId) {
             return new Promise((resolve) => {
               pollId = setInterval(async () => {
                 try {
                   const r = await fetch('/progress');
                   if (!r.ok) return;                // transient (e.g. cold start)
                   const p = await r.json();
+                  if (p.run_id !== runId) return;
                   const total = p.total || 0;
                   const completed = p.completed || 0;
                   const pct = (p.pct !== undefined && p.pct !== null)
@@ -536,8 +596,11 @@
             const formData = new FormData(validateForm);
             // 1) Kick off the job — returns immediately (work runs in background).
             const res = await fetch('/validate', { method: 'POST', body: formData });
+            let runId = null;
             if (res.status === 409) {
               // A run is already in progress — re-attach to it instead of erroring.
+              const running = await res.json();
+              runId = running.run_id;
               showMessage('info', 'A validation is already running — showing its progress.');
               progressLabel.textContent = 'resuming…';
             } else if (!res.ok) {
@@ -545,9 +608,12 @@
               try { const j = await res.json(); errMsg = j.error || errMsg; } catch (e) {}
               showMessage('error', errMsg);
               return;
+            } else {
+              const started = await res.json();
+              runId = started.run_id;
             }
             // 2) Watch progress until the job finishes.
-            const pfin = await pollUntilDone();
+            const pfin = await pollUntilDone(runId);
             if (pfin.cancelled || pfin.current === 'cancelled') {
               showMessage('info', 'Validation cancelled.');
               progressLabel.textContent = 'cancelled';
@@ -559,7 +625,7 @@
               return;
             }
             // 3) Download the finished report (PDF or ZIP).
-            const rr = await fetch('/result');
+            const rr = await fetch('/result?run_id=' + encodeURIComponent(runId));
             if (!rr.ok) {
               let em = 'No report was generated';
               try { const j = await rr.json(); em = (j.errors && j.errors.length) ? j.errors.join(' | ') : (j.error || em); } catch (e) {}
@@ -581,16 +647,19 @@
             }
             const entry = document.createElement('div');
             entry.className = 'notice';
-            entry.innerHTML = `<p><strong>Report ready:</strong> <a class="report-link" href="${url}" download="${filename}">${filename}</a></p>`;
+            const htmlUrl = '/result.html?run_id=' + encodeURIComponent(runId);
+            const openPage = pfin.html_ready
+              ? ` &nbsp;&middot;&nbsp; <a class="report-link" href="${htmlUrl}" target="_blank" rel="noopener">Open HTML report &#8599;</a>`
+              : '';
+            entry.innerHTML = `<p><strong>Report ready:</strong> <a class="report-link" href="${url}" download="${filename}">${filename}</a>${openPage}</p>`;
             dlArea.appendChild(entry);
-            const a = document.createElement('a');
-            a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
             progressLabel.textContent = 'done';
           } catch (err) {
             showMessage('error', 'Validation request failed: ' + err.message);
             console.error('Validation request failed:', err);
           } finally {
             if (pollId) { clearInterval(pollId); pollId = null; }
+            validationSubmitting = false;
             validateBtn.disabled = false;
             if (cancelBtn) { cancelBtn.style.display = 'none'; cancelBtn.disabled = false; cancelBtn.textContent = 'Cancel'; }
           }

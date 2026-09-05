@@ -6,6 +6,8 @@ _LOCAL_TESSDATA = os.path.join(_CUR_DIR, "tessdata")
 if os.path.isdir(_LOCAL_TESSDATA):
     os.environ["TESSDATA_PREFIX"] = _LOCAL_TESSDATA
 
+import collections
+import contextlib
 import gc
 import hashlib
 import json
@@ -19,13 +21,15 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_from_directory, send_file
+from flask import (Flask, Response, jsonify, render_template, request,
+                   send_from_directory, send_file)
 import tempfile
 import io
 from werkzeug.utils import secure_filename
 import sys
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import issue_shots as issue_shots_mod
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_FOLDER = BASE_DIR / "tmp_uploads"
@@ -36,14 +40,27 @@ ALLOWED_EXTENSIONS = {"pdf"}
 PROGRESS_FILE = REPORTS_DIR / "progress.json"
 # In-memory progress store to avoid writing progress to disk
 PROGRESS_STORE: dict = {"total": 0, "completed": 0, "current": None, "reports": [],
-                        "finished": True, "errors": [], "pct": 0}
+                        "finished": True, "errors": [], "pct": 0, "run_id": None}
 PROG_LOCK = threading.Lock()
 # background job control
 JOB_LOCK = threading.Lock()
 JOB_THREAD = None
 JOB_STARTED_AT = 0.0
 # finished report held in memory for /result download
-LAST_RESULT: dict = {"data": None, "name": None, "mime": None}
+LAST_RESULT: dict = {"data": None, "name": None, "mime": None, "run_id": None}
+# The PDF-to-PDF comparison renders the same findings twice. The PDF goes through
+# LAST_RESULT like every other report; the HTML is kept here so it can be opened
+# in the browser instead of downloaded, which is the whole point of having it.
+LAST_HTML: dict = {"data": None, "name": None, "run_id": None}
+WANT_HTML: bool = False
+_MODE_LABELS = {"new": "New validation", "compare": "PDF to PDF comparison",
+                "content": "Content validation", "style": "Style validation",
+                "content_visual": "Content + Visual"}
+# label -> the findings of every mode that ran on that pair, so the pair gets one
+# page rather than one per mode.
+HTML_ROWS: dict = {}
+PAIR_PATHS: dict = {}      # label -> (PROD file name, STAGE file name)
+MODES_RUN: set = set()
 # track running subprocesses for cancellation
 RUNNING_PROCS: list = []
 # cancellation flag
@@ -69,11 +86,32 @@ REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
 app.config["REPORTS_DIR"] = str(REPORTS_DIR)
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
+# A folder pair is uploaded in one request, and a product manual set runs to
+# well over 100 MB — the PROD folder alone is 109 MB. Past the cap Flask
+# aborts the upload with a 413 whose body is an HTML error page, which the
+# queue UI could only report as a JSON parse error.
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024  # 2 GB
 # Reflect code/template/asset edits live — no server restart needed.
 # Jinja templates re-read per request; static files aren't cached by the browser.
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
+
+@app.errorhandler(413)
+def _too_large(_exc):
+    """Answer an oversized upload as JSON, not as an HTML error page.
+
+    The queue page reads every reply with response.json(). Flask's default 413
+    body is HTML, so the browser reported the real cause — the upload was too
+    big — as "Unexpected token '<'", which says nothing about what went wrong.
+    """
+    cap_mb = app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
+    cap = (f"{cap_mb / 1024:.0f} GB" if cap_mb >= 1024 else f"{cap_mb:.0f} MB")
+    if request.path.startswith("/append_pair"):
+        return jsonify(error=(f"That folder pair is larger than the {cap} upload "
+                              f"limit. Append the folders in smaller batches, or "
+                              f"raise MAX_CONTENT_LENGTH.")), 413
+    return jsonify(error="Upload too large."), 413
 app.jinja_env.auto_reload = True
 
 # Make the content_validation package importable. The actual validation runs in
@@ -84,6 +122,7 @@ sys.path.insert(0, str(BASE_DIR / "content_validation"))
 try:
     from content_validation import style_validation  # noqa: F401
     from content_validation import validate_toc_content  # noqa: F401
+    from content_validation import findings_html  # noqa: F401
 except Exception as _imp_exc:  # pragma: no cover
     print(f"[startup] content_validation import warning: {_imp_exc}", flush=True)
 
@@ -147,7 +186,10 @@ def write_progress(data: dict) -> None:
 
 
 def read_progress() -> dict:
-    return dict(PROGRESS_STORE)
+    out = dict(PROGRESS_STORE)
+    out["html_ready"] = bool(LAST_HTML.get("data")
+                             and LAST_HTML.get("run_id") == out.get("run_id"))
+    return out
 
 
 @app.route("/progress", methods=["GET"])
@@ -193,24 +235,89 @@ def root_folders(files: list) -> list[str]:
     return sorted(roots)
 
 
+# A model code is a run of letters and digits carrying both: PD05U, PV3200U,
+# RM05, XL25X, NE001A. Version and revision stamps look the same but name a
+# build, not a product, so they are not identifiers.
+_MODEL_TOKEN_RE = re.compile(r"[A-Za-z]+\d+[A-Za-z0-9]*|\d+[A-Za-z]+[A-Za-z0-9]*")
+_VERSION_TOKEN_RE = re.compile(r"^(?:v|ver|rev|r)\d", re.I)
+
+
+def model_keys(name: str) -> set:
+    """Product codes in a file name.
+
+    The two sides name the same manual completely differently — "PD05U-en.pdf"
+    against "Monitor PD05U Series user manual (1).pdf" — so the model code is
+    the only part that identifies the product across both.
+    """
+    stem = Path(name).stem
+    keys = set()
+    for tok in _MODEL_TOKEN_RE.findall(stem):
+        if _VERSION_TOKEN_RE.match(tok):
+            continue                      # V1, V3, Rev2 — a build, not a product
+        keys.add(tok.upper())
+    return keys
+
+
 def pair_pdfs(prod_dir: Path, stage_dir: Path) -> list[tuple[Path, Path, str]]:
+    """[(prod_pdf, stage_pdf, label)] matched by the product each file names.
+
+    Pairing by sorted position was wrong whenever the two sides use different
+    naming conventions, which is the normal case: it lined "PD05U-en.pdf" up
+    against "BenQ Board NE001A_RE05E_UM user manual.pdf" and compared two
+    unrelated manuals. Files are matched on their model code instead, and a file
+    with no counterpart is left out rather than failing the whole folder pair.
+    """
     prod_pdfs = sorted(prod_dir.rglob("*.pdf"))
     stage_pdfs = sorted(stage_dir.rglob("*.pdf"))
     if not prod_pdfs or not stage_pdfs:
         raise ValueError("Each appended folder pair must contain at least one PDF file.")
     if len(prod_pdfs) == 1 and len(stage_pdfs) == 1:
         return [(prod_pdfs[0], stage_pdfs[0], "")]
+
+    def label_for(prod_pdf, stage_pdf):
+        return (f"{prod_pdf.relative_to(prod_dir)} vs "
+                f"{stage_pdf.relative_to(stage_dir)}")
+
+    stage_keys = [(sp, model_keys(sp.name)) for sp in stage_pdfs]
+    pairs, taken, unmatched = [], set(), []
+    for prod_pdf in prod_pdfs:
+        want = model_keys(prod_pdf.name)
+        best, best_score = None, 0
+        for stage_pdf, have in stage_keys:
+            if stage_pdf in taken or not want or not have:
+                continue
+            shared = want & have
+            if not shared:
+                continue
+            # The longest shared code wins: "PD06U" beats a chance overlap on a
+            # shorter token, so PD06U never pairs with PD05U.
+            score = max(len(k) for k in shared) * 100 + len(shared)
+            if score > best_score:
+                best, best_score = stage_pdf, score
+        if best is None:
+            unmatched.append(prod_pdf.name)
+            continue
+        taken.add(best)
+        pairs.append((prod_pdf, best, label_for(prod_pdf, best)))
+
+    if pairs:
+        for stage_pdf, _ in stage_keys:
+            if stage_pdf not in taken:
+                unmatched.append(stage_pdf.name)
+        if unmatched:
+            print(f"[pair] no counterpart, not validated: {', '.join(unmatched)}",
+                  flush=True)
+        return pairs
+
+    # Nothing carries a model code. Fall back to position, which is right only
+    # when both folders are ordered the same way and hold the same count.
     if len(prod_pdfs) == len(stage_pdfs):
-        return [
-            (
-                prod_pdfs[i],
-                stage_pdfs[i],
-                f"{prod_pdfs[i].relative_to(prod_dir)} vs {stage_pdfs[i].relative_to(stage_dir)}",
-            )
-            for i in range(len(prod_pdfs))
-        ]
+        return [(prod_pdfs[i], stage_pdfs[i], label_for(prod_pdfs[i], stage_pdfs[i]))
+                for i in range(len(prod_pdfs))]
     raise ValueError(
-        "Prod and Stage folder must each contain the same number of PDF files, or exactly one PDF each."
+        "No PROD file could be matched to a STAGE file. Name each pair after the "
+        "same product (a shared model code such as PD05U), or put the same number "
+        "of PDFs in both folders so they can be paired in order."
     )
 
 
@@ -275,6 +382,21 @@ def append_pair():
     prod_list = [str(p.relative_to(prod_dir)) for p in sorted(prod_dir.rglob("*.pdf"))]
     stage_list = [str(p.relative_to(stage_dir)) for p in sorted(stage_dir.rglob("*.pdf"))]
 
+    # Show which file will be compared with which, and which have no counterpart,
+    # at append time — the pairing is decided here, so it should be visible here
+    # rather than discovered from the reports afterwards.
+    try:
+        matched = pair_pdfs(prod_dir, stage_dir)
+    except ValueError:
+        matched = []
+    file_pairs = [{"prod": p.name, "stage": s.name} for p, s, _ in matched]
+    paired_prod = {p.name for p, _, _ in matched}
+    paired_stage = {s.name for _, s, _ in matched}
+    unpaired = ([f"PROD: {n}" for n in
+                 sorted({Path(f).name for f in prod_list} - paired_prod)]
+                + [f"STAGE: {n}" for n in
+                   sorted({Path(f).name for f in stage_list} - paired_stage)])
+
     label = build_pair_label(prod_files, stage_files)
     queue = load_queue()
     queue.append({
@@ -284,6 +406,9 @@ def append_pair():
         "stage_count": stage_count,
         "prod_files": prod_list[:12],
         "stage_files": stage_list[:12],
+        "file_pairs": file_pairs,
+        "pair_count": len(file_pairs),
+        "unpaired": unpaired,
         "created": datetime.now().isoformat(),
     })
     save_queue(queue)
@@ -309,7 +434,7 @@ def _safe_unlink(p):
         pass
 
 
-def _run_jobs(tasks):
+def _run_jobs(tasks, run_id):
     """Background-thread orchestrator. Dispatches to in-process (memory-light,
     free-tier safe) or parallel subprocesses (faster on bigger instances).
 
@@ -322,18 +447,80 @@ def _run_jobs(tasks):
     """
     produced = []
     try:
-        if MAX_PARALLEL <= 1:
+        if MAX_PARALLEL <= 1 or any(t[0] == "compare" for t in tasks):
             produced = _run_sequential_inproc(tasks)
         else:
             produced = _run_parallel_subprocess(tasks)
     finally:
-        _finalize_result([] if CANCELLED else produced)
         with PROG_LOCK:
-            PROGRESS_STORE["finished"] = True
-            PROGRESS_STORE["cancelled"] = bool(CANCELLED)
-            if not CANCELLED:
-                PROGRESS_STORE["pct"] = 100
-            PROGRESS_STORE["current"] = "cancelled" if CANCELLED else "done"
+            if PROGRESS_STORE.get("run_id") == run_id:
+                _finalize_result([] if CANCELLED else produced, run_id)
+                PROGRESS_STORE["finished"] = True
+                PROGRESS_STORE["cancelled"] = bool(CANCELLED)
+                if not CANCELLED:
+                    PROGRESS_STORE["pct"] = 100
+                PROGRESS_STORE["current"] = "cancelled" if CANCELLED else "done"
+
+
+@contextlib.contextmanager
+def _capture_toc_findings(store: dict):
+    """Record the finding lists validate_toc_content hands its report builder.
+
+    That validator returns nothing and writes a PDF; the findings exist only as
+    the keyword arguments of one call. Wrapping that call reads them without
+    touching a 4,800-line module that the other modes depend on.
+    """
+    original = validate_toc_content.generate_report
+
+    def recorder(*args, **kwargs):
+        store.update(kwargs)
+        names = ("prod_path", "stage_path", "toc_results", "content_results",
+                 "image_results", "icon_doc_summary", "report_path")
+        for name, value in zip(names, args):
+            store.setdefault(name, value)
+        return original(*args, **kwargs)
+
+    validate_toc_content.generate_report = recorder
+    try:
+        yield store
+    finally:
+        validate_toc_content.generate_report = original
+
+
+def _collect_rows(label: str, adapt) -> None:
+    """Pool one mode's findings for the run's HTML page.
+
+    The page is a convenience laid over a validation that has already produced
+    its PDF. An adapter that trips over an unexpected shape must cost the page
+    those rows, never the validation.
+    """
+    try:
+        HTML_ROWS.setdefault(label, []).extend(adapt())
+    except Exception as exc:
+        print(f"[html] could not read findings for '{label}': {exc}", flush=True)
+
+
+def _render_html(rows, label, prod_path, stage_path, mode_label) -> bytes:
+    """The findings of any mode, as a self-contained page."""
+    from content_validation import findings_html
+    tmp = tempfile.mkdtemp(prefix="html_report_")
+    try:
+        page = os.path.join(tmp, "report.html")
+        findings_html.render(rows, page, {
+            "name": label,
+            "title": f"{label} Validation Report",
+            "mode_label": mode_label,
+            "mode": mode_label,
+            "prod": str(prod_path),
+            "stage": str(stage_path),
+            "run": datetime.now().strftime("%Y-%m-%d"),
+        })
+        return open(page, "rb").read()
+    except Exception as exc:
+        print(f"[html] could not render the HTML report: {exc}", flush=True)
+        return b""
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _run_sequential_inproc(tasks):
@@ -356,15 +543,63 @@ def _run_sequential_inproc(tasks):
         tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
         tf.close()
         outpath = tf.name
+        artifact_dir = tempfile.mkdtemp(prefix="dual_markdown_") if mode_task == "content_visual" else None
+        compare_dir = tempfile.mkdtemp(prefix="pdf_compare_") if mode_task == "compare" else None
+        PAIR_PATHS[label] = (os.path.basename(str(prod_path)),
+                             os.path.basename(str(stage_path)))
+        MODES_RUN.add(_MODE_LABELS.get(mode_task, mode_task))
         try:
-            if mode_task == "style":
+            captured = {}
+            if mode_task == "compare":
+                # One comparison, two renderings. The PDF is returned through the
+                # normal path; the HTML travels with it and is served inline.
+                from content_validation import pdf_compare, compare_report
+                diffs, prod_doc, stage_doc, pmap = pdf_compare.compare(
+                    str(prod_path), str(stage_path),
+                    lambda pct, msg: cb(pct / 100.0, msg))
+                meta = {"name": label,
+                        "title": f"{label} Content Difference Report",
+                        "matched": sum(1 for v in pmap.values() if v[0]),
+                        "run": datetime.now().strftime("%Y-%m-%d")}
+                built = compare_report.build(diffs, prod_doc, stage_doc,
+                                             compare_dir, "report", meta)
+                shutil.copyfile(built["pdf"], outpath)
+                if WANT_HTML:
+                    _collect_rows(label, lambda: findings_html.from_compare(
+                        diffs, compare_report.evidence(diffs, prod_doc,
+                                                       stage_doc)))
+                cb(1.0, "done")
+            elif mode_task == "content_visual":
+                # Separate pipeline (content_validation/dual_*.py); the existing
+                # content and style validators are untouched by it.
+                from content_validation import dual_runner
+                dual_runner.set_progress_callback(cb)
+                dual_findings, _met = dual_runner.main(
+                    str(prod_path), str(stage_path), outpath, artifact_dir)
+                if WANT_HTML:
+                    _collect_rows(label,
+                                  lambda: findings_html.from_dual(dual_findings))
+            elif mode_task == "style":
                 style_validation.set_progress_callback(cb)
-                style_validation.main(str(prod_path), str(stage_path), outpath)
+                style_findings = style_validation.main(
+                    str(prod_path), str(stage_path), outpath)
+                if WANT_HTML:
+                    _collect_rows(label, lambda: findings_html.from_style(
+                        style_findings or []))
+            # "new" and "content" both run the consolidated content validator.
             else:
                 validate_toc_content.set_progress_callback(cb)
-                validate_toc_content.validate(str(prod_path), str(stage_path), outpath)
+                with _capture_toc_findings(captured):
+                    validate_toc_content.validate(str(prod_path), str(stage_path),
+                                                  outpath)
+                if WANT_HTML:
+                    _collect_rows(label,
+                                  lambda: findings_html.from_toc_kwargs(captured))
         except _Cancelled:
             _safe_unlink(outpath)
+            for scratch in (artifact_dir, compare_dir):
+                if scratch:
+                    shutil.rmtree(scratch, ignore_errors=True)
             break
         except Exception:
             tb = traceback.format_exc()
@@ -373,6 +608,9 @@ def _run_sequential_inproc(tasks):
             with PROG_LOCK:
                 PROGRESS_STORE["errors"].append(f"{mode_task} validation failed for '{label}': {last}")
             _safe_unlink(outpath)
+            for scratch in (artifact_dir, compare_dir):
+                if scratch:
+                    shutil.rmtree(scratch, ignore_errors=True)
             continue
         finally:
             style_validation.set_progress_callback(None)
@@ -385,7 +623,16 @@ def _run_sequential_inproc(tasks):
             data = b""
         _safe_unlink(outpath)
         if len(data) > 1024:
-            produced.append((label, mode_task, data))
+            markdown = {}
+            if compare_dir:
+                shutil.rmtree(compare_dir, ignore_errors=True)
+            if artifact_dir:
+                for name in ("PROD.md", "STAGE.md"):
+                    path = os.path.join(artifact_dir, name)
+                    if os.path.isfile(path):
+                        markdown[name] = open(path, "rb").read()
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+            produced.append((label, mode_task, data, markdown))
         with PROG_LOCK:
             PROGRESS_STORE["completed"] = i + 1
             PROGRESS_STORE["pct"] = int(round((i + 1) / n * 100)) if n else 100
@@ -416,14 +663,18 @@ def _run_parallel_subprocess(tasks):
     def run_one(i, mode_task, prod_path, stage_path, label):
         tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
         tf.close()
+        artifact_dir = tempfile.mkdtemp(prefix="dual_markdown_") if mode_task == "content_visual" else None
         errf = tempfile.NamedTemporaryFile(suffix=".log", delete=False, mode="w+")
         try:
             proc = subprocess.Popen(
                 [sys.executable, str(BASE_DIR / "run_validator.py"),
-                 mode_task, str(prod_path), str(stage_path), tf.name],
+                 mode_task, str(prod_path), str(stage_path), tf.name]
+                + ([artifact_dir] if artifact_dir else []),
                 stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1)
         except Exception as exc:
             errf.close(); _safe_unlink(errf.name); _safe_unlink(tf.name)
+            if artifact_dir:
+                shutil.rmtree(artifact_dir, ignore_errors=True)
             with flock:
                 PROGRESS_STORE["errors"].append(f"{mode_task} could not start for '{label}': {exc}")
             frac[i] = 1.0; refresh()
@@ -454,7 +705,14 @@ def _run_parallel_subprocess(tasks):
             data = b""
         _safe_unlink(tf.name)
         if rc == 0 and len(data) > 1024 and not CANCELLED:
-            slots[i] = (label, mode_task, data)
+            markdown = {}
+            if artifact_dir:
+                for name in ("PROD.md", "STAGE.md"):
+                    path = os.path.join(artifact_dir, name)
+                    if os.path.isfile(path):
+                        markdown[name] = open(path, "rb").read()
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+            slots[i] = (label, mode_task, data, markdown)
         elif not CANCELLED:
             msg = f"{mode_task} validation failed for '{label}' (exit code {rc})."
             if err:
@@ -462,6 +720,8 @@ def _run_parallel_subprocess(tasks):
             print(f"[validate] {msg}", flush=True)
             with flock:
                 PROGRESS_STORE["errors"].append(msg)
+            if artifact_dir:
+                shutil.rmtree(artifact_dir, ignore_errors=True)
         refresh()
 
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
@@ -478,56 +738,151 @@ def _clean_folder(name: str) -> str:
     return name or "report"
 
 
-def _finalize_result(produced):
-    """Build the download. Reports are organised into a zip with one folder per
-    PROD folder name, the report PDF(s) kept inside it:
+def _finalize_result(produced, run_id=None):
+    """Build the download as a SINGLE PDF report — never a zip.
 
-        <prod folder>/content_validation_report.pdf
-        <prod folder>/style_validation_report.pdf
-
-    A run that yields a single report is returned as a plain PDF.
+    A run can produce several reports (one per PROD folder, and one per mode
+    when mode="both"). They are concatenated, in run order, into one PDF so the
+    user always fetches exactly one file. Each report keeps its own pages; a
+    bookmark per report is added so the merged document stays navigable.
     """
-    # de-dup identical report bytes (e.g. duplicate uploads)
+    # Content + Visual returns its annotated PDF together with the two Markdown
+    # views produced from the same extraction pass.
+    # The HTML rendering is produced once for the whole run - every mode that
+    # ran, every pair that was queued - so there is always exactly one page to
+    # open, whatever was selected. The PDF path below is untouched.
+    if WANT_HTML and HTML_ROWS:
+        rows, labels = [], []
+        for label, found in HTML_ROWS.items():
+            labels.append(label)
+            for row in found:
+                if len(HTML_ROWS) > 1:
+                    row.detail = f"[{label}] {row.detail}".strip()
+                rows.append(row)
+        prod = ", ".join(sorted({p for p, _s in PAIR_PATHS.values()}))
+        stage = ", ".join(sorted({s for _p, s in PAIR_PATHS.values()}))
+        title = labels[0] if len(labels) == 1 else f"{len(labels)} pairs"
+        page = _render_html(rows, title, prod, stage,
+                            ", ".join(sorted(MODES_RUN)) or "Validation")
+        prefix = _clean_folder(labels[0]) if len(labels) == 1 else "validation"
+        LAST_HTML.update({"data": page or None, "run_id": run_id,
+                          "name": f"{prefix}_report.html" if page else None})
+
+    if any(len(item) > 3 and item[1] == "content_visual" for item in produced):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for folder, mode_task, data, markdown in produced:
+                prefix = _clean_folder(folder)
+                bundle.writestr(f"{prefix}/{prefix}_{mode_task}_validation_report.pdf", data)
+                for filename, contents in markdown.items():
+                    bundle.writestr(f"{prefix}/{filename}", contents)
+        LAST_RESULT.update({"data": archive.getvalue(), "mime": "application/zip",
+                    "name": f"content_visual_validation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    "run_id": run_id})
+        return
+
+    # de-dup identical reports (e.g. the same folder queued twice). Comparing
+    # raw bytes is not enough: every reportlab build stamps a fresh document ID
+    # and creation date, so two runs over the same pair of PDFs differ byte for
+    # byte while rendering identically. Hash the extracted page text instead,
+    # falling back to the bytes when the PDF cannot be read.
+    def _report_fingerprint(data):
+        try:
+            import fitz
+            doc = fitz.open(stream=data, filetype="pdf")
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+            if text.strip():
+                return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+        except Exception:
+            pass
+        return hashlib.sha256(data).hexdigest()
+
     seen, items = set(), []
-    for folder, mode_task, data in produced:
-        h = hashlib.sha256(data).hexdigest()
+    for item in produced:
+        folder, mode_task, data = item[:3]
+        h = (mode_task, _report_fingerprint(data))
         if h in seen:
             continue
         seen.add(h)
         items.append((folder, mode_task, data))
 
     if not items:
-        LAST_RESULT.update({"data": None, "name": None, "mime": None})
+        LAST_RESULT.update({"data": None, "name": None, "mime": None, "run_id": run_id})
         return
 
     if len(items) == 1:
         folder, mode_task, data = items[0]
         LAST_RESULT.update({"data": data, "mime": "application/pdf",
-                            "name": f"{_clean_folder(folder)}_{mode_task}_validation_report.pdf"})
+                    "name": f"{_clean_folder(folder)}_{mode_task}_validation_report.pdf",
+                    "run_id": run_id})
         return
 
-    zip_bio = io.BytesIO()
-    used = set()
-    with zipfile.ZipFile(zip_bio, "w", zipfile.ZIP_DEFLATED) as zf:
-        for folder, mode_task, data in items:
-            base = f"{_clean_folder(folder)}/{mode_task}_validation_report.pdf"
-            path, k = base, 2
-            while path in used:        # avoid collisions if a name repeats
-                root, ext = os.path.splitext(base)
-                path = f"{root}_{k}{ext}"
-                k += 1
-            used.add(path)
-            zf.writestr(path, data)
-    LAST_RESULT.update({
-        "data": zip_bio.getvalue(),
-        "name": f"validation_reports_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-        "mime": "application/zip"})
+    import fitz
+
+    def _merge(parts, folder):
+        """One PDF for one pair: its modes in run order, bookmarked."""
+        merged, toc = fitz.open(), []
+        for mode_task, data in parts:
+            try:
+                part = fitz.open(stream=data, filetype="pdf")
+            except Exception as exc:
+                print(f"[report] skipping unreadable {mode_task} report for "
+                      f"'{folder}': {exc}", flush=True)
+                continue
+            start_page = merged.page_count + 1        # 1-based for the bookmark
+            merged.insert_pdf(part)
+            part.close()
+            toc.append([1, f"{_clean_folder(folder)} — {mode_task}", start_page])
+        if merged.page_count == 0:
+            merged.close()
+            return None
+        if toc:
+            merged.set_toc(toc)
+        out = merged.tobytes(deflate=True, garbage=3)
+        merged.close()
+        return out
+
+    # Group by pair. A run over a folder pair validates each product separately,
+    # and a single stitched-together PDF cannot be handed to whoever owns one of
+    # them — so each pair gets its own report, and several pairs are delivered
+    # as a zip of those reports rather than as one document.
+    by_pair = collections.OrderedDict()
+    for folder, mode_task, data in items:
+        by_pair.setdefault(folder, []).append((mode_task, data))
+
+    reports = []
+    for folder, parts in by_pair.items():
+        data = _merge(parts, folder)
+        if data:
+            reports.append((folder, data))
+
+    if not reports:
+        LAST_RESULT.update({"data": None, "name": None, "mime": None, "run_id": run_id})
+        return
+
+    if len(reports) == 1:
+        folder, data = reports[0]
+        LAST_RESULT.update({"data": data, "mime": "application/pdf",
+                            "name": f"{_clean_folder(folder)}_validation_report.pdf",
+                            "run_id": run_id})
+        return
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for folder, data in reports:
+            prefix = _clean_folder(folder)
+            bundle.writestr(f"{prefix}_validation_report.pdf", data)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    LAST_RESULT.update({"data": archive.getvalue(), "mime": "application/zip",
+                        "name": f"validation_reports_{stamp}.zip",
+                        "run_id": run_id})
 
 
 @app.route("/validate", methods=["POST"])
 def validate():
     mode = request.form.get("mode")
-    if mode not in {"content", "style", "both"}:
+    if mode not in {"new", "content_visual", "compare", "content", "style", "both"}:
         return jsonify(error="Please select a validation mode."), 400
 
     queue = load_queue()
@@ -545,11 +900,12 @@ def validate():
             bundles = pair_pdfs(prod_dir, stage_dir)
             for index, (prod_path, stage_path, detail) in enumerate(bundles, start=1):
                 if len(bundles) > 1:
-                    # one report per product: name it after the PDF's immediate
-                    # folder (robust to any wrapper folders in the upload); fall
-                    # back to the filename if the PDFs sit flat in the upload.
-                    folder = Path(prod_path).parent.name
-                    label = folder if folder not in ("prod", "") else Path(prod_path).stem
+                    # One report per pair, named after the product. The PDFs of a
+                    # folder upload all share one parent directory, so naming a
+                    # report after that folder gave every pair in the upload the
+                    # same name and made the reports indistinguishable.
+                    codes = sorted(model_keys(Path(prod_path).name))
+                    label = "_".join(codes) if codes else Path(prod_path).stem
                 else:
                     label = item["label"]
                 bundles_list.append((prod_path, stage_path, label))
@@ -559,10 +915,31 @@ def validate():
     # Expand into per-mode tasks.
     tasks = []
     for (prod_path, stage_path, label) in bundles_list:
+        if mode == "new":
+            # New validation is both reports: the issue table it has always
+            # produced, and the PDF-to-PDF comparison that boxes each difference
+            # on both pages. They answer different questions and the merged PDF
+            # carries them in that order.
+            tasks.append(("new", prod_path, stage_path, label))
+            tasks.append(("compare", prod_path, stage_path, label))
+        if mode == "compare":
+            tasks.append(("compare", prod_path, stage_path, label))
+        if mode == "content_visual":
+            tasks.append(("content_visual", prod_path, stage_path, label))
+        if mode == "compare":
+            tasks.append(("compare", prod_path, stage_path, label))
         if mode in ("content", "both"):
             tasks.append(("content", prod_path, stage_path, label))
         if mode in ("style", "both"):
             tasks.append(("style", prod_path, stage_path, label))
+
+    # The HTML rendering is a property of the run, not of a mode: whatever was
+    # selected, the findings can also be written as a page.
+    global WANT_HTML
+    WANT_HTML = request.form.get("html_report") in ("1", "on", "true", "yes")
+    HTML_ROWS.clear()
+    PAIR_PATHS.clear()
+    MODES_RUN.clear()
 
     global JOB_THREAD, CANCELLED, JOB_STARTED_AT
     with JOB_LOCK:
@@ -573,24 +950,31 @@ def validate():
         if running and not stale:
             return jsonify(error="A validation run is already in progress. "
                                  "Use Cancel to stop it, or wait for it to finish.",
-                           in_progress=True), 409
+                           in_progress=True,
+                           run_id=PROGRESS_STORE.get("run_id")), 409
         # (a stale/orphaned thread is simply abandoned; the new run starts fresh)
         CANCELLED = False
         JOB_STARTED_AT = time.time()
-        LAST_RESULT.update({"data": None, "name": None, "mime": None})
+        run_id = uuid.uuid4().hex
+        LAST_RESULT.update({"data": None, "name": None, "mime": None, "run_id": None})
+        LAST_HTML.update({"data": None, "name": None, "run_id": None})
         with PROG_LOCK:
             PROGRESS_STORE.update({"total": len(tasks), "completed": 0,
                                    "current": "starting…", "reports": [],
-                                   "finished": False, "errors": [], "pct": 0})
-        JOB_THREAD = threading.Thread(target=_run_jobs, args=(tasks,), daemon=True)
+                                   "finished": False, "errors": [], "pct": 0,
+                                   "run_id": run_id})
+        JOB_THREAD = threading.Thread(target=_run_jobs, args=(tasks, run_id), daemon=True)
         JOB_THREAD.start()
 
     # Return immediately; the browser polls /progress, then GETs /result.
-    return jsonify(started=True, total=len(tasks))
+    return jsonify(started=True, total=len(tasks), run_id=run_id)
 
 
 @app.route("/result", methods=["GET"])
 def result():
+    requested_run_id = request.args.get("run_id")
+    if requested_run_id and requested_run_id != LAST_RESULT.get("run_id"):
+        return jsonify(error="The requested validation report is not ready yet."), 404
     data = LAST_RESULT.get("data")
     if not data:
         errs = (read_progress().get("errors") or [])
@@ -601,6 +985,18 @@ def result():
     bio.seek(0)
     return send_file(bio, mimetype=LAST_RESULT["mime"], as_attachment=True,
                      download_name=LAST_RESULT["name"])
+
+
+@app.route("/result.html", methods=["GET"])
+def result_html():
+    """The comparison report as a page, opened rather than downloaded."""
+    requested_run_id = request.args.get("run_id")
+    if requested_run_id and requested_run_id != LAST_HTML.get("run_id"):
+        return "The requested report is not ready yet.", 404
+    data = LAST_HTML.get("data")
+    if not data:
+        return "No HTML report is ready. Run a PDF \u21c4 PDF comparison first.", 404
+    return Response(data, mimetype="text/html; charset=utf-8")
 
 
 @app.route('/cancel', methods=['POST'])
@@ -942,16 +1338,32 @@ def guide_section(product: str, idx: int):
             coverage, missing = v._section_missing(prod_words, stage_ns, stage_cset, stage_full_lower)
             status = "pass" if not missing else "fail"
 
-    # Render the section's PROD pages + pull tables/image counts.
+    # Per-issue cropped screenshots — only rendered when there is an issue to
+    # show, so a passing section costs nothing.
+    issue_shots = []
+    if status == "fail" and missing:
+        try:
+            for sh in issue_shots_mod.build_section_shots(
+                    data["prod_path"], data.get("stage_path"), missing,
+                    page, title):
+                issue_shots.append({
+                    "fragment": sh["fragment"],
+                    "comment": sh["comment"],
+                    "prod_page": sh["prod_page"],
+                    "stage_page": sh["stage_page"],
+                    "prod_img": _png_uri(sh["prod_png"]),
+                    "stage_img": _png_uri(sh["stage_png"]),
+                })
+        except Exception as exc:
+            print(f"[guide] issue screenshots failed for {title}: {exc}", flush=True)
+
+    # Pull tables/image counts from the section's PROD pages.
     doc = fitz.open(data["prod_path"])
     last = (next_page - 1) if next_page and next_page > page else page
     last = min(last, page + 5)            # cap very long sections
-    page_imgs, tables, n_images = [], [], 0
+    tables, n_images = [], 0
     for pno in range(page, min(last, doc.page_count) + 1):
         pg = doc[pno - 1]
-        pix = pg.get_pixmap(matrix=fitz.Matrix(1.4, 1.4))
-        page_imgs.append("data:image/png;base64," +
-                         base64.b64encode(pix.tobytes("png")).decode())
         n_images += len(pg.get_images())
         try:
             for tb in pg.find_tables().tables:
@@ -967,8 +1379,14 @@ def guide_section(product: str, idx: int):
         status=status, coverage=coverage,
         missing=missing[:30],
         text=section_text[:8000],
-        page_images=page_imgs, image_count=n_images, tables=tables,
+        image_count=n_images, tables=tables, issue_shots=issue_shots,
     )
+
+
+def _png_uri(png: bytes | None) -> str | None:
+    """base64 data URI for a PNG blob, or None when there is no image."""
+    import base64
+    return ("data:image/png;base64," + base64.b64encode(png).decode()) if png else None
 
 
 # ── Q&A Index cache — holds the last validate-all result per product ────────
@@ -1192,6 +1610,73 @@ def guide_validate_vs_site(product: str):
     return jsonify(result)
 
 
+def _shot_flowables(gdata, row, esc, cell_style, miss_style, limit: int = 2):
+    """Side-by-side PROD/STAGE issue crops for one report section.
+
+    Kept to `limit` issues per section so a badly-regressed section cannot push
+    the report to hundreds of pages.  Returns [] when screenshots are
+    unavailable (site mode, missing PDFs, or nothing locatable on a page).
+    """
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Image, Paragraph, Spacer, Table, TableStyle, KeepTogether
+
+    if not gdata or not gdata.get("prod_path"):
+        return []
+    try:
+        shots = issue_shots_mod.build_section_shots(
+            gdata["prod_path"], gdata.get("stage_path"),
+            row.get("missing_sample") or [], row.get("page") or 1,
+            row.get("title") or "", limit=limit)
+    except Exception as exc:
+        print(f"[report] issue screenshots failed for {row.get('title')}: {exc}", flush=True)
+        return []
+    if not shots:
+        return []
+
+    cap = ParagraphStyle("shotcap", parent=cell_style, fontSize=7,
+                         leading=9, textColor=colors.HexColor("#64748b"))
+    note = ParagraphStyle("shotnote", parent=cell_style, fontSize=7.5, leading=10,
+                          textColor=colors.HexColor("#7c2d12"))
+    col_w = 4.6 * inch                      # landscape letter, two columns
+
+    def _img(png):
+        if not png:
+            return Paragraph("<i>No matching location in STAGE — the whole "
+                             "passage is absent.</i>", cap)
+        img = Image(io.BytesIO(png))
+        img.drawHeight = img.drawHeight * (col_w / img.drawWidth)
+        img.drawWidth = col_w
+        return img
+
+    out = [Spacer(1, 4)]
+    for sh in shots:
+        tbl = Table([
+            [Paragraph(f"<b>PROD p.{sh['prod_page']}</b> — missing content (red)", cap),
+             Paragraph(f"<b>STAGE{(' p.' + str(sh['stage_page'])) if sh['stage_page'] else ''}</b>"
+                       " — where it should be (amber)", cap)],
+            [_img(sh["prod_png"]), _img(sh["stage_png"])],
+        ], colWidths=[col_w + 6, col_w + 6])
+        tbl.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f8fafc")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        out.append(KeepTogether([Paragraph("Issue: " + esc(sh["comment"]), note),
+                                 Spacer(1, 3), tbl, Spacer(1, 8)]))
+    return out
+
+
+def is_site_state(state: dict) -> bool:
+    """A site-crawl result has no STAGE PDF, so it gets no screenshots."""
+    return "url" in state
+
+
 @app.route("/guide/qa-report/<path:product>", methods=["GET"])
 def guide_qa_report(product: str):
     """Generate and return a downloadable PDF report for the Q&A Index results."""
@@ -1205,7 +1690,12 @@ def guide_qa_report(product: str):
     from reportlab.lib.pagesizes import letter, landscape
     from reportlab.lib.units import inch
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, Image, KeepTogether)
+    from reportlab.lib.utils import ImageReader
+
+    # Issue screenshots need the source PDFs; the site variant has no STAGE PDF.
+    gdata = None if is_site_state(state) else _guide_data(state.get("product") or product)
 
     bio = io.BytesIO()
     doc = SimpleDocTemplate(bio, pagesize=landscape(letter),
@@ -1294,6 +1784,7 @@ def guide_qa_report(product: str):
                 f"<b>{r.get('missing_count', len(ms))} missing fragment(s):</b>", miss))
             for frag in ms:
                 story.append(Paragraph("• " + esc(frag), frag_s))
+            story += _shot_flowables(gdata, r, esc, cell, miss)
         elif status == "PASS":
             story.append(Paragraph("✓ All content present.", cell))
 

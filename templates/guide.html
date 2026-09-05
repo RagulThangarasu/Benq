@@ -48,6 +48,17 @@
       .pane { display:none; }
       .pane.active { display:block; }
       .page-img { width:100%; border:1px solid var(--border); border-radius:8px; margin-bottom:14px; box-shadow:0 4px 16px rgba(2,6,23,0.06); }
+      .shot { border:1px solid var(--border); border-radius:10px; margin-bottom:18px; overflow:hidden; background:#fff; }
+      .shot-comment { padding:10px 12px; font-size:0.86rem; line-height:1.45; background:#fff7ed; border-bottom:1px solid var(--border); color:#7c2d12; }
+      .shot-pair { display:grid; grid-template-columns:1fr 1fr; gap:0; }
+      @media (max-width:900px) { .shot-pair { grid-template-columns:1fr; } }
+      .shot-side { padding:10px; min-width:0; }
+      .shot-side + .shot-side { border-left:1px solid var(--border); }
+      .shot-label { font-size:0.72rem; font-weight:700; letter-spacing:.05em; text-transform:uppercase; margin-bottom:6px; color:var(--muted); }
+      .shot-label.prod { color:#b91c1c; }
+      .shot-label.stage { color:#c2570a; }
+      .shot-side img { width:100%; display:block; border:1px solid var(--border); border-radius:6px; }
+      .shot-none { font-size:0.82rem; color:var(--muted); padding:18px 8px; text-align:center; border:1px dashed var(--border); border-radius:6px; }
       table.tbl { border-collapse:collapse; width:100%; margin-bottom:16px; font-size:0.85rem; }
       table.tbl td, table.tbl th { border:1px solid var(--border); padding:6px 9px; text-align:left; }
       table.tbl tr:first-child td { background:#f1f5f9; font-weight:700; }
@@ -145,6 +156,26 @@
             <ul class="miss-list">${d.missing.map(m => `<li>${escapeHtml(m)}</li>`).join('')}</ul></div>`;
         }
 
+        const shotsHtml = (d.issue_shots || []).map(s => `
+          <div class="shot">
+            <div class="shot-comment"><b>Issue:</b> ${escapeHtml(s.comment)}</div>
+            <div class="shot-pair">
+              <div class="shot-side">
+                <div class="shot-label prod">PROD &middot; page ${s.prod_page} &middot; missing content</div>
+                <img src="${s.prod_img}" alt="PROD excerpt with the missing text highlighted" />
+              </div>
+              <div class="shot-side">
+                <div class="shot-label stage">STAGE ${s.stage_page ? '&middot; page ' + s.stage_page : ''}</div>
+                ${s.stage_img
+                  ? `<img src="${s.stage_img}" alt="STAGE excerpt showing where the content should be" />`
+                  : '<div class="shot-none">No matching location found in STAGE &mdash; the surrounding passage is absent too.</div>'}
+              </div>
+            </div>
+          </div>`).join('') ||
+          (d.status === 'fail'
+            ? '<div class="placeholder">Issues found, but none could be located on a page.</div>'
+            : '<div class="placeholder">No issues in this section.</div>');
+
         const tablesHtml = (d.tables || []).map(rows =>
           `<table class="tbl">${rows.map(row =>
             `<tr>${row.map(c => `<td>${escapeHtml(c)}</td>`).join('')}</tr>`).join('')}</table>`).join('');
@@ -156,12 +187,12 @@
             · <span class="count-pill">${(d.tables||[]).length} table(s)</span></div>
           ${missCard}
           <div class="tabs">
-            <div class="tab active" data-pane="rendered">Rendered (content + images + tables)</div>
+            <div class="tab active" data-pane="rendered">Issues (${(d.issue_shots||[]).length})</div>
             <div class="tab" data-pane="tables">Tables (${(d.tables||[]).length})</div>
             <div class="tab" data-pane="text">Text</div>
           </div>
           <div class="pane active" data-pane="rendered">
-            ${(d.page_images||[]).map(src => `<img class="page-img" src="${src}" />`).join('') || '<div class="placeholder">No rendered pages.</div>'}
+            ${shotsHtml}
           </div>
           <div class="pane" data-pane="tables">${tablesHtml || '<div class="placeholder">No tables detected in this section.</div>'}</div>
           <div class="pane" data-pane="text"><div class="card"><pre class="text">${escapeHtml(d.text || '(no text)')}</pre></div></div>
