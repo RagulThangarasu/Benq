@@ -1,8 +1,18 @@
+# Web app
 Flask>=2.0
 Werkzeug>=2.0
+gunicorn>=20.1
+Python-dotenv>=0.19.0
+
+# PDF reading, rendering and reporting
 PyMuPDF>=1.20
 reportlab>=3.6
 Pillow>=10.0
-gunicorn>=20.1
-Python-dotenv>=0.19.0
+
+# Artwork detection (figure regions) — imported by content_validation.dual_extract
+# and used by the visual lane. Headless build: no GUI libraries, no X11.
+opencv-python-headless>=4.8
+numpy>=1.24
+
+# Site validation lane only
 playwright>=1.40

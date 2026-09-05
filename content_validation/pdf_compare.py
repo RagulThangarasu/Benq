@@ -202,6 +202,31 @@ def _is_nav(page) -> bool:
     return trailing >= len(lines) * 0.5
 
 
+_QA_TITLE_RE = re.compile(r"q\s*&\s*a\s*index|qa index|faq index", re.I)
+
+
+def _front_matter_pages(doc) -> set:
+    """Page numbers of a Q&A / FAQ index called out in the PDF bookmarks.
+
+    It is a list of links to other sections, reworded per channel same as any
+    other navigation aid, so its wording is compared nowhere - same reasoning
+    validate_toc_content.py applies via SKIP_SECTIONS, expressed here as pages
+    rather than sections because this comparator has no notion of a section.
+    """
+    try:
+        toc = doc.get_toc()
+    except Exception:
+        toc = []
+    pages = set()
+    for idx, item in enumerate(toc):
+        if not _QA_TITLE_RE.search(item[1] or ""):
+            continue
+        start = item[2]
+        end = next((nxt[2] for nxt in toc[idx + 1:] if nxt[2] > start), start + 1)
+        pages.update(range(start, end))
+    return pages
+
+
 # ── the two documents, read once ─────────────────────────────────────────────
 @dataclass
 class Side:
@@ -214,6 +239,7 @@ class Side:
     figs: dict = field(default_factory=dict)      # page -> [fitz.Rect]
     fig_ocr: dict = field(default_factory=dict)   # (page, i) -> ocr text
     missing_langs: set = field(default_factory=set)   # traineddata this doc needs
+    page_missing: dict = field(default_factory=dict)  # page -> packs it needed
 
     @property
     def whole(self) -> str:
@@ -223,6 +249,8 @@ class Side:
 def load(tag: str, path: str) -> Side:
     doc = fitz.open(path)
     s = Side(tag=tag, path=path, doc=doc)
+    s.nav.add(1)                        # cover / title page - never content
+    s.nav |= _front_matter_pages(doc)   # Q&A / FAQ index - navigation, not content
     for i, page in enumerate(doc):
         text = page.get_text()
         s.pages.append(text)
@@ -367,10 +395,18 @@ def _cluster(rects: list, gap: float = 14.0) -> list:
     return out
 
 
-def read_figures(side: Side, pages=None) -> None:
-    """Populate `figs` and `fig_ocr` for the given pages (default: all)."""
-    todo = pages if pages is not None else range(1, side.doc.page_count + 1)
-    for pno in todo:
+def read_figures(side: Side, pages=None, on_page=None) -> None:
+    """Populate `figs` and `fig_ocr` for the given pages (default: all).
+
+    `on_page(done, total)` is called after each page. Reading every figure of a
+    manual optically is the longest phase of a comparison, and without this the
+    caller could only announce it once and then sit silent until it ended.
+    """
+    todo = list(pages if pages is not None else range(1, side.doc.page_count + 1))
+    total = len(todo)
+    for done, pno in enumerate(todo, 1):
+        if on_page:
+            on_page(done, total)
         if pno in side.figs or pno < 1 or pno > side.doc.page_count:
             continue
         page = side.doc[pno - 1]
@@ -379,6 +415,7 @@ def read_figures(side: Side, pages=None) -> None:
         lang, missing = ocr_langs_for(side.pages[pno - 1])
         if missing:
             side.missing_langs.update(missing)
+            side.page_missing[pno] = set(missing)
         for i, r in enumerate(rects):
             side.fig_ocr[(pno, i)] = _ocr(page, r, lang)
 
@@ -442,11 +479,11 @@ def _probe(line: str) -> list:
     return w[1:-1] if len(w) >= 4 else w
 
 
-def text_differences(prod: Side, stage: Side, pmap: dict) -> list:
+def text_differences(prod: Side, stage: Side, pmap: dict, on_page=None) -> list:
     """Wording present on one side and nowhere on the other."""
     out = []
     p_corpus, s_corpus = _corpus(prod), _corpus(stage)
-    s_art = _page_ocr_corpus(stage)
+    s_art = _page_ocr_corpus(stage, on_page=on_page)
     p_art = ""      # PROD is read exactly; only STAGE needs an optical pass
 
     def sweep(src: Side, corpus: str, artwork: str):
@@ -488,9 +525,9 @@ def text_differences(prod: Side, stage: Side, pmap: dict) -> list:
     return out
 
 
-def _page_ocr_corpus(side: Side) -> str:
+def _page_ocr_corpus(side: Side, on_page=None) -> str:
     """Flat OCR text of every figure on every page, read lazily and cached."""
-    read_figures(side)
+    read_figures(side, on_page=on_page)
     return " " + " ".join(w for t in side.fig_ocr.values()
                           for w in words(t)) + " "
 
@@ -604,7 +641,7 @@ def _stage_ink(stage: Side, spno: int, span: int = 1) -> str:
 
 
 def figure_differences(prod: Side, stage: Side, pmap: dict,
-                       already: set | None = None) -> list:
+                       already: set | None = None, on_page=None) -> list:
     """Lettering the PROD artwork carries and the STAGE artwork does not.
 
     PROD's labels are read exactly, as text - there is no reason to OCR a
@@ -619,6 +656,8 @@ def figure_differences(prod: Side, stage: Side, pmap: dict,
 
 
     for pno in range(1, prod.doc.page_count + 1):
+        if on_page:
+            on_page(pno, prod.doc.page_count)
         if pno in prod.nav:
             continue
         spno = paired(pmap, pno, confident=0.35)
@@ -637,8 +676,12 @@ def figure_differences(prod: Side, stage: Side, pmap: dict,
                        and w not in vocab and w not in already]
             if not missing:
                 continue
-            confident = (_read_well(stage, spno, doc_vocab)
-                         and not stage.missing_langs)
+            # A script this machine cannot OCR makes a negative read on THAT
+            # page meaningless. It says nothing about any other page.
+            near = set()
+            for q in range(max(1, spno - 1), min(stage.doc.page_count, spno + 1) + 1):
+                near |= stage.page_missing.get(q, set())
+            confident = _read_well(stage, spno, doc_vocab) and not near
             seen, shown, rects = set(), [], []
             for w, r in missing:
                 if w not in seen:
@@ -753,11 +796,22 @@ def compare(prod_path: str, stage_path: str, progress=None) -> tuple:
     stage = load("STAGE", stage_path)
     say(25, "Matching pages")
     pmap = map_pages(prod, stage)
+    # The two long phases report per page. Announcing a phase once and then
+    # working through a whole manual in silence left the bar frozen for minutes,
+    # which reads as a hung run rather than a slow one.
+    def span(lo, hi, what):
+        def on_page(done, total):
+            frac = done / total if total else 1.0
+            say(int(lo + (hi - lo) * frac), f"{what} — page {done} of {total}")
+        return on_page
+
     say(35, "Comparing wording")
-    diffs = text_differences(prod, stage, pmap)
+    diffs = text_differences(prod, stage, pmap,
+                             on_page=span(35, 55, "Reading STAGE artwork"))
     reported = {w for d in diffs for w in words(d.text)}
     say(55, "Reading artwork" + ("" if _HAS_OCR else " (OCR unavailable - skipped)"))
-    diffs += figure_differences(prod, stage, pmap, already=reported)
+    diffs += figure_differences(prod, stage, pmap, already=reported,
+                                on_page=span(55, 85, "Comparing artwork"))
 
     diffs = _pair(_group(diffs))
     order = {"high": 0, "medium": 1, "low": 2}

@@ -40,19 +40,35 @@ MAX_SHOT_PT = 190.0     # tallest evidence crop, in points, in the PDF
 # covers the scripts these manuals actually ship in, and fall back to Helvetica
 # only when the machine has none.
 _UNICODE_FONT_CANDIDATES = (
+    # macOS - covers every script these manuals ship in, including CJK.
     ("ArialUnicode", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
     ("ArialUnicode", "/Library/Fonts/Arial Unicode.ttf"),
-    ("DejaVuSans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    # Debian/Ubuntu, as installed by the Dockerfile and scripts/setup.sh.
+    # CJK first: it carries Latin, Cyrillic and Greek too, so one face covers
+    # the widest range and the report never mixes faces mid-sentence.
+    ("NotoSansCJK", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    ("NotoSansCJK", "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
     ("NotoSans", "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
-    ("NotoSans", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    ("DejaVuSans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    # Windows.
+    ("ArialUnicode", "C:/Windows/Fonts/ARIALUNI.TTF"),
+    ("SegoeUI", "C:/Windows/Fonts/segoeui.ttf"),
 )
 
 
 def _register_unicode_font():
-    """(regular, bold) font names that can print the scripts in these manuals."""
+    """(regular, bold) font names that can print the scripts in these manuals.
+
+    REPORT_FONT_PATH overrides the search, so a deployment with its own licensed
+    face does not have to patch this list.
+    """
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    for name, path in _UNICODE_FONT_CANDIDATES:
+    candidates = list(_UNICODE_FONT_CANDIDATES)
+    override = os.environ.get("REPORT_FONT_PATH")
+    if override:
+        candidates.insert(0, ("ReportFont", override))
+    for name, path in candidates:
         if not os.path.isfile(path):
             continue
         try:
@@ -119,6 +135,16 @@ def evidence(diffs, prod, stage) -> dict:
         s = crop(stage, d.stage_page, d.stage_rects) if d.stage_page else b""
         shots[d.did] = (p, s)
     return shots
+
+
+def coverage_note(stage) -> str:
+    """One line on what OCR could not read, for the reader of the report."""
+    missing = sorted(getattr(stage, "missing_langs", set()) or ())
+    if not missing:
+        return ""
+    return ("Artwork on some pages is written in a script this machine has no "
+            "OCR language pack for (" + ", ".join(missing) + "). Findings on "
+            "those pages are reported as questions, not verdicts.")
 
 
 def _counts(diffs) -> dict:
@@ -300,6 +326,9 @@ def write_html(diffs, prod, stage, shots, out_path: str, meta: dict) -> str:
             b.append("</div>")
         b.append("</div></article>")
 
+    note = coverage_note(stage)
+    if note:
+        b.append('<div class="note"><b>OCR coverage</b>%s</div>' % _e(note))
     b.append('<footer>%s &rarr; %s<br>Text layer: PyMuPDF &middot; '
              'Artwork: Tesseract OCR at %d dpi &middot; page mapping by token-set '
              'similarity across all %d &times; %d page pairs<br>'
@@ -401,6 +430,10 @@ def write_pdf(diffs, prod, stage, shots, out_path: str, meta: dict) -> str:
             "layer or inside the artwork.", st["body"]))
 
     F.append(Paragraph("HOW THE COMPARISON WAS MADE", st["sec"]))
+    note = coverage_note(stage)
+    if note:
+        F.append(Paragraph("<b>OCR coverage</b> &mdash; " + note, st["muted"]))
+        F.append(Spacer(1, 6))
     F.append(Paragraph(
         "Two passes that do not share a blind spot. The text pass reads the "
         "embedded text layer of both files. The image pass renders every artwork "

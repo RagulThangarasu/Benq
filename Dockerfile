@@ -1,10 +1,27 @@
 FROM python:3.11-slim
 
-# system deps
+# System dependencies.
+#
+# tesseract-ocr-all matters as much as the Python packages: the comparison reads
+# figure artwork optically, and a language pack that is not installed makes
+# tesseract exit on that page. An empty read is indistinguishable from "the
+# label is not there", so a missing pack turns into a false "label missing" for
+# every label on the page. Installing the full set means any localisation of a
+# manual validates without special-casing.
+#
+# The Noto and DejaVu fonts matter for the same reason at the other end: the PDF
+# report quotes the evidence verbatim, and a report that prints Cyrillic, Greek,
+# Hebrew, Arabic or CJK findings as black boxes is worse than no report.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
     libglib2.0-0 \
+    tesseract-ocr \
+    tesseract-ocr-all \
+    fonts-dejavu-core \
+    fonts-noto-core \
+    fonts-noto-cjk \
+    fonts-noto-extra \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,6 +32,10 @@ RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 
 # copy app
 COPY . /app
+
+# Fail the build rather than ship an image that silently cannot read half the
+# world's manuals.
+RUN python scripts/check_language_support.py --strict
 
 # use a non-root user
 RUN useradd --no-log-init -m appuser && chown -R appuser /app

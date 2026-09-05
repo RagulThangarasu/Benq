@@ -126,6 +126,37 @@ try:
 except Exception as _imp_exc:  # pragma: no cover
     print(f"[startup] content_validation import warning: {_imp_exc}", flush=True)
 
+
+def _report_language_coverage():
+    """Log what this machine can read and print. Never raises, never blocks.
+
+    A missing language pack does not stop a run; it downgrades findings on that
+    script to "needs a human look". Saying so at startup is the difference
+    between a known limitation and a mystery."""
+    try:
+        from content_validation import pdf_compare, compare_report
+        have = pdf_compare._LANGS_AVAILABLE
+        if not have:
+            print("[startup] Tesseract not found - figure artwork cannot be read. "
+                  "Run: bash scripts/setup.sh", flush=True)
+        else:
+            print(f"[startup] OCR languages: {len(have)} pack(s)", flush=True)
+            wanted = {"rus", "ell", "heb", "ara", "chi_sim", "chi_tra", "jpn",
+                      "kor", "tha", "deu", "fra", "spa", "por", "tur"}
+            gap = sorted(wanted - have)
+            if gap:
+                print(f"[startup] no pack for: {', '.join(gap)} - findings on "
+                      f"those scripts are reported as 'needs a human look'. "
+                      f"Run: bash scripts/setup.sh", flush=True)
+        if compare_report.FONT == "Helvetica":
+            print("[startup] no Unicode font found - non-Latin text in the PDF "
+                  "report will not render. Run: bash scripts/setup.sh", flush=True)
+    except Exception as exc:
+        print(f"[startup] language coverage check skipped: {exc}", flush=True)
+
+
+_report_language_coverage()
+
 # Free-tier memory is tight (~512 MB); each parallel job is a full PyMuPDF
 # subprocess. Cap concurrency via env so we don't OOM-kill the worker.
 MAX_PARALLEL = max(1, int(os.environ.get("VALIDATOR_MAX_PARALLEL", "1")))
@@ -888,6 +919,17 @@ def validate():
     queue = load_queue()
     if not queue:
         return jsonify(error="No appended folder pairs to validate."), 400
+
+    # Validate what the user ticked. The page tracks a selection and shows
+    # "N selected", but the run used the whole queue regardless — so a run over
+    # one ticked pair silently validated every queued pair as well.
+    wanted = [i for i in request.form.getlist("pair_ids") if i]
+    if wanted:
+        chosen = [item for item in queue if item.get("id") in set(wanted)]
+        if not chosen:
+            return jsonify(error="The selected folder pairs are no longer in the "
+                                 "queue. Refresh the page and try again."), 400
+        queue = chosen
 
     # Build (prod, stage, label) bundles from the queued folder pairs. The label
     # becomes the zip folder name, so each product PDF must be named after its own

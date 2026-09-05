@@ -594,6 +594,9 @@
 
           try {
             const formData = new FormData(validateForm);
+            // Send the ticked pairs so the run matches the "N selected" count.
+            // With none ticked, the server falls back to the whole queue.
+            selectedIds.forEach(id => formData.append('pair_ids', id));
             // 1) Kick off the job — returns immediately (work runs in background).
             const res = await fetch('/validate', { method: 'POST', body: formData });
             let runId = null;

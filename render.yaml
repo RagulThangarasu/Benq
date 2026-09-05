@@ -1,17 +1,22 @@
 services:
   - type: web
     name: benq-validator
-    env: python
+    # Docker, not the native Python environment. The native env can only run
+    # `pip install`, and this app needs system packages that pip cannot provide:
+    # Tesseract with every language pack (to read lettering baked into figure
+    # artwork) and Unicode fonts (to print that lettering back in the report).
+    # Without them non-English manuals validate in a degraded mode. The
+    # Dockerfile installs both and fails the build if either is missing.
+    env: docker
+    dockerfilePath: ./Dockerfile
     plan: free
     region: oregon
-    buildCommand: pip install -r requirements.txt
-    # 1 worker keeps the in-memory progress store shared; multiple THREADS let
-    # /progress polls be served while /validate runs a long job in another
-    # thread. A long --timeout stops gunicorn killing the worker mid-job.
-    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 600 --graceful-timeout 30 -b 0.0.0.0:$PORT
     healthCheckPath: /
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      # 1 worker keeps the in-memory progress store shared; the threads in the
+      # Dockerfile CMD let /progress polls be served while /validate runs a long
+      # job in another thread.
       - key: VALIDATOR_MAX_PARALLEL
         value: "1"

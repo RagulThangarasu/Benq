@@ -19,9 +19,57 @@ STAGE PDFs **and** validates a published AEM site against its source PDF.
     **alignment**. (Typography/colour governed by AEM are checked via the rendered styles.)
 - Docker-ready for cloud deployment
 
+## Quick start
+
+```bash
+bash scripts/setup.sh          # macOS (Homebrew)
+sudo bash scripts/setup.sh     # Debian / Ubuntu
+```
+
+One command. It installs the Python packages **and** the two system pieces that
+`pip` cannot provide — Tesseract with every language pack, and a Unicode font —
+then prints a coverage report. It is idempotent, so re-run it any time.
+
+Docker users need nothing: the image installs all of it and the build fails if
+anything is missing.
+
+```bash
+docker build -t benq-validator .
+docker run -p 10000:10000 benq-validator
+```
+
+To check an existing machine at any time:
+
+```bash
+python scripts/check_language_support.py            # report
+python scripts/check_language_support.py --strict   # exit 1 if degraded (CI)
+```
+
+## Language support
+
+Manuals ship in every market, so the validator is script-agnostic by design:
+
+- **Comparison** tokenises any script — Latin, Cyrillic, Greek, Hebrew, Arabic,
+  Thai, Chinese, Japanese, Korean. Chinese, Japanese, Korean and Thai are
+  segmented per character, because they are written without spaces and a whole
+  line would otherwise arrive as a single token.
+- **Artwork OCR** reads figure lettering in the languages the document is
+  actually written in, chosen from the Unicode blocks present on each page, and
+  requests only packs that are installed.
+- **Reports** register a Unicode font (Arial Unicode, Noto CJK or DejaVu), so
+  findings print in their own script instead of as black boxes. Override with
+  `REPORT_FONT_PATH=/path/to/font.ttf`.
+
+**Nothing errors when a pack is missing.** A run completes either way; findings
+on a page whose script has no pack are reported as *"needs a human look"* with
+both crops shown, rather than asserted as defects. The app logs the gap at
+startup and each report states it.
+
 ## Requirements
 - Python 3.11+
 - `pip`
+- Tesseract + language packs and a Unicode font — installed by `scripts/setup.sh`
+  or by the Dockerfile
 - PDFs for PROD/STAGE validation
 - For the **Sites Validation → Style** tab: Playwright + a Chromium build, and an
   authenticated AEM session (sign in from the Content tab header).
