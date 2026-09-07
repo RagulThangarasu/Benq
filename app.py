@@ -461,29 +461,38 @@ def append_pair():
         shutil.rmtree(pair_dir, ignore_errors=True)
         return jsonify(error=str(exc)), 400
 
-    prod_count = len(list(prod_dir.rglob("*.pdf")))
-    stage_count = len(list(stage_dir.rglob("*.pdf")))
-    if prod_count == 0 or stage_count == 0:
+    if not list(prod_dir.rglob("*.pdf")) or not list(stage_dir.rglob("*.pdf")):
         shutil.rmtree(pair_dir, ignore_errors=True)
         return jsonify(error="Selected folders must contain PDF files."), 400
-    # Collect a preview of files for UI display (store relative paths)
-    prod_list = [str(p.relative_to(prod_dir)) for p in sorted(prod_dir.rglob("*.pdf"))]
-    stage_list = [str(p.relative_to(stage_dir)) for p in sorted(stage_dir.rglob("*.pdf"))]
 
-    # Show which file will be compared with which, and which have no counterpart,
-    # at append time — the pairing is decided here, so it should be visible here
-    # rather than discovered from the reports afterwards.
+    # Decide the pairing now, and KEEP ONLY THE MATCHED FILES. A PROD or STAGE
+    # PDF with no counterpart is never validated, so storing it just clutters
+    # the queue and the disk — the uploaded files are dropped here so the queue
+    # item is exactly the set of pairs that will run.
     try:
         matched = pair_pdfs(prod_dir, stage_dir)
-    except ValueError:
-        matched = []
+    except ValueError as exc:
+        shutil.rmtree(pair_dir, ignore_errors=True)
+        return jsonify(error=str(exc)), 400
+    if not matched:
+        shutil.rmtree(pair_dir, ignore_errors=True)
+        return jsonify(error="No PROD file could be matched to a STAGE file. "
+                             "Nothing was added."), 400
+
+    keep = {p.resolve() for p, _s, _l in matched} | {
+        s.resolve() for _p, s, _l in matched}
+    dropped = []
+    for side, folder in (("PROD", prod_dir), ("STAGE", stage_dir)):
+        for pdf in sorted(folder.rglob("*.pdf")):
+            if pdf.resolve() not in keep:
+                dropped.append(f"{side}: {pdf.name}")
+                pdf.unlink()
+
+    prod_count = len(list(prod_dir.rglob("*.pdf")))
+    stage_count = len(list(stage_dir.rglob("*.pdf")))
+    prod_list = [str(p.relative_to(prod_dir)) for p in sorted(prod_dir.rglob("*.pdf"))]
+    stage_list = [str(p.relative_to(stage_dir)) for p in sorted(stage_dir.rglob("*.pdf"))]
     file_pairs = [{"prod": p.name, "stage": s.name} for p, s, _ in matched]
-    paired_prod = {p.name for p, _, _ in matched}
-    paired_stage = {s.name for _, s, _ in matched}
-    unpaired = ([f"PROD: {n}" for n in
-                 sorted({Path(f).name for f in prod_list} - paired_prod)]
-                + [f"STAGE: {n}" for n in
-                   sorted({Path(f).name for f in stage_list} - paired_stage)])
 
     label = build_pair_label(prod_files, stage_files)
     queue = load_queue()
@@ -496,11 +505,12 @@ def append_pair():
         "stage_files": stage_list[:12],
         "file_pairs": file_pairs,
         "pair_count": len(file_pairs),
-        "unpaired": unpaired,
+        "unpaired": [],
+        "dropped": dropped,
         "created": datetime.now().isoformat(),
     })
     save_queue(queue)
-    return jsonify(queue=queue)
+    return jsonify(queue=queue, dropped=dropped)
 
 
 @app.route("/clear_queue", methods=["POST"])
@@ -881,6 +891,11 @@ def _finalize_result(produced, run_id=None):
     if any(len(item) > 3 and item[1] == "content_visual" for item in produced):
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+            if len(produced) > 1:
+                summary_pdf = _consolidated_summary_pdf(
+                    [(folder, data) for folder, _m, data, _md in produced])
+                if summary_pdf:
+                    bundle.writestr("0_CONSOLIDATED_SUMMARY.pdf", summary_pdf)
             for folder, mode_task, data, markdown in produced:
                 prefix = _clean_folder(folder)
                 bundle.writestr(f"{prefix}/{prefix}_{mode_task}_validation_report.pdf", data)
@@ -980,6 +995,9 @@ def _finalize_result(produced, run_id=None):
 
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        summary_pdf = _consolidated_summary_pdf(reports)
+        if summary_pdf:
+            bundle.writestr("0_CONSOLIDATED_SUMMARY.pdf", summary_pdf)
         for folder, data in reports:
             prefix = _clean_folder(folder)
             bundle.writestr(f"{prefix}_validation_report.pdf", data)
@@ -987,6 +1005,116 @@ def _finalize_result(produced, run_id=None):
     LAST_RESULT.update({"data": archive.getvalue(), "mime": "application/zip",
                         "name": f"validation_reports_{stamp}.zip",
                         "run_id": run_id})
+
+
+_SUMMARY_TOC_RE = re.compile(
+    r"TOC / section status:\s*(PASS|FAIL)\s*[—-]\s*(\d+)\s*pass"
+    r".*?(\d+)\s*missing in STAGE.*?(\d+)\s*extra in STAGE"
+    r".*?(\d+)\s*level change", re.S)
+_SUMMARY_METRICS_RE = re.compile(
+    r"Metrics\s*[—-]\s*(\d+)\s*section\(s\) with content issues"
+    r".*?(\d+)\s*section\(s\) missing in STAGE"
+    r".*?(\d+)\s*content fragment\(s\) dropped"
+    r".*?(\d+)\s*issue\(s\) total", re.S)
+
+
+def _extract_report_summary(folder: str, data: bytes) -> dict:
+    """Best-effort key metrics scraped from an already-generated report PDF,
+    so the consolidated summary needs no changes to the validators themselves."""
+    row = {"product": folder, "toc_status": "-", "toc_pass": "-",
+          "toc_missing": "-", "toc_extra": "-",
+          "content_issues": "-", "content_dropped": "-",
+          "total_issues": "-", "verdict": "See report"}
+    try:
+        import fitz
+        doc = fitz.open(stream=data, filetype="pdf")
+        text = "\n".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        return row
+    m = _SUMMARY_TOC_RE.search(text)
+    if m:
+        row.update(toc_status=m.group(1), toc_pass=m.group(2),
+                   toc_missing=m.group(3), toc_extra=m.group(4))
+    m = _SUMMARY_METRICS_RE.search(text)
+    if m:
+        row.update(content_issues=m.group(1), content_dropped=m.group(3),
+                   total_issues=m.group(4))
+        row["verdict"] = "Pass" if m.group(4) == "0" else f"Fail — {m.group(4)} issue(s)"
+    elif row["toc_status"] != "-":
+        row["verdict"] = row["toc_status"].title()
+    return row
+
+
+def _consolidated_summary_pdf(reports) -> bytes | None:
+    """One-page-per-many-products overview: every product this run validated,
+    side by side, so a multi-product run doesn't require opening every
+    individual report just to see which ones need attention."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer,
+                                        Table, TableStyle)
+    except Exception:
+        return None
+
+    rows = [_extract_report_summary(folder, data) for folder, data in reports]
+    if not rows:
+        return None
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
+                            leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=14 * mm, bottomMargin=14 * mm,
+                            title="Consolidated Validation Summary")
+    styles = getSampleStyleSheet()
+    cell = ParagraphStyle("cell", parent=styles["Normal"], fontSize=8, leading=10)
+    story = [Paragraph("Consolidated Validation Summary", styles["Title"]),
+            Paragraph(f"{len(rows)} product(s) validated in this run — "
+                     f"{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                     styles["Normal"]),
+            Spacer(1, 8)]
+
+    n_pass = sum(1 for r in rows if r["verdict"] == "Pass")
+    story.append(Paragraph(
+        f"<b>{n_pass}/{len(rows)} passed</b> — the rest have issues; open that "
+        f"product's own report (in this zip) for the full detail.",
+        styles["Normal"]))
+    story.append(Spacer(1, 10))
+
+    head = ["Product", "TOC status", "TOC pass", "Missing in STAGE",
+           "Extra in STAGE", "Content issues", "Total issues", "Verdict"]
+    data_rows = [head]
+    for r in rows:
+        verdict_style = ("Pass" not in r["verdict"]) and colors.HexColor("#b71c1c") \
+            or colors.HexColor("#2e7d32")
+        data_rows.append([
+            Paragraph(r["product"], cell), r["toc_status"], r["toc_pass"],
+            r["toc_missing"], r["toc_extra"], r["content_issues"],
+            r["total_issues"], Paragraph(f"<font color='{verdict_style}'>"
+                                         f"<b>{r['verdict']}</b></font>", cell)])
+    table = Table(data_rows, repeatRows=1,
+                 colWidths=[70 * mm, 22 * mm, 20 * mm, 28 * mm, 24 * mm,
+                            26 * mm, 24 * mm, 40 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f2f2f")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#999999")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#f2f2f2")]),
+    ]))
+    story.append(table)
+    try:
+        doc.build(story)
+    except Exception as exc:
+        print(f"[summary] consolidated PDF build failed: {exc}", flush=True)
+        return None
+    return buf.getvalue()
 
 
 @app.route("/validate", methods=["POST"])

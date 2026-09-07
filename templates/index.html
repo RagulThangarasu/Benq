@@ -296,9 +296,11 @@
               + ` <span style="color:#6b7280;">&rarr;</span> `
               + `<span style="color:#6b7280; font-size:0.8rem;">STAGE</span> <strong>${esc(fp.stage)}</strong>`
               + `</div>`).join('');
-            const left = (item.unpaired || []).length
-              ? `<div style="color:#b45309; margin-top:4px;">Not paired, will not be validated: ${(item.unpaired || []).map(esc).join(', ')}</div>`
-              : '';
+            const left = (item.dropped || []).length
+              ? `<div style="color:#b45309; margin-top:4px;">Not a matching pair, not added: ${(item.dropped || []).map(esc).join(', ')}</div>`
+              : ((item.unpaired || []).length
+                ? `<div style="color:#b45309; margin-top:4px;">Not paired, will not be validated: ${(item.unpaired || []).map(esc).join(', ')}</div>`
+                : '');
             filesCell = `<div style="color:#374151;">${item.file_pairs.length} file pair(s):</div>${rows}${left}`;
           } else {
             const prodPreview = (item.prod_files || []).slice(0,5).map(f => f.split('/').pop()).join(', ');
@@ -432,7 +434,9 @@
             return;
           }
           renderQueue(data.queue);
-          showMessage('info', 'Folder pair appended');
+          showMessage('info', (data.dropped && data.dropped.length)
+            ? `Folder pair appended — only matching pairs added. Not added: ${data.dropped.join(', ')}`
+            : 'Folder pair appended');
           // The pair now lives in the queue, so the pickers go back to empty.
           // Leaving them populated made the panel disagree with the queue and
           // let the next change to either side append the same pair again.
