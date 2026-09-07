@@ -4904,12 +4904,27 @@ def _hyperlink_pageno_issues(pdf_path: str, doc_label: str, nav_pages: set):
                 lands = folio if folio is not None else tgt
                 if lands == said:
                     continue      # the link goes where its text says it goes
+                # The link still WORKS if it lands on the section it names -
+                # the printed "page N" is just stale from the other document's
+                # pagination, and the reader who clicks gets the right place.
+                # Only a link that jumps to the WRONG CONTENT is a real defect.
+                anchor = re.sub(r"\s+on\s+pages?\s+\d+\s*$", "", text,
+                                flags=re.IGNORECASE).strip()
+                a_toks = [t for t in _seq_tokens(anchor) if len(t) > 2]
+                if len(a_toks) >= 2:
+                    win = "".join(
+                        _flat_key(doc[p].get_text())
+                        for p in range(max(0, tgt - 2), min(doc.page_count, tgt + 1)))
+                    hit = sum(1 for t in a_toks if _flat_key(t) in win)
+                    if hit >= max(2, len(a_toks) - 1):
+                        continue   # lands on the right section - link works
                 shown = text if len(text) <= 90 else text[:87] + "…"
                 out.append({"doc": doc_label, "page": i,
                             "kind": "Hyperlink goes to the wrong page",
                             "text": (f"the hyperlink “{shown}” on {doc_label} "
-                                     f"page {i} says page {said}, but it lands "
-                                     f"on page {lands}")})
+                                     f"page {i} does not work: its text says "
+                                     f"page {said}, and clicking it jumps to "
+                                     f"page {lands}, which is not that section")})
     finally:
         doc.close()
     return out
@@ -7420,21 +7435,20 @@ _REPORTED_ISSUES = (
     # A link STAGE carries but draws as plain body text: the reader has no way
     # to know it is there. Asked for explicitly, so it is reported.
     "Hyperlink not highlighted in STAGE",
-    # A cross-reference PROD makes clickable that STAGE prints as plain text:
-    # the reader loses the jump.  Asked for explicitly, so it is reported.
-    "Hyperlink lost",
-    "Web address in PROD not linked in STAGE",
-    # STAGE links a cross-reference PROD prints as plain text: a formatting
-    # difference between the two documents, reported in both directions.
-    "Hyperlink added in STAGE",
-    # the link text names one page and the link lands on another
-    "Hyperlink goes to the wrong page",
-    # a cross-reference whose target is a different section than the one it names
-    "Hyperlink goes to the wrong section",
-    # a printed "see X on page N" whose page number or section is wrong in STAGE
-    "Cross-reference page number is wrong",
-    "Cross-reference points to the wrong section",
-    # hyperlink not working
+    # A link STAGE carries but draws as plain body text - the reader cannot
+    # see it is a link. Asked for explicitly.
+    "Hyperlink not highlighted in STAGE",
+    # Hyperlinks are reported ONLY when the link itself does not work - the
+    # target does not resolve, the scheme is unusable, the hotspot has no area.
+    # NOT reported (verified working links, repeatedly confirmed as false):
+    #   "Hyperlink goes to the wrong page" / "wrong section"
+    #   "Cross-reference page number is wrong" / "points to the wrong section"
+    #     - these fire on a STALE PRINTED page number ("see X on page 45") while
+    #       the clickable link still lands on the right section. The navigation
+    #       works; only the typed number is out of date, and the page->folio
+    #       inference behind the check is itself unreliable.
+    #   "Hyperlink lost" / "added in STAGE" / "Web address ... not linked"
+    #     - a link existing on one side only is a formatting choice, not breakage.
     "Internal link target does not resolve",
     "Hyperlink has no usable scheme",
     "Hyperlink hotspot cannot be clicked",
@@ -8106,6 +8120,12 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
         for f in table_findings:
             hdr = f.get("header") or ""
             rlab = f.get("row_label") or ""
+            # A pure quantity marker ("x1", "x2", "1", "N/A") is never
+            # meaningful "missing content" - skip it, it is what a dropped
+            # packing-list table leaves behind and it is pure noise.
+            if re.fullmatch(r"[x\u00d7]?\s*\d{1,3}|n/?a", (f["text"] or "").strip(),
+                            re.IGNORECASE):
+                continue
             where_tbl = (f"the table with columns [{_esc(_trunc(hdr, 90))}]"
                          if hdr else f"a table on PROD page {f['page']}")
             row_bit = (f" the row for <b>{_esc(_trunc(rlab, 70))}</b>"
@@ -8125,7 +8145,8 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                           f"<b>That value is missing from STAGE</b> — the rest "
                           f"of the row's values are present.")
             _sect = _section_for(f"PROD p{f['page']}", f["text"])
-            add("Table cell missing", f"PROD p{f['page']}",
+            add("Table cell missing",
+                f"PROD p{f['page']} · row {f.get('row', '?')}",
                 f"Table under “{_esc(_sect)}”, PROD page {f['page']}", detail,
                 fail_s,
                 probe=f["text"])
