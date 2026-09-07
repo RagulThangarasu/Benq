@@ -196,6 +196,7 @@ def _extract_page(page, pno, body_size):
             images.append({"page": pno, "rect": fitz.Rect(bb), "pw": pw, "ph": ph})
     for l in page.get_links():
         links.append({"page": pno, "kind": l.get("kind"), "uri": l.get("uri"),
+                      "file": l.get("file"),
                       "to_page": (l.get("page", -1) + 1) if l.get("kind") == fitz.LINK_GOTO else None,
                       "rect": fitz.Rect(l.get("from"))})
     # single get_drawings() pass yields underline strokes, bg fills, and a quick
@@ -1415,10 +1416,38 @@ def check_table_cell_padding(s_all, findings):
         ))
 
 
+_WEBLINK_RE = re.compile(r"^(?:https?://|www\.)|\.(?:com|net|org|io|gov|edu|cn|tw|hk|de|jp|co)\b", re.I)
+
+
+def _link_web_target(l: dict) -> str:
+    """The web address a link opens, whether stored as a proper URI or as a
+    file-launch action.
+
+    Some AEM exports write an external URL as a /Launch action instead of a
+    /URI. Common PDF viewers still open it in the browser, so a launch action
+    that carries a web address is a working external link — it must not be
+    reported as a missing hyperlink.
+    """
+    if l.get("kind") == fitz.LINK_URI:
+        return (l.get("uri") or "").strip()
+    if l.get("kind") == fitz.LINK_LAUNCH:
+        tgt = (l.get("file") or l.get("uri") or "").strip()
+        if _WEBLINK_RE.search(tgt):
+            return tgt
+    return ""
+
+
+def _norm_uri(u: str) -> str:
+    return re.sub(r"^(?:https?://)?(?:www\.)?", "",
+                  (u or "").strip().lower(), flags=re.I).rstrip("/")
+
+
 def check_hyperlinks(sections, p_all, s_all, findings):
-    # document-level URI comparison
-    p_uris = {l["uri"] for l in p_all["links"] if l["kind"] == fitz.LINK_URI and l["uri"]}
-    s_uris = {l["uri"] for l in s_all["links"] if l["kind"] == fitz.LINK_URI and l["uri"]}
+    # document-level URI comparison. A web link counts whether it is stored as a
+    # /URI or as a /Launch action, and matching ignores scheme / www / trailing
+    # slash so http://x and https://www.x/ are the same address.
+    p_uris = {_norm_uri(u) for u in (_link_web_target(l) for l in p_all["links"]) if u}
+    s_uris = {_norm_uri(u) for u in (_link_web_target(l) for l in s_all["links"]) if u}
     missing = p_uris - s_uris
     if missing:
         findings.append(_f(

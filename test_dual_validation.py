@@ -97,6 +97,22 @@ def test_figure_height_difference_is_reported():
     assert "height PROD 200.0 pt, STAGE 100.0 pt" in findings[0].detail
 
 
+def test_table_issue_labels_are_reported():
+    from content_validation import validate_toc_content as validator
+
+    for label in (
+        "Table columns differ",
+        "Table column layout differs",
+        "Table cell layout differs",
+        "Table layout broken",
+        "Table breaking the margins",
+        "Table continuation missing its header",
+        "Table heading missing",
+        "Table cell missing",
+    ):
+        assert validator._is_reported(label), f"{label} should be included in the report"
+
+
 # ── extraction ───────────────────────────────────────────────────────────────
 @needs_pdfs
 def test_extract_builds_both_views():

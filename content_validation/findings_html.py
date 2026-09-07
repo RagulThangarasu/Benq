@@ -92,8 +92,50 @@ _TOC_LISTS = {
     "italic_findings": "Emphasis difference", "figdiff_findings": "Figure difference",
     "pixel_findings": "Visual difference", "liststyle_findings": "List style",
     "tableshape_findings": "Table shape", "tablebreak_findings": "Table break",
-    "callgap_findings": "Callout numbering",
+    "tablecont_findings": "Table continuation header missing",
+    "tablemerge_findings": "Table cell layout difference",
+    "callgap_findings": "Image callout numbering",
+    "textalign_findings": "Text alignment",
+    "linkloss_findings": "Hyperlink difference",
+    "labelmerge_findings": "Paragraph alignment",
 }
+
+# The issue label each list carries, in the same vocabulary the PDF report's
+# _REPORTED_ISSUES scope uses. Without this the HTML report rendered every list
+# generate_report was handed, including the kinds the PDF deliberately leaves
+# out, so narrowing the PDF's scope had no effect here. Items that carry their
+# own "kind" (link, page-number, icon and encoding findings) use that instead.
+_ISSUE_FOR_LIST = {
+    "table_findings": "Table cell missing",
+    "heading_findings": "Table heading missing",
+    "label_findings": "Image label missing",
+    "bold_findings": "Bold lost",
+    "figure_findings": "Image missing",
+    "align_findings": "List alignment broken",
+    "italic_findings": "Italic lost",
+    "figdiff_findings": "Image not correctly updated",
+    "pixel_findings": "Image quality",
+    "liststyle_findings": "List marker changed",
+    "tableshape_findings": "Table column layout differs",
+    "tablebreak_findings": "Table layout broken",
+    "tablecont_findings": "Table continuation missing its header",
+    "tablemerge_findings": "Table cell layout differs",
+    "callgap_findings": "Diagram callout number missing",
+    "textalign_findings": "Text alignment changed",
+    "labelmerge_findings": "Paragraph merged with heading",
+}
+
+
+def _issue_label(key: str, item) -> str:
+    """The scope label for one finding — its own "kind" wins, else the list's."""
+    if isinstance(item, dict):
+        kind = (item.get("kind") or "").strip()
+        if kind:
+            return kind
+    if key == "linkloss_findings":
+        doc = item.get("doc") if isinstance(item, dict) else None
+        return "Hyperlink lost" if doc != "STAGE" else "Hyperlink added in STAGE"
+    return _ISSUE_FOR_LIST.get(key, "")
 
 
 def _page(value) -> int:
@@ -125,25 +167,67 @@ def _stringify(item) -> tuple:
 
 
 def from_toc_kwargs(captured: dict) -> list:
-    """The keyword lists generate_report() was called with -> Row."""
+    """The keyword lists generate_report() was called with -> Row.
+
+    Filtered through the same scope the PDF report uses, so both formats show
+    the same findings. A kind the PDF leaves out is left out here too.
+    """
+    from .validate_toc_content import _is_reported
+
     out = []
     for key, kind in _TOC_LISTS.items():
         for item in (captured.get(key) or []):
+            issue = _issue_label(key, item)
+            if not issue or not _is_reported(issue):
+                continue
             text, detail, pp, sp = _stringify(item)
             if not text.strip():
                 continue
-            out.append(Row(kind=kind, text=text[:400], detail=detail[:600],
-                           severity="high" if "missing" in kind.lower() else "medium",
+            out.append(Row(kind=issue, text=text[:400], detail=detail[:600],
+                           severity="high" if "missing" in issue.lower() else "medium",
                            prod_page=pp, stage_page=sp,
                            lane="image" if "figure" in kind.lower()
                                 or "image" in kind.lower() else "text"))
-    for key in ("content_results", "toc_results"):
-        for item in (captured.get(key) or []):
-            text, detail, pp, sp = _stringify(item)
-            if text.strip():
-                out.append(Row(kind="Content difference", text=text[:400],
-                               detail=detail[:600], severity="high",
-                               prod_page=pp, stage_page=sp))
+    # Section rows are not findings in themselves — only the fragments a section
+    # is actually missing are. Emitting one row per section listed every passing
+    # topic as a "Content difference".
+    for item in (captured.get("content_results") or []):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "")
+        for frag in (item.get("missing") or []):
+            if not str(frag).strip():
+                continue
+            out.append(Row(kind="Content missing", text=str(frag)[:400],
+                           detail=f"In PROD under “{title}”, absent from STAGE"[:600],
+                           severity="high",
+                           prod_page=_page(item.get("prod_page")),
+                           stage_page=_page(item.get("stage_page"))))
+    for item in (captured.get("toc_results") or []):
+        if not isinstance(item, dict):
+            continue
+        # A heading that survived the move but changed outline depth. Nothing
+        # else reports it: the text matches, so every content check passes.
+        if item.get("level_status") == "Changed":
+            out.append(Row(
+                kind="TOC level changed",
+                text=str(item.get("title") or "")[:400],
+                detail=(f"Outline depth L{item.get('prod_level')} in PROD, "
+                        f"L{item.get('stage_level')} in STAGE")[:600],
+                severity="medium",
+                prod_page=_page(item.get("prod_page")),
+                stage_page=_page(item.get("stage_page"))))
+        if item.get("toc_status") != "Missing in Stage":
+            continue
+        out.append(Row(kind="Content missing",
+                       text=str(item.get("title") or "")[:400],
+                       detail=(f"Topic present in PROD at outline level "
+                               f"L{item.get('prod_level')}, absent from STAGE"
+                               if isinstance(item.get("prod_level"), int)
+                               else "Topic present in PROD, absent from STAGE")[:600],
+                       severity="high",
+                       prod_page=_page(item.get("prod_page")),
+                       stage_page=_page(item.get("stage_page"))))
     return out
 
 

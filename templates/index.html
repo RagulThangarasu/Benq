@@ -191,15 +191,7 @@
           <form id="validateForm" action="{{ url_for('validate') }}" method="post">
             <fieldset style="border:1px solid #e2e8f0; border-radius:16px; padding:18px;">
               <legend style="font-weight:700;">Mode</legend>
-              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="new" checked /> <strong>New</strong> validation &mdash; PDF &#8644; PDF comparison, issues only (content missing/extra, encoding &amp; garbling, figure labels read optically). Reported as HTML <em>and</em> PDF, every difference boxed on both pages.</label>
-              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="content_visual" /> <strong>Content + Visual</strong> &mdash; one pass, two lanes (content tree diff + layout/visual checks)</label>
-              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="content" /> Content validation</label>
-              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="style" /> Style validation</label>
-              <label class="option" style="display:block;"><input type="radio" name="mode" value="both" /> Both (content + style)</label>
-              <label class="option" style="display:block; margin-top:12px; padding-top:12px; border-top:1px solid #e5e7eb;">
-                <input type="checkbox" name="html_report" id="html_report" value="1" />
-                <strong>Also produce an HTML report</strong> &mdash; applies to whichever mode is selected above. Opens in the browser; the PDF is downloaded as usual.
-              </label>
+              <label class="option" style="display:block; margin-bottom:6px;"><input type="radio" name="mode" value="new" checked /> <strong>New</strong> validation &mdash; one report per pair, issues only, grouped by kind: encoding, content, image, table, alignment. Each issue carries what it means and how to fix it, with a screenshot of the page that proves it.</label>
             </fieldset>
             <div class="actions cta" style="margin-top: 18px;">
               <button id="validateButton" type="submit" class="primary">Validate queue</button>
@@ -214,6 +206,11 @@
                 </div>
               </div>
               <div style="margin-top:8px; font-size:0.9rem; color:#334155;">Progress: <span id="progressText">0/0</span> — <span id="progressLabel">idle</span></div>
+              <div style="margin-top:8px; display:flex; align-items:center; justify-content:space-between;">
+                <span style="font-size:0.78rem; font-weight:700; color:#475569; letter-spacing:.03em;">RUN CONSOLE</span>
+                <label style="font-size:0.75rem; color:#64748b; cursor:pointer;"><input type="checkbox" id="logAutoscroll" checked style="vertical-align:middle;"> auto-scroll</label>
+              </div>
+              <pre id="runLog" style="margin-top:4px; background:#0b1220; color:#cbd5e1; font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; padding:10px 12px; border-radius:8px; height:190px; overflow:auto; white-space:pre-wrap; word-break:break-word;">waiting for run…</pre>
             </div>
 
           {% if error %}
@@ -557,6 +554,7 @@
           document.getElementById('progressPercent').textContent = '0%';
           progressText.textContent = '0/0';
           progressLabel.textContent = 'starting...';
+          document.getElementById('runLog').textContent = 'starting…';
 
           let pollId = null;
           // Poll /progress until the background job reports finished; resolves
@@ -578,6 +576,15 @@
                   document.getElementById('progressPercent').textContent = pct + '%';
                   progressText.textContent = `${completed}/${total}`;
                   progressLabel.textContent = p.current || 'working...';
+                  if (Array.isArray(p.log)) {
+                    const box = document.getElementById('runLog');
+                    const txt = p.log.join('\n');
+                    if (box.textContent !== txt) {
+                      const stick = document.getElementById('logAutoscroll').checked;
+                      box.textContent = txt || 'waiting for run…';
+                      if (stick) box.scrollTop = box.scrollHeight;
+                    }
+                  }
                   if (p.finished) {
                     progressBar.classList.remove('animated');
                     clearInterval(pollId); pollId = null;
@@ -689,10 +696,12 @@
           serverProductSelect.innerHTML = '<option disabled>No server products found</option>';
           return;
         }
+        products.sort((a, b) => Number(!!b.has_stage) - Number(!!a.has_stage)
+          || String(a.product).localeCompare(String(b.product)));
         serverProductSelect.innerHTML = products.map(p => {
-          const ok = !!p.zip_name;
-          const tag = ok ? p.source : 'no STAGE — can\'t validate';
-          return `<option value="${p.product}" ${ok ? '' : 'disabled'}>${p.product} (${tag})</option>`;
+          const ok = !!p.has_stage;
+          const label = p.pdf_name || p.product;
+          return `<option value="${p.product}" ${ok ? '' : 'disabled'}>${label}${ok ? '' : ' (no STAGE)'}</option>`;
         }).join('');
       }
 

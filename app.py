@@ -40,8 +40,51 @@ ALLOWED_EXTENSIONS = {"pdf"}
 PROGRESS_FILE = REPORTS_DIR / "progress.json"
 # In-memory progress store to avoid writing progress to disk
 PROGRESS_STORE: dict = {"total": 0, "completed": 0, "current": None, "reports": [],
-                        "finished": True, "errors": [], "pct": 0, "run_id": None}
+                        "finished": True, "errors": [], "pct": 0, "run_id": None,
+                        "log": []}
 PROG_LOCK = threading.Lock()
+_LOG_MAX = 500
+
+
+def _prog_log(msg) -> None:
+    """Append line(s) to the in-memory run console shown under the progress bar."""
+    if not msg:
+        return
+    stamp = datetime.now().strftime("%H:%M:%S")
+    with PROG_LOCK:
+        lg = PROGRESS_STORE.setdefault("log", [])
+        for part in str(msg).splitlines():
+            part = part.rstrip()
+            if not part.strip():
+                continue
+            if lg and lg[-1][10:] == part:      # collapse immediate repeats
+                continue
+            lg.append(f"{stamp}  {part}")
+        del lg[:-_LOG_MAX]
+
+
+class _TeeStdout:
+    """Write-through stdout wrapper that also feeds the run console."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def write(self, s):
+        try:
+            self._real.write(s)
+        except Exception:
+            pass
+        _prog_log(s)
+        return len(s)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 # background job control
 JOB_LOCK = threading.Lock()
 JOB_THREAD = None
@@ -68,6 +111,10 @@ CANCELLED = False
 
 # ── BenQ PDF download (AEM) — separate page / job ──
 BENQ_PDFS_DIR = BASE_DIR / "benq_pdfs"
+PROD_FILES_DIR = BASE_DIR / "PROD FIles"
+STAGE_FILES_DIR = BASE_DIR / "Stage files"
+PROD_PDF_ZIPS_DIR = BASE_DIR / "prod-pdf's"
+EXTRACTED_ZIP_PDFS_DIR = UPLOAD_FOLDER / "extracted_zip_pdfs"
 # Source "Final Cleanup files" tree (FM/ and INDD/ hold one zip per product).
 # Override with the BENQ_CLEANUP_DIR env var when the path differs.
 CLEANUP_DIR = Path(os.environ.get(
@@ -77,11 +124,21 @@ CLEANUP_DIR = Path(os.environ.get(
 DL_LOCK = threading.Lock()
 DL_THREAD = None
 DL_STORE: dict = {"running": False, "pct": 0, "current": None, "finished": True,
-                  "ok": 0, "total": 0, "rows": [], "error": None}
+                  "ok": 0, "total": 0, "rows": [], "error": None,
+                  "cancel": False, "cancelled": False, "languages": "en"}
+
+# ── BenQ HTML download (AEM Sites pages) — same page, its own job ──
+BENQ_HTML_DIR = BASE_DIR / "benq_html"
+HTML_DL_LOCK = threading.Lock()
+HTML_DL_THREAD = None
+HTML_DL_STORE: dict = {"running": False, "pct": 0, "current": None,
+                       "finished": True, "ok": 0, "total": 0, "rows": [],
+                       "error": None, "cancel": False, "cancelled": False}
 
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
 PAIRS_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+EXTRACTED_ZIP_PDFS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
@@ -491,6 +548,8 @@ def _run_jobs(tasks, run_id):
                 if not CANCELLED:
                     PROGRESS_STORE["pct"] = 100
                 PROGRESS_STORE["current"] = "cancelled" if CANCELLED else "done"
+        if PROGRESS_STORE.get("run_id") == run_id:
+            _prog_log("run cancelled." if CANCELLED else "run finished — report ready.")
 
 
 @contextlib.contextmanager
@@ -558,6 +617,15 @@ def _run_sequential_inproc(tasks):
     """Run tasks one at a time in this process (no subprocess, lowest memory)."""
     n = len(tasks)
     produced = []
+    _real_stdout = sys.stdout
+    sys.stdout = _TeeStdout(_real_stdout)     # mirror validator prints to the UI console
+    try:
+        return _run_sequential_inproc_body(tasks, n, produced)
+    finally:
+        sys.stdout = _real_stdout
+
+
+def _run_sequential_inproc_body(tasks, n, produced):
     for i, (mode_task, prod_path, stage_path, label) in enumerate(tasks):
         if CANCELLED:
             break
@@ -570,6 +638,8 @@ def _run_sequential_inproc(tasks):
                 PROGRESS_STORE["pct"] = int(round((_b + _s * frac) * 100))
                 PROGRESS_STORE["completed"] = _i + (1 if frac >= 1.0 else 0)
                 PROGRESS_STORE["current"] = (f"{_m}: {_l} — {msg}" if msg else f"{_m}: {_l}")
+            if msg:
+                _prog_log(f"[{int(round((_b + _s * frac) * 100)):3d}%] {_m}: {_l} — {msg}")
 
         tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
         tf.close()
@@ -697,11 +767,17 @@ def _run_parallel_subprocess(tasks):
         artifact_dir = tempfile.mkdtemp(prefix="dual_markdown_") if mode_task == "content_visual" else None
         errf = tempfile.NamedTemporaryFile(suffix=".log", delete=False, mode="w+")
         try:
+            # Fixed hash seed: several matchers break ties by dict/set iteration
+            # order, which Python otherwise randomises per process — without
+            # this, re-running the same PROD/STAGE pair can report a different
+            # set of findings each time.
+            child_env = dict(os.environ, PYTHONHASHSEED="0")
             proc = subprocess.Popen(
                 [sys.executable, str(BASE_DIR / "run_validator.py"),
                  mode_task, str(prod_path), str(stage_path), tf.name]
                 + ([artifact_dir] if artifact_dir else []),
-                stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1)
+                stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1,
+                env=child_env)
         except Exception as exc:
             errf.close(); _safe_unlink(errf.name); _safe_unlink(tf.name)
             if artifact_dir:
@@ -720,6 +796,9 @@ def _run_parallel_subprocess(tasks):
                 if m:
                     frac[i] = float(m.group(1))
                     refresh(f"{mode_task}: {label} — {m.group(2).strip()}")
+                clean = _PROG_RE.sub("", line).rstrip()
+                if clean.strip():
+                    _prog_log(f"{label}: {clean}")
         except Exception:
             pass
         proc.wait()
@@ -958,18 +1037,17 @@ def validate():
     tasks = []
     for (prod_path, stage_path, label) in bundles_list:
         if mode == "new":
-            # New validation is both reports: the issue table it has always
-            # produced, and the PDF-to-PDF comparison that boxes each difference
-            # on both pages. They answer different questions and the merged PDF
-            # carries them in that order.
+            # One report per pair. This used to append the PDF-to-PDF comparison
+            # as well, so the delivered file held two reports back to back and
+            # listed the same content differences twice, in two different
+            # styles. The comparison is its own mode for whoever wants it.
             tasks.append(("new", prod_path, stage_path, label))
-            tasks.append(("compare", prod_path, stage_path, label))
         if mode == "compare":
+            # Listed once. It appeared twice below, which queued every
+            # comparison job two times over.
             tasks.append(("compare", prod_path, stage_path, label))
         if mode == "content_visual":
             tasks.append(("content_visual", prod_path, stage_path, label))
-        if mode == "compare":
-            tasks.append(("compare", prod_path, stage_path, label))
         if mode in ("content", "both"):
             tasks.append(("content", prod_path, stage_path, label))
         if mode in ("style", "both"):
@@ -979,6 +1057,10 @@ def validate():
     # selected, the findings can also be written as a page.
     global WANT_HTML
     WANT_HTML = request.form.get("html_report") in ("1", "on", "true", "yes")
+    # AI cross-check toggle (checkbox in the UI). The validator reads this env
+    # var; setting it here makes both the in-process and subprocess runners obey.
+    _ai_on = request.form.get("ai_crosscheck") in ("1", "on", "true", "yes")
+    os.environ["VALIDATOR_AI_CROSSCHECK"] = "1" if _ai_on else "0"
     HTML_ROWS.clear()
     PAIR_PATHS.clear()
     MODES_RUN.clear()
@@ -1004,7 +1086,9 @@ def validate():
             PROGRESS_STORE.update({"total": len(tasks), "completed": 0,
                                    "current": "starting…", "reports": [],
                                    "finished": False, "errors": [], "pct": 0,
-                                   "run_id": run_id})
+                                   "run_id": run_id, "log": []})
+        _prog_log(f"run started — {len(tasks)} task(s): "
+                  + ", ".join(sorted({t[0] for t in tasks})))
         JOB_THREAD = threading.Thread(target=_run_jobs, args=(tasks, run_id), daemon=True)
         JOB_THREAD.start()
 
@@ -1070,7 +1154,7 @@ def download_page():
     return render_template("download.html")
 
 
-def _run_download():
+def _run_download(languages: str):
     """Background worker: pull the latest BenQ PDFs and record progress."""
     sys.path.insert(0, str(BASE_DIR))
     try:
@@ -1083,17 +1167,32 @@ def _run_download():
                 DL_STORE["pct"] = int(round(frac * 100))
                 DL_STORE["current"] = msg
 
-        res = dl.download_all(progress_cb=cb)
+        def cancelled():
+            with DL_LOCK:
+                return bool(DL_STORE.get("cancel"))
+
+        res = dl.download_all(progress_cb=cb, should_cancel=cancelled,
+                      languages=languages)
+        stopped = res.get("cancelled")
         with DL_LOCK:
             DL_STORE.update({"ok": res["ok"], "total": res["total"],
                              "rows": res["rows"], "pct": 100,
-                             "current": f"Downloaded {res['ok']}/{res['total']}"})
+                             "cancelled": bool(stopped),
+                             "current": f"Downloaded {res['ok']}/{res['total']}"
+                                        + (" — cancelled" if stopped else "")})
     except Exception as exc:
         tb = traceback.format_exc()
         print(f"[download] failed:\n{tb}", flush=True)
-        last = tb.strip().splitlines()[-1] if tb.strip() else str(exc)
+        # A connectivity failure already explains itself; only fall back to the
+        # traceback's last line when the error carries no message of its own.
+        # "urllib.error.URLError: <urlopen error timed out>" told the user
+        # nothing about which host was tried or what to do about it.
+        message = str(exc).strip()
+        if not message:
+            message = (tb.strip().splitlines()[-1] if tb.strip()
+                       else exc.__class__.__name__)
         with DL_LOCK:
-            DL_STORE["error"] = last
+            DL_STORE["error"] = message
             DL_STORE["current"] = "failed"
     finally:
         with DL_LOCK:
@@ -1104,13 +1203,18 @@ def _run_download():
 @app.route("/download/start", methods=["POST"])
 def download_start():
     global DL_THREAD
+    payload = request.get_json(silent=True) or request.form
+    languages = str(payload.get("languages", "en")).strip().lower() or "en"
+    if languages != "*" and not re.fullmatch(r"[a-z]{2}(?:-[a-z]{2,3})?(?:\s*,\s*[a-z]{2}(?:-[a-z]{2,3})?)*", languages):
+        return jsonify(error="Invalid language selection."), 400
     with DL_LOCK:
         if DL_THREAD is not None and DL_THREAD.is_alive():
             return jsonify(error="A download is already in progress.", in_progress=True), 409
         DL_STORE.update({"running": True, "pct": 0, "current": "starting…",
                          "finished": False, "ok": 0, "total": 0, "rows": [],
-                         "error": None})
-        DL_THREAD = threading.Thread(target=_run_download, daemon=True)
+                         "error": None, "cancel": False, "cancelled": False,
+                         "languages": languages})
+        DL_THREAD = threading.Thread(target=_run_download, args=(languages,), daemon=True)
         DL_THREAD.start()
     return jsonify(started=True)
 
@@ -1119,6 +1223,31 @@ def download_start():
 def download_progress():
     with DL_LOCK:
         return jsonify(dict(DL_STORE))
+
+
+@app.route("/download/languages", methods=["GET"])
+def download_languages():
+    """List languages that currently have generated PDFs in the configured AEM stage."""
+    try:
+        import importlib
+        import download_benq_pdfs as dl
+        importlib.reload(dl)
+        languages = sorted({lang for _product, lang, _path in
+                            dl.discover_output_pdfs(languages="*") if lang})
+        return jsonify(languages=languages)
+    except Exception as exc:
+        return jsonify(error=str(exc), languages=[]), 503
+
+
+@app.route("/download/cancel", methods=["POST"])
+def download_cancel():
+    """Ask the PDF crawl to stop. It finishes the file in flight, then reports."""
+    with DL_LOCK:
+        if not DL_STORE.get("running"):
+            return jsonify(error="No download is running."), 409
+        DL_STORE["cancel"] = True
+        DL_STORE["current"] = "cancelling…"
+    return jsonify(cancelling=True)
 
 
 @app.route("/download/zip", methods=["GET"])
@@ -1137,6 +1266,98 @@ def download_zip():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BenQ HTML download — crawls every folder under the AEM guide root and pulls
+# the rendered page for every topic under each product's language folder.
+# ─────────────────────────────────────────────────────────────────────────────
+def _run_html_download():
+    """Background worker: pull the latest BenQ guide HTML and record progress."""
+    sys.path.insert(0, str(BASE_DIR))
+    try:
+        import importlib
+        import download_benq_html as dh
+        importlib.reload(dh)  # pick up any credential/root edits without restart
+
+        def cb(frac, msg=""):
+            with HTML_DL_LOCK:
+                HTML_DL_STORE["pct"] = int(round(frac * 100))
+                HTML_DL_STORE["current"] = msg
+
+        def cancelled():
+            with HTML_DL_LOCK:
+                return bool(HTML_DL_STORE.get("cancel"))
+
+        res = dh.download_all(progress_cb=cb, should_cancel=cancelled)
+        stopped = res.get("cancelled")
+        with HTML_DL_LOCK:
+            HTML_DL_STORE.update({"ok": res["ok"], "total": res["total"],
+                                  "rows": res["rows"], "pct": 100,
+                                  "cancelled": bool(stopped),
+                                  "current": f"Downloaded {res['ok']}/{res['total']}"
+                                             + (" — cancelled" if stopped else "")})
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[download-html] failed:\n{tb}", flush=True)
+        message = str(exc).strip()
+        if not message:
+            message = (tb.strip().splitlines()[-1] if tb.strip()
+                       else exc.__class__.__name__)
+        with HTML_DL_LOCK:
+            HTML_DL_STORE["error"] = message
+            HTML_DL_STORE["current"] = "failed"
+    finally:
+        with HTML_DL_LOCK:
+            HTML_DL_STORE["running"] = False
+            HTML_DL_STORE["finished"] = True
+
+
+@app.route("/download/html/start", methods=["POST"])
+def download_html_start():
+    global HTML_DL_THREAD
+    with HTML_DL_LOCK:
+        if HTML_DL_THREAD is not None and HTML_DL_THREAD.is_alive():
+            return jsonify(error="An HTML download is already in progress.",
+                           in_progress=True), 409
+        HTML_DL_STORE.update({"running": True, "pct": 0, "current": "starting…",
+                              "finished": False, "ok": 0, "total": 0, "rows": [],
+                              "error": None, "cancel": False, "cancelled": False})
+        HTML_DL_THREAD = threading.Thread(target=_run_html_download, daemon=True)
+        HTML_DL_THREAD.start()
+    return jsonify(started=True)
+
+
+@app.route("/download/html/progress", methods=["GET"])
+def download_html_progress():
+    with HTML_DL_LOCK:
+        return jsonify(dict(HTML_DL_STORE))
+
+
+@app.route("/download/html/cancel", methods=["POST"])
+def download_html_cancel():
+    """Ask the HTML crawl to stop. It finishes the page in flight, then reports."""
+    with HTML_DL_LOCK:
+        if not HTML_DL_STORE.get("running"):
+            return jsonify(error="No HTML download is running."), 409
+        HTML_DL_STORE["cancel"] = True
+        HTML_DL_STORE["current"] = "cancelling…"
+    return jsonify(cancelling=True)
+
+
+@app.route("/download/html/zip", methods=["GET"])
+def download_html_zip():
+    """Zip up everything currently in benq_html/ for a one-click download."""
+    if not BENQ_HTML_DIR.exists() or not any(BENQ_HTML_DIR.rglob("*.html")):
+        return jsonify(error="No downloaded HTML available yet."), 404
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+        for page in sorted(BENQ_HTML_DIR.rglob("*.html")):
+            zf.write(page, page.relative_to(BENQ_HTML_DIR))
+    bio.seek(0)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return send_file(bio, mimetype="application/zip", as_attachment=True,
+                     download_name=f"benq_html_{stamp}.zip")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-product download — match each downloaded PROD PDF (benq_pdfs/<folder>/)
 # to the matching source zip in the Final Cleanup tree (FM/ or INDD/) by folder
 # name, and offer both for download from the page.
@@ -1146,7 +1367,7 @@ def _norm_name(s: str) -> str:
 
 
 def _cleanup_index() -> dict:
-    """norm(zip stem) -> (source, Path) for every zip under FM/ and INDD/."""
+    """norm(zip stem) -> (source label, Path) for legacy cleanup source ZIPs."""
     idx = {}
     for sub in ("FM", "INDD"):
         d = CLEANUP_DIR / sub
@@ -1155,6 +1376,179 @@ def _cleanup_index() -> dict:
         for z in sorted(d.glob("*.zip")):
             idx.setdefault(_norm_name(z.stem), (sub, z))
     return idx
+
+
+def _zip_cache_dir(zip_path: Path) -> Path:
+    stat = zip_path.stat()
+    rel = str(zip_path.relative_to(BASE_DIR)) if zip_path.is_relative_to(BASE_DIR) else str(zip_path)
+    digest = hashlib.sha1(f"{rel}|{stat.st_mtime_ns}|{stat.st_size}".encode()).hexdigest()[:12]
+    return EXTRACTED_ZIP_PDFS_DIR / f"{_norm_name(zip_path.stem)[:80]}_{digest}"
+
+
+def _extract_zip_pdf_candidates(zip_path: Path) -> list[Path]:
+    """Extract PDFs from one source ZIP and return the cached PDF paths."""
+    try:
+        cache_dir = _zip_cache_dir(zip_path)
+    except OSError:
+        return []
+    marker = cache_dir / ".complete"
+    if marker.is_file():
+        cached = sorted(cache_dir.rglob("*.pdf"))
+        if cached:
+            return cached
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = []
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            members = [n for n in z.namelist()
+                       if n.lower().endswith(".pdf") and "__MACOSX" not in n]
+            used = set()
+            for idx, member in enumerate(members, start=1):
+                name = secure_filename(Path(member).name) or f"pdf_{idx}.pdf"
+                if not name.lower().endswith(".pdf"):
+                    name += ".pdf"
+                if name.lower() in used:
+                    stem, suffix = Path(name).stem, Path(name).suffix
+                    name = f"{stem}_{idx}{suffix}"
+                used.add(name.lower())
+                dest = cache_dir / name
+                dest.write_bytes(z.read(member))
+                out.append(dest)
+        if out:
+            marker.write_text(str(zip_path), encoding="utf-8")
+    except Exception as exc:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        print(f"[products] failed to extract {zip_path}: {exc}", flush=True)
+        return []
+    return sorted(out)
+
+
+def _source_zip_for_extracted_pdf(pdf_path: Path) -> Path | None:
+    try:
+        marker = next(p for p in [pdf_path.parent / ".complete"] if p.is_file())
+        text = marker.read_text(encoding="utf-8").strip()
+        return Path(text) if text else None
+    except Exception:
+        return None
+
+
+def _stage_source_label(pdf_path: Path) -> str:
+    if pdf_path.is_relative_to(STAGE_FILES_DIR):
+        return "Stage files"
+    if pdf_path.is_relative_to(EXTRACTED_ZIP_PDFS_DIR):
+        source_zip = _source_zip_for_extracted_pdf(pdf_path)
+        if source_zip:
+            try:
+                return str(source_zip.relative_to(BASE_DIR))
+            except ValueError:
+                return str(source_zip)
+        return "extracted ZIP PDF"
+    return str(pdf_path.parent)
+
+
+def _stage_pdf_candidates() -> list[Path]:
+    """Every already-downloaded or extracted STAGE-side PDF available locally."""
+    out = []
+    if STAGE_FILES_DIR.is_dir():
+        out.extend(sorted(STAGE_FILES_DIR.rglob("*.pdf")))
+    if PROD_PDF_ZIPS_DIR.is_dir():
+        for zip_path in sorted(PROD_PDF_ZIPS_DIR.rglob("*.zip")):
+            out.extend(_extract_zip_pdf_candidates(zip_path))
+    return sorted(out)
+
+
+def _downloaded_pdf_candidates() -> list[Path]:
+    """Every downloaded English PDF that can be used as the counterpart side."""
+    out = []
+    if BENQ_PDFS_DIR.is_dir():
+        out.extend(sorted(BENQ_PDFS_DIR.rglob("*.pdf")))
+    if PROD_FILES_DIR.is_dir():
+        out.extend(sorted(PROD_FILES_DIR.rglob("*.pdf")))
+    if STAGE_FILES_DIR.is_dir():
+        out.extend(sorted(STAGE_FILES_DIR.rglob("*.pdf")))
+    return sorted(out)
+
+
+def _candidate_match_names(pdf_path: Path) -> list[str]:
+    names = [pdf_path.name, pdf_path.stem]
+    if pdf_path.is_relative_to(EXTRACTED_ZIP_PDFS_DIR):
+        source_zip = _source_zip_for_extracted_pdf(pdf_path)
+        if source_zip:
+            names.extend([source_zip.name, source_zip.stem, source_zip.parent.name])
+    else:
+        names.append(pdf_path.parent.name)
+    return names
+
+
+def _match_stage_pdf(candidates: list[Path], *names: str):
+    """Best STAGE PDF match for a product/friendly PROD name."""
+    want = set()
+    for name in names:
+        want |= model_keys(name or "")
+    best, best_score = None, 0
+    for pdf in candidates:
+        have = set()
+        for candidate_name in _candidate_match_names(pdf):
+            have |= model_keys(candidate_name)
+        shared = want & have
+        if not shared:
+            continue
+        score = max(len(k) for k in shared) * 100 + len(shared)
+        if score > best_score:
+            best, best_score = pdf, score
+    if best is not None:
+        return best
+
+    needles = [_norm_name(n or "") for n in names if _norm_name(n or "")]
+    scored = []
+    for pdf in candidates:
+        pnorms = [_norm_name(n) for n in _candidate_match_names(pdf) if _norm_name(n)]
+        for needle in needles:
+            for pnorm in pnorms:
+                if pnorm.startswith(needle) or needle.startswith(pnorm):
+                    scored.append((len(os.path.commonprefix([pnorm, needle])), pdf))
+    if scored:
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1]
+    return None
+
+
+def _product_entry(product: str, prod_pdf: Path, prod_root: Path,
+                   stage_pdfs: list[Path], cleanup_idx: dict) -> dict:
+    """Catalog row for one PROD PDF, with the best available STAGE source."""
+    dl_name = f"{product}.pdf" if prod_pdf.name.lower() == ".pdf" else prod_pdf.name
+    entry = {
+        "product": product,
+        "pdf_name": prod_pdf.name,
+        "pdf_dl": dl_name,
+        "pdf_kb": prod_pdf.stat().st_size // 1024,
+        "prod_path": str(prod_pdf),
+        "prod_source": str(prod_root.relative_to(BASE_DIR)) if prod_root.is_relative_to(BASE_DIR) else str(prod_root),
+        "zip_name": None,
+        "zip_kb": None,
+        "stage_pdf_name": None,
+        "stage_pdf_kb": None,
+        "stage_path": None,
+        "source": None,
+        "has_stage": False,
+    }
+    stage_pdf = _match_stage_pdf(stage_pdfs, product, prod_pdf.name)
+    if stage_pdf:
+        entry.update(stage_pdf_name=stage_pdf.name,
+                     stage_pdf_kb=stage_pdf.stat().st_size // 1024,
+                     stage_path=str(stage_pdf), source=_stage_source_label(stage_pdf),
+                     has_stage=True)
+        return entry
+
+    m = _match_cleanup(cleanup_idx, product)
+    if m:
+        source, zip_path = m
+        entry.update(zip_name=zip_path.name,
+                     zip_path=str(zip_path),
+                     zip_kb=zip_path.stat().st_size // 1024, source=source,
+                     has_stage=True)
+    return entry
 
 
 # Hand-verified matches where names differ enough that fuzzy matching can't be
@@ -1183,36 +1577,32 @@ def _match_cleanup(idx: dict, product: str):
 
 
 def _matched_products() -> list:
-    """Every PROD product (benq_pdfs/<folder>/ with a PDF). Each entry also
-    carries its matching Final Cleanup ZIP when one exists (else zip_name=None)."""
+    """Every PROD product with its matching STAGE PDF or cleanup ZIP, if any."""
     idx = _cleanup_index()
+    stage_pdfs = _stage_pdf_candidates()
+    downloaded_pdfs = _downloaded_pdf_candidates()
     out = []
-    if not BENQ_PDFS_DIR.is_dir():
-        return out
-    for folder in sorted(BENQ_PDFS_DIR.iterdir()):
-        if not folder.is_dir():
-            continue
-        pdfs = sorted(folder.glob("*.pdf"))
-        if not pdfs:
-            continue
-        # Some PROD PDFs land on disk with an empty stem (".pdf"); give those a
-        # friendly download name based on the product folder.
-        dl_name = f"{folder.name}.pdf" if pdfs[0].name.lower() == ".pdf" else pdfs[0].name
-        entry = {
-            "product": folder.name,
-            "pdf_name": pdfs[0].name,
-            "pdf_dl": dl_name,
-            "pdf_kb": pdfs[0].stat().st_size // 1024,
-            "zip_name": None,
-            "zip_kb": None,
-            "source": None,
-        }
-        m = _match_cleanup(idx, folder.name)
-        if m:
-            source, zip_path = m
-            entry.update(zip_name=zip_path.name,
-                         zip_kb=zip_path.stat().st_size // 1024, source=source)
-        out.append(entry)
+    seen_products = set()
+
+    def add_entry(product: str, prod_pdf: Path, prod_root: Path,
+                  candidates: list[Path]):
+        label = product
+        if label in seen_products:
+            label = f"{product} ({prod_root.name})"
+        seen_products.add(label)
+        out.append(_product_entry(label, prod_pdf, prod_root, candidates, idx))
+
+    if BENQ_PDFS_DIR.is_dir():
+        for pdf in sorted(BENQ_PDFS_DIR.rglob("*.pdf")):
+            product = pdf.stem or pdf.parent.name
+            add_entry(product, pdf, BENQ_PDFS_DIR, stage_pdfs)
+    if PROD_FILES_DIR.is_dir():
+        for pdf in sorted(PROD_FILES_DIR.rglob("*.pdf")):
+            product = pdf.stem or pdf.name
+            add_entry(product, pdf, PROD_FILES_DIR, stage_pdfs)
+    for pdf in [p for p in stage_pdfs if p.is_relative_to(EXTRACTED_ZIP_PDFS_DIR)]:
+        product = pdf.stem or pdf.name
+        add_entry(product, pdf, EXTRACTED_ZIP_PDFS_DIR, downloaded_pdfs)
     return out
 
 
@@ -1225,11 +1615,25 @@ def _register_pair(pair_id: str, label: str, prod_dir: Path, stage_dir: Path) ->
     """Record a prepared prod/stage pair in the validation queue (shared helper)."""
     prod_list = [str(p.relative_to(prod_dir)) for p in sorted(prod_dir.rglob("*.pdf"))]
     stage_list = [str(p.relative_to(stage_dir)) for p in sorted(stage_dir.rglob("*.pdf"))]
+    try:
+        matched = pair_pdfs(prod_dir, stage_dir)
+    except ValueError:
+        matched = []
+    file_pairs = [{"prod": p.name, "stage": s.name} for p, s, _ in matched]
+    paired_prod = {p.name for p, _, _ in matched}
+    paired_stage = {s.name for _, s, _ in matched}
+    unpaired = ([f"PROD: {n}" for n in
+                 sorted({Path(f).name for f in prod_list} - paired_prod)]
+                + [f"STAGE: {n}" for n in
+                   sorted({Path(f).name for f in stage_list} - paired_stage)])
     queue = load_queue()
     queue.append({
         "id": pair_id, "label": label,
         "prod_count": len(prod_list), "stage_count": len(stage_list),
         "prod_files": prod_list[:12], "stage_files": stage_list[:12],
+        "file_pairs": file_pairs,
+        "pair_count": len(file_pairs),
+        "unpaired": unpaired,
         "created": datetime.now().isoformat(),
     })
     save_queue(queue)
@@ -1251,16 +1655,20 @@ def _extract_stage_pdf(zip_path: Path, dest_dir: Path) -> Path:
 
 @app.route("/download/add-to-validation/<path:product>", methods=["POST"])
 def add_to_validation(product: str):
-    """Queue a PROD (benq_pdfs) vs STAGE (cleanup-zip PDF) pair for validation —
-    no download, no manual upload."""
+    """Queue a matched PROD/STAGE pair already available on the server."""
     match = next((m for m in _matched_products() if m["product"] == product), None)
     if not match:
         return jsonify(error="Unknown product."), 404
-    if not match["zip_name"]:
-        return jsonify(error="No STAGE source (Final Cleanup file) for this product."), 400
-    prod_src = BENQ_PDFS_DIR / product / match["pdf_name"]
-    zip_path = CLEANUP_DIR / match["source"] / match["zip_name"]
-    if not prod_src.is_file() or not zip_path.is_file():
+    prod_src = Path(match.get("prod_path") or (BENQ_PDFS_DIR / product / match["pdf_name"]))
+    stage_src = Path(match["stage_path"]) if match.get("stage_path") else None
+    zip_path = (Path(match["zip_path"]) if match.get("zip_path")
+                else (CLEANUP_DIR / match["source"] / match["zip_name"]
+                      if match.get("zip_name") else None))
+    if not stage_src and not zip_path:
+        return jsonify(error="No STAGE source for this product."), 400
+    if (not prod_src.is_file()
+            or (stage_src and not stage_src.is_file())
+            or (zip_path and not zip_path.is_file())):
         return jsonify(error="Source files are missing on the server."), 404
 
     pair_id = uuid.uuid4().hex
@@ -1271,7 +1679,10 @@ def add_to_validation(product: str):
     stage_dir.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copy2(prod_src, prod_dir / match["pdf_dl"])
-        _extract_stage_pdf(zip_path, stage_dir)
+        if stage_src:
+            shutil.copy2(stage_src, stage_dir / stage_src.name)
+        else:
+            _extract_stage_pdf(zip_path, stage_dir)
     except Exception as exc:
         shutil.rmtree(pair_dir, ignore_errors=True)
         return jsonify(error=str(exc)), 400
@@ -1297,7 +1708,7 @@ def _guide_data(product: str):
     match = next((m for m in _matched_products() if m["product"] == product), None)
     if not match:
         return None
-    prod_path = BENQ_PDFS_DIR / product / match["pdf_name"]
+    prod_path = Path(match.get("prod_path") or (BENQ_PDFS_DIR / product / match["pdf_name"]))
     if not prod_path.is_file():
         return None
 
@@ -1306,14 +1717,21 @@ def _guide_data(product: str):
     toc = v.get_toc(str(prod_path))
     prod_sections = v.extract_sections(str(prod_path), is_prod=True)
 
-    # STAGE side (optional — present only when a Final Cleanup file matched).
+    # STAGE side (optional — present when a direct STAGE PDF or cleanup file matched).
     stage_path = None
     stage_index = None
-    if match["zip_name"]:
+    if match.get("stage_path"):
+        stage_path = Path(match["stage_path"])
+    elif match["zip_name"]:
         sdir = (PAIRS_DIR / "_guide_stage" / re.sub(r"[^\w.\-]", "_", product))
         sdir.mkdir(parents=True, exist_ok=True)
         try:
             stage_path = _extract_stage_pdf(CLEANUP_DIR / match["source"] / match["zip_name"], sdir)
+        except Exception as exc:
+            print(f"[guide] stage build failed for {product}: {exc}", flush=True)
+            stage_path = None
+    if stage_path:
+        try:
             sdoc = fitz.open(str(stage_path))
             stage_nav = {1} | v._detect_nav_pages(sdoc)
             sdoc.close()
@@ -1848,7 +2266,7 @@ def download_all_prod_pdfs():
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
         for m in products:
-            src = BENQ_PDFS_DIR / m["product"] / m["pdf_name"]
+            src = Path(m.get("prod_path") or (BENQ_PDFS_DIR / m["product"] / m["pdf_name"]))
             if src.is_file():
                 zf.write(src, m["pdf_dl"])
     bio.seek(0)
@@ -1861,7 +2279,7 @@ def download_all_prod_pdfs():
 def download_prod_pdf(product: str):
     for m in _matched_products():
         if m["product"] == product:
-            f = BENQ_PDFS_DIR / product / m["pdf_name"]
+            f = Path(m.get("prod_path") or (BENQ_PDFS_DIR / product / m["pdf_name"]))
             if f.is_file():
                 return send_file(f, mimetype="application/pdf",
                                  as_attachment=True, download_name=m["pdf_dl"])
@@ -3005,7 +3423,11 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 5000)), help="Port to bind the Flask app")
     args = parser.parse_args()
 
-    # debug=True keeps the werkzeug auto-reloader on: editing any .py file
-    # restarts the worker automatically, and templates re-render per request.
-    # So changes show up after a browser refresh — no manual restart required.
-    app.run(host=args.host, port=args.port, debug=True, use_reloader=True)
+    # The werkzeug auto-reloader is OFF by default. On this box it left two
+    # processes serving the same port, and job state (download / validation
+    # progress) lives in per-process memory — so /download/start ran the job in
+    # one process while the browser polled /progress on the other, which looked
+    # like "the download never starts". Opt back in with BENQ_RELOAD=1 only when
+    # you're actively editing .py files and can live with that.
+    reload_on = os.environ.get("BENQ_RELOAD") in ("1", "true", "yes", "on")
+    app.run(host=args.host, port=args.port, debug=reload_on, use_reloader=reload_on)

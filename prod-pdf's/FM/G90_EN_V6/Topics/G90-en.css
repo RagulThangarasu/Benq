@@ -1,0 +1,940 @@
+/* ─────────────────────────────────────────────
+   DITA-style global reset & base
+───────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+ 
+body {
+  font-family: Arial, sans-serif;
+  font-size: 11pt;
+  line-height: 1.6;
+  color: #1a1a1a;
+  background-color: #ffffff;
+  padding: 32px 48px;
+  max-width: 860px;
+  margin: 0 auto;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA topic container
+───────────────────────────────────────────── */
+.topic {
+  display: block;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA title  (h1 — page/topic title)
+───────────────────────────────────────────── */
+h1.title {
+  font-size: 20pt;
+  font-weight: bold;
+  color: #5c2d91;
+  margin-bottom: 20px;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA body / conbody
+───────────────────────────────────────────── */
+.body.conbody {
+  display: block;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA section
+───────────────────────────────────────────── */
+.section {
+  display: block;
+  margin-bottom: 28px;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA sectiontitle  (h2 and h3)
+   Matches the purple headings with rule below
+───────────────────────────────────────────── */
+h2.sectiontitle,
+h3.sectiontitle {
+  font-family: Arial, sans-serif;
+  font-weight: bold;
+  color: #5c2d91;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #d0d0d0;
+  margin-bottom: 14px;
+}
+ 
+h2.sectiontitle {
+  font-size: 18pt;
+  margin-top: 4px;
+}
+ 
+h3.sectiontitle {
+  font-size: 16pt;
+  margin-top: 18px;
+  border-bottom: none;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA paragraph
+───────────────────────────────────────────── */
+p.p {
+  font-size: 11pt;
+  margin-bottom: 8px;
+  line-height: 1.6;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA unordered list
+───────────────────────────────────────────── */
+ul.ul {
+  list-style: disc;
+  padding-left: 22px;
+  margin-bottom: 10px;
+}
+ 
+ul.ul ul.ul {
+  list-style: disc;
+  padding-left: 22px;
+  margin-top: 6px;
+  margin-bottom: 4px;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA list item
+───────────────────────────────────────────── */
+li.li {
+  font-size: 11pt;
+  line-height: 1.6;
+  margin-bottom: 5px;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA note  (icon immediately left of text)
+   Only used when a PDF icon is present
+───────────────────────────────────────────── */
+.note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background-color: #f8f8f8;
+  border-left: 3px solid #5c2d91;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  border-radius: 2px;
+}
+ 
+.note .image {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin-top: 2px;
+}
+ 
+.note p.p {
+  margin-bottom: 0;
+  font-size: 11pt;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA fig  (figure / image containers)
+───────────────────────────────────────────── */
+.fig {
+  display: inline-block;
+  margin-bottom: 14px;
+  vertical-align: top;
+}
+ 
+.fig.safety-icons {
+  display: block;
+  margin-bottom: 12px;
+}
+ 
+.fig.safety-icons .image {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+ 
+.env-conditions-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.fig.env-conditions {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  margin-right: 12px;
+  margin-bottom: 16px;
+}
+ 
+.fig.env-conditions .image {
+  width: 90px;
+  height: auto;
+}
+ 
+.fig.env-conditions p.env-label {
+  font-size: 8pt;
+  text-align: center;
+  margin-top: 4px;
+  margin-bottom: 0;
+  color: #333;
+}
+ 
+.fig.qr-code {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: 14px 0;
+}
+ 
+.fig.qr-code .image {
+  width: 80px;
+  height: 80px;
+}
+ 
+.fig.qr-code .fig-caption {
+  font-size: 8pt;
+  color: #555;
+  margin-top: 4px;
+  margin-bottom: 0;
+  text-align: center;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA image
+───────────────────────────────────────────── */
+.image {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA table
+───────────────────────────────────────────── */
+table.table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid #ccc;
+  font-size: 11pt;
+  margin-bottom: 16px;
+}
+ 
+/* header row — dark gray background, white text */
+table.table thead.thead tr.header-row th.entry {
+  background-color: #4a4a4a;
+  color: #ffffff;
+  font-weight: bold;
+  text-align: left;
+  padding: 8px 12px;
+  border: 1px solid #999;
+}
+ 
+table.table tbody.tbody tr.row td.entry {
+  padding: 8px 12px;
+  border: 1px solid #ccc;
+  vertical-align: top;
+  line-height: 1.5;
+}
+ 
+/* icon cell — narrow, centred */
+table.table td.entry.icon-cell {
+  width: 64px;
+  text-align: center;
+  vertical-align: middle;
+}
+ 
+table.table td.entry.icon-cell .image {
+  width: 32px;
+  height: 32px;
+  margin: 0 auto;
+  display: block;
+}
+ 
+/* no alternating row tint — matches PDF plain white rows */
+ 
+/* ─────────────────────────────────────────────
+   DITA xref  (hyperlinks)
+───────────────────────────────────────────── */
+a.xref {
+  color: #5c2d91;
+  text-decoration: underline;
+}
+ 
+a.xref:hover {
+  color: #3a1a6e;
+}
+ 
+/* ─────────────────────────────────────────────
+   Superscript (e.g. mm²)
+───────────────────────────────────────────── */
+sup {
+  font-size: 0.7em;
+  vertical-align: super;
+  line-height: 0;
+}
+ 
+/* ─────────────────────────────────────────────
+   Checklist table  (Getting started page)
+   Two-column: left = item label, right = image
+───────────────────────────────────────────── */
+table.checklist-table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid #ccc;
+  margin-bottom: 20px;
+}
+ 
+table.checklist-table tbody.tbody tr.row td.entry {
+  border: 1px solid #ccc;
+  padding: 10px 14px;
+  vertical-align: middle;
+  font-size: 11pt;
+  line-height: 1.5;
+}
+ 
+/* left column — fixed width for label text */
+table.checklist-table tbody.tbody tr.row td.entry:first-child {
+  width: 45%;
+  vertical-align: top;
+  padding-top: 12px;
+}
+ 
+/* right column — holds the illustration placeholder */
+table.checklist-table tbody.tbody tr.row td.entry.img-cell {
+  width: 55%;
+  text-align: center;
+  min-height: 80px;
+}
+ 
+table.checklist-table td.entry.img-cell .image {
+  max-width: 180px;
+  max-height: 140px;
+  width: 100%;
+  height: auto;
+  display: inline-block;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA ordered list
+───────────────────────────────────────────── */
+ol.ol {
+  list-style: decimal;
+  padding-left: 22px;
+  margin-bottom: 10px;
+}
+ 
+ol.ol li.li {
+  font-size: 11pt;
+  line-height: 1.6;
+  margin-bottom: 5px;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA note — tip variant  (lightbulb icon)
+───────────────────────────────────────────── */
+.note.tip {
+  border-left-color: #2e7d32;
+  background-color: #f6faf6;
+}
+ 
+/* Note with a body wrapper (icon + content side by side) */
+.note .note__body {
+  flex: 1;
+}
+ 
+.note .note__body .ul {
+  margin-bottom: 0;
+}
+ 
+/* ─────────────────────────────────────────────
+   Two-column figure layout (image + numbered list)
+   Used in Front view / Back view sections
+───────────────────────────────────────────── */
+.two-col-fig {
+  display: flex;
+  gap: 32px;
+  align-items: flex-start;
+  margin-bottom: 20px;
+}
+ 
+.two-col-fig__image {
+  flex-shrink: 0;
+}
+ 
+.two-col-fig__image .image {
+  max-width: 220px;
+  width: 100%;
+  height: auto;
+  display: block;
+}
+ 
+.two-col-fig__desc {
+  flex: 1;
+}
+ 
+/* ─────────────────────────────────────────────
+   Connections diagram figure group
+───────────────────────────────────────────── */
+.fig.connections-diagram {
+  display: block;
+  margin-bottom: 20px;
+}
+ 
+.fig.connections-diagram .image {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin-bottom: 4px;
+}
+ 
+.connections-diagram__bottom {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+ 
+.connections-diagram__bottom .image {
+  max-width: 100%;
+  height: auto;
+}
+ 
+.connections-diagram__labels {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 10pt;
+  color: #333;
+}
+ 
+/* ─────────────────────────────────────────────
+   Table grouped header row  (dark gray spanning cell)
+───────────────────────────────────────────── */
+table.table thead.thead tr.group-header-row th.entry {
+  background-color: #4a4a4a;
+  color: #ffffff;
+  text-align: center;
+  font-weight: bold;
+  padding: 8px 12px;
+  border: 1px solid #999;
+  font-size: 11pt;
+}
+ 
+/* ─────────────────────────────────────────────
+   DITA note — warning variant  (exclamation icon)
+───────────────────────────────────────────── */
+.note.warning {
+  border-left-color: #b71c1c;
+  background-color: #fff8f8;
+}
+ 
+/* ─────────────────────────────────────────────
+   Assembly step sections
+───────────────────────────────────────────── */
+.section.step-section {
+  margin-bottom: 28px;
+}
+ 
+h3.sectiontitle.step-title {
+  font-size: 12pt;
+  font-weight: bold;
+  color: #5c2d91;
+  margin-top: 20px;
+  margin-bottom: 10px;
+}
+ 
+/* ─────────────────────────────────────────────
+   Inline icon image (e.g. AC power symbol ~)
+───────────────────────────────────────────── */
+img.image.inline-icon {
+  display: inline;
+  vertical-align: middle;
+  width: 18px;
+  height: 18px;
+  margin: 0 2px;
+}
+ 
+/* ─────────────────────────────────────────────
+   Sub-section title (h4 — e.g. A. Clamp mounting)
+───────────────────────────────────────────── */
+h4.sectiontitle {
+  font-size: 11pt;
+  font-weight: bold;
+  color: #5c2d91;
+  text-decoration: underline;
+  margin-top: 16px;
+  margin-bottom: 8px;
+}
+ 
+/* ─────────────────────────────────────────────
+   Alphabetically ordered list (a. b. c.)
+───────────────────────────────────────────── */
+ol.ol.alpha-ol {
+  list-style-type: lower-latin;
+}
+ 
+/* ─────────────────────────────────────────────
+   Table: page-break control & header repeat
+───────────────────────────────────────────── */
+ 
+/* Prevent rows from splitting across page breaks */
+table.table tr {
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+ 
+/* Standard thead rendering on screen (print override below prevents page-repeat) */
+thead.thead {
+  display: table-header-group;
+}
+ 
+/* ─────────────────────────────────────────────
+   Row header cells in tbody
+   (th[scope="row"] and th[scope="rowgroup"])
+───────────────────────────────────────────── */
+ 
+/* Base style: same visual weight as td.entry */
+table.table tbody.tbody th.entry {
+  padding: 8px 12px;
+  border: 1px solid #ccc;
+  vertical-align: top;
+  text-align: left;
+  line-height: 1.5;
+  font-size: 11pt;
+}
+ 
+/* Single-row item labels — bold to match PDF */
+table.table tbody.tbody th.entry[scope="row"] {
+  font-weight: bold;
+  background-color: #ffffff;
+}
+ 
+/* Multi-row group spans (e.g. PIP, Color Mode, Advanced) */
+table.table tbody.tbody th.entry[scope="rowgroup"] {
+  font-weight: bold;
+  background-color: #ffffff;
+  vertical-align: top;
+}
+
+/* Sub-item rows indented under a rowgroup header */
+table.table tbody.tbody th.entry.sub-item {
+  padding-left: 24px;
+}
+ 
+/* No alternating tint on row-header cells either */
+ 
+/* ─────────────────────────────────────────────
+   Group header rows in tbody (section dividers)
+───────────────────────────────────────────── */
+table.table tbody.tbody tr.group-header-row th.entry {
+  background-color: #eeeeee;
+  color: #444444;
+  font-style: normal;
+  font-weight: normal;
+  text-align: left;
+  padding: 5px 12px;
+  border: 1px solid #ccc;
+  vertical-align: middle;
+}
+ 
+/* ─────────────────────────────────────────────
+   OSD screenshot tables — dark background to match PDF
+───────────────────────────────────────────── */
+table.table.osd-screenshot {
+  width: auto;
+  min-width: 62%;
+  font-size: 10pt;
+  border: 1px solid #444;
+  margin-bottom: 16px;
+  background-color: #2a2a2a;
+  color: #d0d0d0;
+}
+ 
+table.table.osd-screenshot td.entry {
+  background-color: transparent;
+  color: #d0d0d0;
+  border: 1px solid #3a3a3a;
+  padding: 4px 10px;
+}
+ 
+/* ─────────────────────────────────────────────
+   Content table column widths (via <colgroup>)
+───────────────────────────────────────────── */
+table.table col.col-icon  { width: 72px; }
+table.table col.col-item  { width: 22%; }
+table.table col.col-fn    { width: 53%; }
+table.table col.col-range { width: 25%; }
+
+/* ─────────────────────────────────────────────
+   Color Mode availability matrix (page 63)
+   9-column table: center all data cells and
+   column-header cells for V / N/A values
+───────────────────────────────────────────── */
+table.table.color-matrix td.entry {
+  text-align: center;
+}
+table.table.color-matrix thead.thead tr.header-row th.entry {
+  text-align: center;
+}
+ 
+/* ─────────────────────────────────────────────
+   Checklist table — thead & row-header styles
+───────────────────────────────────────────── */
+table.checklist-table thead.thead tr.header-row th.entry {
+  background-color: #4a4a4a;
+  color: #ffffff;
+  font-weight: bold;
+  text-align: left;
+  padding: 8px 12px;
+  border: 1px solid #999;
+  font-size: 11pt;
+}
+ 
+/* checklist items are normal weight (not bold) — overrides general scope="row" bold rule */
+table.checklist-table tbody.tbody th.entry[scope="row"] {
+  padding: 10px 14px;
+  border: 1px solid #ccc;
+  vertical-align: middle;
+  font-size: 11pt;
+  line-height: 1.5;
+  font-weight: normal;
+  background-color: #ffffff;
+  text-align: left;
+}
+ 
+/* ─────────────────────────────────────────────
+   Print media — enforce page-break rules and
+   preserve background colours when printing
+───────────────────────────────────────────── */
+@media print {
+  table.table {
+    page-break-inside: auto;
+    border-collapse: collapse;
+  }
+ 
+  table.table tr {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+ 
+  thead.thead {
+    display: table-row-group; /* prevents header from repeating on each printed page */
+  }
+ 
+  /* Force background colours to print */
+  table.table thead.thead tr th.entry,
+  table.table tbody.tbody tr.group-header-row th.entry,
+  table.table tbody.tbody th.entry[scope="rowgroup"],
+  table.table.osd-screenshot,
+  table.table.osd-screenshot td.entry,
+  table.checklist-table thead.thead tr th.entry {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}
+
+.icon-mini {
+  width: 15%;
+  height: auto;
+}
+.icon-micro {
+  display: inline-block;
+  width: 14px;
+  height: 29px;
+  object-fit: contain;
+  vertical-align: middle;
+}
+ 
+.previewbody {
+  height: 100vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+ 
+.multi-file-tiles {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+ 
+.previewbody .topic {
+  height: stretch;
+  overflow-y: auto;
+  overflow-x: hidden;
+ 
+  /* Hide scrollbar (cross-browser) */
+  scrollbar-width: none;       /* Firefox */
+  -ms-overflow-style: none;    /* IE/Edge */
+}
+ 
+.previewbody .topic::-webkit-scrollbar {
+  display: none;               /* Chrome, Safari */
+}
+.icon-small {
+  width: 20px;
+  height: 20px;
+  vertical-align: middle;
+  margin: 0 2px;
+}
+ 
+.safety-symbol {
+  width: 80px;
+  height: auto;
+  max-width: none;
+}
+.image_right {
+  float: right;
+  width: 50px;
+  height: 50px;
+  margin-left: 12px;
+  object-fit: contain;
+}
+.center-image {
+  display: flex;
+  justify-content: center;
+}
+ 
+.center-container{
+      display: flex;
+  justify-content: center;
+    margin: 0 auto;
+    margin-bottom:10px;
+}
+ 
+div.note {
+  display: flex;
+  align-items:flex-start;
+  gap: 10px;
+  border-radius: 4px;
+  padding: 10px 12px;
+  margin: 12px 0;
+}
+ 
+.icon-medium{
+  width:70%;
+  height:auto;
+    margin-bottom:10px;
+}
+ 
+div.note-ul {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border-radius: 4px;
+  padding: 10px 12px;
+  margin: 12px 0;
+}
+.icon-num{
+  display: inline-block;
+  width: 25px;
+  height: auto;
+  vertical-align: middle;
+  margin: 0 2px;
+  max-width: none;
+}
+.small-icon {
+  width: 40px;
+  height: auto;
+  vertical-align: middle;
+  margin: 0 2px;  
+}
+ 
+ 
+ 
+.icon-number {
+  display: inline-block;
+  width: auto;
+  height: 25px;
+  vertical-align: middle;
+}
+ 
+.image-small {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+  width: 30%;
+  height: auto;
+}
+.icon-large {
+  width: 50%;
+  height: auto;
+}
+ 
+.heading-title, .subsectiontitle{
+font-size:17px;
+line-height:27px;
+    font-weight:bold;
+}
+.package-items {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 1.25rem 1rem;
+    margin: 1rem 0 1.25rem;
+}
+.tip-container img{
+    width: 30px;
+  height: auto;
+  flex-shrink: 0;
+ 
+}
+ 
+div .tip-container {
+align-items:center;
+}
+ 
+.two-col,.fig-group{
+      display: flex;
+    justify-content: space-between;
+}
+ 
+.two-cols, .eprel-block{
+      display: flex;
+}
+.two-row{
+display:block;
+}
+.note, .note.warning{
+    background: transparent;
+    border: none;
+}
+.center-table{
+  margin:0 auto;
+    width:40%;
+}
+.two-layout{
+width:90%;
+}
+ 
+.image-medium{
+  width:50%;
+  height: auto;
+}
+/* Two-column layout for images */
+.two-column {
+  display: flex;
+  margin: 16px 0;
+}
+ 
+.two-column .column {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+}
+ 
+/* Two-column layout for other content */
+.two-col {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start;
+  margin: 12px 0;
+}
+ 
+.two-col .col {
+  flex: 1;
+  min-width: 180px;
+}
+.icon-xsmall{
+  width:40%;
+  height:auto;
+}
+.center-table .tbody{
+  text-align:center;
+}
+ 
+.two-col-list {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 4px;
+  padding: 10px 12px;
+  margin: 12px 0;
+}
+ 
+.bold_text {
+  font-weight: bold;
+}
+ 
+.extra-small-icon {
+  display: inline-block;
+  width: 14px;
+  height: auto;
+  vertical-align: middle;
+}
+ 
+.three-col-group{
+display: flex;
+justify-content:space-between;
+margin-bottom: 16px;}
+ 
+.fig.three-col{
+display:inline-flex;
+flex-direction:column;
+align-items:center;
+margin-right:12px;
+margin-bottom:16px;
+flex:1;
+}
+ 
+.large-icons{
+  width:60%;
+  height:auto
+ 
+}
+/* ─────────────────────────────────────────────
+   Specifications table — center-align right column only
+───────────────────────────────────────────── */
+table.table.specs-table tbody.tbody tr.row td.entry:last-child {
+  text-align: center;
+}
+.ul-none{
+  list-style: none;
+}
+.logo-icon{
+  width:140px;
+  height:auto;
+}
+.step-divider {
+  border: none;
+  border-top: 1px solid #d0d0d0;
+  margin: 8px 0;
+}
+ 
+.medium-icon{
+  width:190px;
+  height:auto;
+}
+.qr-image{
+  width: 60px;
+  height: auto;
+ 
+}
+.inline-icon-small{
+   display: inline-block;
+  width: 15px;
+  height: auto;
+  vertical-align: middle;
+  margin: 0 2px;
+  max-width: none;
+ 
+}
+ 
+.note-icon {
+  background-color: #f8f8f8;
+  border-left: 3px solid #5c2d91;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  border-radius: 2px;
+}
+ 
+.image-short {
+  width: 100%;
+  height: 220px;
+  max-width: 220px;
+  display: block;
+}

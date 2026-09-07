@@ -23,6 +23,8 @@ import unicodedata
 import hashlib
 import bisect
 import io
+import json
+import difflib
 
 # Configure local TESSDATA_PREFIX before importing fitz (PyMuPDF)
 _CUR_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +43,7 @@ except ImportError:
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
-    Image as RLImage,
+    KeepTogether, Image as RLImage,
 )
 from reportlab.platypus.flowables import HRFlowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -148,11 +150,19 @@ _STEP_BOOKMARK_RE = re.compile(r"^\s*\d{1,2}\s*[.)]\s+\S")
 _PAGE_REF_RE     = re.compile(
     r"\b(?:on|see)\s+pages?\s+\d+(?:\s*[-–]\s*\d+)?\.?", re.IGNORECASE)
 _NAV_INLINE_RE   = re.compile(r"\b\d{1,2}\b")
+# A table-of-contents entry line: text, then dot leaders or a wide gap, then a
+# trailing page number. Used to tell a real TOC page from a spec table (which
+# also has many short lines and small numbers).
+_TOC_ENTRY_RE = re.compile(r"^.{2,}?(?:\.{2,}|\s{3,})\s*\d{1,3}\s*$")
 # Strip formatting-only labels before comparison
 _FMT_LABEL_RE    = re.compile(
     r"\b(NOTE|TIP|IMPORTANT|CAUTION|WARNING)\s*:\s*", re.IGNORECASE)
 # Numbered list marker — matches "1." "7." etc. (not "1," "2)")
 _NUMBERED_ITEM_RE = re.compile(r"\b\d+\.")
+# A canonical token that IS a value+unit ("9v", "4a", "12v") once digit-only
+# tokens are already stripped by _split_canon — used to spot spec-table
+# fragments where reading order is a rendering artefact, not real wording.
+_UNIT_VALUE_RE = re.compile(r"^\d+[a-z]+$")
 # OSD screenshot block pattern — resolution, refresh rate, or nav-key labels
 _OSD_SCREEN_RE = re.compile(
     r"\d{3,4}x\d{3,4}|"      # resolution like 3840x2160
@@ -496,7 +506,10 @@ def _detect_nav_pages(doc) -> set:
     total  = doc.page_count
     result = set()
 
-    # Identify Q&A index pages from TOC to protect them from being skipped
+    # Q&A / FAQ index pages are navigation, not content: they restate headings
+    # that are validated where they actually live, and their wording is
+    # rewritten per channel. They were previously protected from nav detection,
+    # which meant every cross-reference on them was compared and reported.
     qa_pages = set()
     try:
         toc = doc.get_toc()
@@ -520,9 +533,11 @@ def _detect_nav_pages(doc) -> set:
     use_ocr = _is_pdf_garbled(doc)
     ocr_lang = _get_pdf_language(doc) if use_ocr else "eng"
 
+    result |= qa_pages
+
     for i, p in enumerate(doc, 1):
         if i in qa_pages:
-            continue  # Do not treat Q&A index pages as navigation pages
+            continue                       # already excluded as navigation
         tp = None
         if use_ocr:
             try:
@@ -533,11 +548,23 @@ def _detect_nav_pages(doc) -> set:
         else:
             text = p.get_text()
             
-        if len(re.findall(r"\.{4,}", text)) >= 8:
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        # A table-of-contents / index line is "<heading text> ....  <page no>":
+        # a run of words, then dot leaders or a wide gap, then a 1-3 digit page
+        # number at the end of the line. Counting these is a reliable TOC signal.
+        # The previous rule counted every bare 1-2 digit number on the page,
+        # which flagged spec-table pages ("USB 2.0", "4K 30 FPS", "64 pcs", ...)
+        # as navigation and dropped the entire page - table, content and all -
+        # from every check.
+        toc_lines = sum(1 for ln in lines if _TOC_ENTRY_RE.match(ln))
+        dot_runs = len(re.findall(r"\.{4,}", text))
+        if dot_runs >= 8:
             result.add(i)
-        elif (i <= max(1, int(total * 0.10))
-              and len(_NAV_INLINE_RE.findall(text)) >= 15
-              and _median_line_len(p, textpage=tp) <= 50):
+        elif (lines and toc_lines >= 8
+              and toc_lines / len(lines) >= 0.5
+              and i <= max(2, int(total * 0.15))):
+            # a dot-leader-free TOC: mostly "heading  <page no>" lines, near the
+            # front of the document
             result.add(i)
     return result
 
@@ -1528,7 +1555,22 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
                         if dwords and all(w in stage_section_lower for w in dwords):
                             reported = False
 
-                    # 4) Final gate: re-verify the fragment against the WHOLE
+                    # 4) A fragment made up entirely of short value/unit tokens
+                    #    ("9V", "4A", "2.4A") is a stacked value-and-sub-label
+                    #    spec pair — which one a layout engine's block sort
+                    #    reads first depends on pixel position, not wording, so
+                    #    "4A 9V 3A 12V" against PROD's "9V 4A 12V 3A" is the same
+                    #    spec table, reordered. If every token (with repeats)
+                    #    occurs somewhere in STAGE, order is not checked.
+                    if reported:
+                        frag_canon = _seq_tokens(frag_text)
+                        if frag_canon and all(_UNIT_VALUE_RE.match(t) for t in frag_canon):
+                            need = collections.Counter(frag_canon)
+                            if all(len(_seq_idx.get(t, ())) >= n
+                                  for t, n in need.items()):
+                                reported = False
+
+                    # 5) Final gate: re-verify the fragment against the WHOLE
                     #    STAGE document word by word, tolerating small gaps.
                     #    Only the parts with no counterpart anywhere in STAGE
                     #    survive — content that merely moved to the next page,
@@ -1802,6 +1844,7 @@ _CALLOUT_NUM_RE = re.compile(r"\d{1,2}\s*[.)]?")
 _XREF_RE = re.compile(r"\bpage\s+\d+", re.I)   # a cross-reference, not a label
 _LABEL_VALUE_RE = re.compile(r"\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+)?\s*(?:%|[a-zA-Z]+|°\s*[a-zA-Z]+)")
 _IMAGE_LABEL_LINE_CACHE = {}
+_FLAT_LINE_CACHE = {}
 
 # ── Text baked into artwork ──────────────────────────────────────────────────
 # STAGE renders some figures as a flat raster — the environment spec strip on
@@ -1813,12 +1856,13 @@ _OCR_PAGE_CACHE = {}
 _RASTER_PAGE_CACHE = {}
 _OCR_UNAVAILABLE = False
 _OCR_ANY_OK = False       # one page has been read: OCR itself works
-_OCR_MAX_PAGES = 8        # ceiling on pages read per label: STAGE draws a
+_OCR_MAX_PAGES = 16       # ceiling on pages read per label: STAGE draws a
                            # figure on or near the page PROD has it on, and
                            # scanning the whole document per label cost more
                            # than every other check put together
 _OCR_MIN_IMG_PT = (96, 32) # a raster smaller than this carries no readable
                            # label — icons and rules are not worth an OCR pass
+_PAGE_TEXT_TOKS_CACHE = {}
 
 
 def _ocr_page_text(pdf_path: str, page_no: int, dpi: int = 150) -> str:
@@ -1880,6 +1924,34 @@ def _raster_pages(pdf_path: str) -> set:
     return pages
 
 
+def _page_text_tokens(pdf_path: str, page_no: int) -> collections.Counter:
+    """Counter of canonical tokens in a page's own (non-OCR) selectable text.
+
+    A COUNT, not a set: a word that appears once in ordinary prose does not
+    disqualify a SEPARATE, additional occurrence of the same word genuinely
+    baked into the artwork ("3 cm" is mentioned once in a sentence and drawn
+    twice more as measurement labels on the diagram below it) — only the
+    occurrences already explained by the text layer should be discounted.
+    """
+    key = (os.path.abspath(pdf_path), page_no)
+    hit = _PAGE_TEXT_TOKS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    toks = collections.Counter()
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            toks = collections.Counter(_seq_tokens(doc[page_no - 1].get_text()))
+        finally:
+            doc.close()
+    except Exception:
+        pass
+    if len(_PAGE_TEXT_TOKS_CACHE) > 400:
+        _PAGE_TEXT_TOKS_CACHE.clear()
+    _PAGE_TEXT_TOKS_CACHE[key] = toks
+    return toks
+
+
 def _text_in_artwork(pdf_path: str, text: str, hint_page: int = 0,
                      skip_pages: set = None) -> bool:
     """True when every word of `text` is readable in this PDF's artwork.
@@ -1906,8 +1978,34 @@ def _text_in_artwork(pdf_path: str, text: str, hint_page: int = 0,
             return False
         if not got:
             continue
-        toks = set(_seq_tokens(got))
-        if all(w in toks for w in want):
+        # full=True OCR re-reads the page's ordinary selectable prose as well
+        # as its artwork, so a label whose words merely occur nearby in a
+        # numbered instruction ("the alignment arrow on the bottom of the
+        # lid...") looked "found in the artwork" even though the picture
+        # itself carries neither word. Counting occurrences (not just
+        # presence) is what keeps this from over-correcting the other way:
+        # "3 cm" mentioned once in a sentence and ALSO drawn twice more as
+        # measurement labels still counts those extra, genuinely-artwork
+        # occurrences — only counts already explained by the text layer are
+        # discounted.
+        ocr_counts = collections.Counter(_seq_tokens(got))
+        extra = ocr_counts - _page_text_tokens(pdf_path, pno)
+        want_counts = collections.Counter(want)
+        if all(extra.get(w, 0) >= n for w, n in want_counts.items()):
+            return True
+        # OCR runs words together and drops punctuation, so the token form can
+        # miss a label the picture plainly shows. The flattened form catches
+        # it — built from the SAME extra-occurrence words (in their original
+        # order, each consumed at most once), so ordinary prose cannot
+        # inflate this match either.
+        budget = dict(extra)
+        kept = []
+        for t in _seq_tokens(got):
+            if budget.get(t, 0) > 0:
+                kept.append(t)
+                budget[t] -= 1
+        got_extra = " ".join(kept)
+        if _flat_key(text) and _flat_key(text) in _flat_key(got_extra):
             return True
     return False
 
@@ -1935,6 +2033,39 @@ def _image_label_line_keys(pdf_path: str, nav_pages: set) -> set:
     if len(_IMAGE_LABEL_LINE_CACHE) > 6:
         _IMAGE_LABEL_LINE_CACHE.clear()
     _IMAGE_LABEL_LINE_CACHE[cache_key] = keys
+    return keys
+
+
+def _flat_line_keys(pdf_path: str, nav_pages: set) -> set:
+    """_flat_key() of every individual visible LINE in a PDF (not the whole
+    document flattened into one string — see the false-negative this fixes:
+    a short two-word label like "Alignment arrow" reads as a contiguous
+    substring of ordinary prose too ("the alignment arrow on the bottom of
+    the lid"), so matching against the whole document confirmed a caption
+    was "present" when it was really just those two words occurring next to
+    each other in an unrelated sentence elsewhere on the page.
+    """
+    cache_key = (os.path.abspath(pdf_path), tuple(sorted(nav_pages)))
+    cached = _FLAT_LINE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    document, keys = fitz.open(pdf_path), set()
+    for page_number, page in enumerate(document, 1):
+        if page_number in nav_pages:
+            continue
+        for block in _page_dict(page)["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                text = "".join(span.get("text", "")
+                               for span in line.get("spans", [])).strip()
+                key = _flat_key(text)
+                if key:
+                    keys.add(key)
+    document.close()
+    if len(_FLAT_LINE_CACHE) > 6:
+        _FLAT_LINE_CACHE.clear()
+    _FLAT_LINE_CACHE[cache_key] = keys
     return keys
 
 
@@ -2004,12 +2135,82 @@ def _image_labels(pdf_path: str, nav_pages: set):
     return out
 
 
+_FLAT_CACHE = {}
+
+
+def _flat_key(text: str) -> str:
+    """Letters and digits only, case-folded — punctuation and spacing removed.
+
+    A figure label is compared on the characters a reader sees, never on how the
+    two documents happen to space or punctuate them: "PC / Notebook" and
+    "PC/Notebook", "non-alcohol" and "non alcohol", an en dash and a hyphen are
+    the same label. Colour, weight and size play no part — a label that reads the
+    same is the same label.
+    """
+    t = unicodedata.normalize("NFKC", text or "").lower()
+    t = (t.replace("\u2013", "-").replace("\u2014", "-").replace("\u2019", "'")
+          .replace("\u00a0", " "))
+    return re.sub(r"[^0-9a-z\u00c0-\uffff]+", "", t)
+
+
+def _flat_document(pdf_path: str, nav_pages: set) -> str:
+    """The whole document as one flattened string, cached."""
+    key = (os.path.abspath(pdf_path), tuple(sorted(nav_pages or ())))
+    hit = _FLAT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    doc = fitz.open(pdf_path)
+    try:
+        parts = [page.get_text() for i, page in enumerate(doc, 1)
+                 if i not in (nav_pages or set())]
+    finally:
+        doc.close()
+    flat = _flat_key(" ".join(parts))
+    if len(_FLAT_CACHE) > 8:
+        _FLAT_CACHE.clear()
+    _FLAT_CACHE[key] = flat
+    return flat
+
+
+def _page_mapper(toc_results):
+    """prod page -> the STAGE page carrying the same section.
+
+    The two documents paginate differently, so a PROD page number is not a hint
+    about where to look in STAGE: page 51 of one is page 42 of the other. Every
+    matched heading gives one true correspondence, and pages between headings are
+    offset from the nearest one above.
+    """
+    marks = []
+    for r in toc_results or []:
+        try:
+            pp, sp = int(r.get("prod_page")), int(r.get("stage_page"))
+        except (TypeError, ValueError):
+            continue
+        if pp > 0 and sp > 0:
+            marks.append((pp, sp))
+    marks.sort()
+
+    def to_stage(prod_page: int) -> int:
+        if not marks or not prod_page:
+            return prod_page
+        best = marks[0]
+        for pp, sp in marks:
+            if pp <= prod_page:
+                best = (pp, sp)
+            else:
+                break
+        return max(1, best[1] + (prod_page - best[0]))
+
+    return to_stage
+
+
 def _image_label_issues(prod_path, stage_path, prod_nav, stage_nav,
-                        stage_idx, prod_idx):
+                        stage_idx, prod_idx, to_stage_page=None):
     """Figure labels PROD carries that STAGE does not."""
     _SHORT_LABEL = 6
     findings, seen = [], set()
     stage_line_keys = _image_label_line_keys(stage_path, stage_nav)
+    stage_flat_line_keys = _flat_line_keys(stage_path, stage_nav)
 
     # A figure label has to read *on a figure* in STAGE, not merely somewhere in
     # the document. "Headphone" labels the connection diagram in PROD; STAGE has
@@ -2032,10 +2233,37 @@ def _image_label_issues(prod_path, stage_path, prod_nav, stage_nav,
     for pno, label in _image_labels(prod_path, prod_nav):
         if _script_unreliable(label):
             continue                    # not comparable — see _script_unreliable
-        toks = _seq_tokens(label)
-        if not toks or label.lower() in seen:
+        # A callout number is valid as long as it is there. Whether it can be
+        # read back out of the artwork depends on how STAGE rasterised the
+        # drawing and on whether this machine has an OCR pack — neither says
+        # anything about the document. Reporting "1" as a missing label was
+        # noise, so numeric and symbol-only labels are left alone; the numbering
+        # itself is checked by _callout_gap_issues, which looks for gaps in the
+        # sequence rather than for one unreadable glyph.
+        if not re.search(r"[^\W\d_]", label or ""):
             continue
-        seen.add(label.lower())
+        # A bare measurement value ("3 cm", "9V") is spec data, not wording —
+        # the same "any dimension is fine" principle already applied to table
+        # cells and WxDxH labels. It is also the hardest kind of label to
+        # verify here: the number is stripped from every token comparison,
+        # and OCR often cannot read a short value/unit pair off a diagram at
+        # all, so a genuinely-present value reads as "missing" for reasons
+        # that have nothing to do with STAGE actually lacking it.
+        if _LABEL_VALUE_RE.fullmatch(label.strip()):
+            continue
+        toks = _seq_tokens(label)
+        if not toks:
+            continue
+        # De-dup only an exact repeat of this label ON THE SAME PAGE (a caption
+        # printed twice next to one figure). The same label text recurring on a
+        # DIFFERENT page/figure — the same icon captioned three times across the
+        # manual — is three independent instances; keying "seen" on the text
+        # alone collapsed them into one and silently dropped the other two, even
+        # when STAGE was missing the label from a different one of the three.
+        dedup_key = (pno, label.lower())
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
 
         # Labels often contain ranges, units and symbols. Compare the exact
         # rendered line first, keeping those values rather than dropping them
@@ -2049,7 +2277,18 @@ def _image_label_issues(prod_path, stage_path, prod_nav, stage_nav,
                 continue
             if _on_a_stage_figure(label, toks):
                 continue
-            if _text_in_artwork(stage_path, label, pno, stage_nav):
+            # Last guard before reporting: the label read as plain characters.
+            # Tokenisation splits on punctuation, so "PC / Notebook" and
+            # "PC/Notebook" produce different token runs while reading exactly
+            # the same. Checked against STAGE's own LINES, not the whole
+            # document flattened into one string — a short label's words can
+            # occur next to each other in an unrelated sentence too ("the
+            # alignment arrow on the bottom of the lid" contains "alignment
+            # arrow"), which a whole-document match wrongly called present.
+            if _flat_key(label) in stage_flat_line_keys:
+                continue
+            hint = to_stage_page(pno) if to_stage_page else pno
+            if _text_in_artwork(stage_path, label, hint, stage_nav):
                 continue        # STAGE draws it into the figure — see above
             if stage_fig_idx is None:
                 # STAGE's figures could not be located at all. Falling back to
@@ -2065,7 +2304,10 @@ def _image_label_issues(prod_path, stage_path, prod_nav, stage_nav,
             for gap in _refine_fragment(_tokenize(label), stage_idx, prod_idx):
                 if _script_unreliable(gap) or _all_words_present(gap, stage_idx):
                     continue
-                if _text_in_artwork(stage_path, gap, pno, stage_nav):
+                if _flat_key(gap) in stage_flat_line_keys:
+                    continue
+                hint = to_stage_page(pno) if to_stage_page else pno
+                if _text_in_artwork(stage_path, gap, hint, stage_nav):
                     continue    # STAGE draws it into the figure — see above
                 findings.append({"page": pno, "text": gap})
     return findings
@@ -2484,7 +2726,7 @@ def _nearest_figure(page, text_rect, figs):
 
 
 def _figure_diff_issues(prod_path, stage_path, prod_nav, stage_nav, stage_idx,
-                        max_figures: int = 80):
+                        max_figures: int = 2000):
     """Figures whose STAGE artwork does not match PROD's.
 
     Each PROD figure is paired with a STAGE figure through the caption printed
@@ -2579,18 +2821,363 @@ def _figure_diff_issues(prod_path, stage_path, prod_nav, stage_nav, stage_idx,
     return findings
 
 
+# ── Coloured annotation boxes on a figure ────────────────────────────────────
+# SSIM is useless across two render pipelines, but a strongly-coloured region
+# (a red callout box, a highlight) is unambiguous in both.  This compares only
+# the amount of saturated colour, per hue, between paired figures — so a red box
+# PROD draws on a screenshot that STAGE omits (or vice-versa) is caught even
+# though the rest of the picture "differs" by SSIM in every pair.
+_COLOR_NAMES = (("red", (0, 12)), ("red", (168, 180)), ("orange", (13, 27)),
+                ("yellow", (28, 40)), ("green", (41, 90)),
+                ("blue", (91, 135)), ("purple", (136, 167)))
+_COLOR_PROD_MIN = 0.015   # 1.5%..35% of the figure is this hue in one document
+_COLOR_PROD_MAX = 0.35    # (more than a third is a colour photo, not a box)
+_COLOR_OTHER_MAX = 0.004  # and under 0.4% in the other
+
+
+def _figure_colours(page, rect):
+    """{hue name: fraction of the figure that is strongly that colour}."""
+    if not _CV_OK:
+        return {}
+    try:
+        pix = page.get_pixmap(clip=rect, matrix=fitz.Matrix(2, 2))
+        img = _np.frombuffer(pix.samples, dtype=_np.uint8).reshape(
+            pix.height, pix.width, pix.n)
+    except Exception:  # noqa: BLE001
+        return {}
+    if pix.n < 3 or img.size == 0:
+        return {}
+    img = img[:, :, :3]
+    hsv = _cv2.cvtColor(img, _cv2.COLOR_RGB2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    strong = (s > 90) & (v > 60) & (v < 250)
+    total = float(img.shape[0] * img.shape[1]) or 1.0
+    out = {}
+    for name, (lo, hi) in _COLOR_NAMES:
+        mask = strong & (h >= lo) & (h <= hi)
+        out[name] = out.get(name, 0.0) + mask.sum() / total
+    return out
+
+
+def _figure_colour_issues(prod_path, stage_path, prod_nav, stage_nav,
+                          toc_results, max_findings: int = 40):
+    """Figures where one document paints a coloured box / highlight the other
+    does not — paired by their order within a shared section heading."""
+    if not _CV_OK or os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    prod_doc, stage_doc = fitz.open(prod_path), fitz.open(stage_path)
+    findings = []
+    try:
+        p_ranges = _section_ranges(toc_results, "prod", prod_doc.page_count)
+        s_ranges = {t: (a, b) for t, a, b in
+                    _section_ranges(toc_results, "stage", stage_doc.page_count)}
+        for title, p_first, p_last in p_ranges:
+            if len(findings) >= max_findings or title not in s_ranges:
+                continue
+            s_first, s_last = s_ranges[title]
+            p_figs = _section_figures(prod_doc, prod_nav, p_first, p_last)
+            s_figs = _section_figures(
+                stage_doc, stage_nav, s_first,
+                min(stage_doc.page_count, s_last + _SECTION_SPILLOVER))
+            if not p_figs or not s_figs:
+                continue
+            if len(p_figs) > _IMG_MAX_PER_SEC or len(s_figs) > _IMG_MAX_PER_SEC:
+                continue
+            for (p_pno, p_rect, _pt), (s_pno, s_rect, _st) in zip(p_figs, s_figs):
+                if len(findings) >= max_findings:
+                    break
+                if min(p_rect.width, p_rect.height) < 40:
+                    continue
+                pc = _figure_colours(prod_doc[p_pno - 1], p_rect)
+                sc = _figure_colours(stage_doc[s_pno - 1], s_rect)
+                for name in set(pc) | set(sc):
+                    pf, sf = pc.get(name, 0.0), sc.get(name, 0.0)
+                    if (_COLOR_PROD_MIN <= pf <= _COLOR_PROD_MAX
+                            and sf < _COLOR_OTHER_MAX):
+                        who, gone, frac = "PROD", "STAGE", pf
+                    elif (_COLOR_PROD_MIN <= sf <= _COLOR_PROD_MAX
+                          and pf < _COLOR_OTHER_MAX):
+                        who, gone, frac = "STAGE", "PROD", sf
+                    else:
+                        continue
+                    cap = _figure_caption_text(prod_doc[p_pno - 1], p_rect) or title
+                    findings.append({
+                        "page": p_pno, "stage_page": s_pno,
+                        "anchor": cap[:60], "colour": name,
+                        "has": who, "missing": gone,
+                        "pct": round(frac * 100, 1)})
+                    break
+    finally:
+        prod_doc.close()
+        stage_doc.close()
+    return findings
+
+
+# ── Image mismatch, section by section ───────────────────────────────────────
+# _figure_diff_issues can only judge a figure that carries a caption, because a
+# caption is the one thing that pairs the same picture across two differently
+# paginated documents. Most artwork in these manuals has no caption at all, so
+# most of it was never compared.
+#
+# A section gives the pairing instead: whatever illustrations PROD prints under
+# a heading, STAGE must print the same ones under that heading. Each PROD figure
+# is matched to its closest STAGE figure inside the same section; a PROD figure
+# with no close match is missing or has been replaced, and a STAGE figure left
+# over is artwork PROD does not have.
+_IMG_MATCH_LIMIT = 0.16   # thumbnails closer than this are the same picture
+_IMG_MAX_PER_SEC = 12     # guard: a section with more figures than this is a
+                          # gallery, and pairing degenerates into guesswork
+_SECTION_SPILLOVER = 3    # STAGE pages searched past a section's nominal end —
+                          # reflow routinely pushes a topic's own figures onto
+                          # what the TOC marks as the next section's first page,
+                          # and that is not a defect against this section. STAGE
+                          # can also bookmark several fine-grained headings
+                          # (e.g. "Screen Message", "Room Name") that PROD
+                          # keeps as one broader section's body text, each
+                          # eating into the page range before it — 2 pages
+                          # wasn't always enough to still reach content that
+                          # legitimately belongs to the section being checked.
+
+
+def _section_ranges(toc_results, side: str, page_count: int):
+    """[(title, first page, last page)] over one document's pages.
+
+    Several headings can share one page (a compact overview page with a few
+    sub-headings and no page of their own) — clamping a section's end to at
+    least its own start page means every heading still gets a range instead
+    of silently vanishing because its "span" would otherwise be negative.
+    """
+    marks = _section_page_index(toc_results, side)
+    out = []
+    for n, (pg, title) in enumerate(marks):
+        nxt = (marks[n + 1][0] - 1) if n + 1 < len(marks) else page_count
+        out.append((title, pg, max(pg, min(nxt, page_count))))
+    return out
+
+
+def _section_figures(doc, nav_pages, first, last):
+    """[(page, rect, thumbnail)] for every figure in a page range.
+
+    _detect_figures erases the words and keeps whatever ink is left, so a
+    shaded NOTE / IMPORTANT panel survives as a big blob and is returned as a
+    "figure". Those phantoms broke the section comparison three ways: they
+    inflated one side's figure count, they stole greedy matches from real
+    artwork, and they left genuine figures reported as mismatched. The text
+    coverage guard is the one _figure_regions already uses for this.
+    """
+    out = []
+    for pno in range(first, min(last, doc.page_count) + 1):
+        if pno in nav_pages:
+            continue
+        page = doc[pno - 1]
+        for rect in _detect_figures(page):
+            if _region_text_cover(page, rect) > _FIG_MAX_TEXT_COVER:
+                continue                  # a note box, not a picture
+            thumb = _figure_thumb(page, rect)
+            if thumb:
+                out.append((pno, rect, thumb))
+    return out
+
+
+_ALIGN_TOL_FRAC = 0.06     # of the text column width
+
+
+def _align_of(rect, col):
+    """"left-aligned" / "centred" / "right-aligned", or None when it is none of
+    those. A figure sitting at some other offset is a deliberate inset, and
+    guessing at it is what makes a placement check noisy."""
+    cl, cr = col
+    cw = (cr - cl) or 1.0
+    tol = max(14.0, _ALIGN_TOL_FRAC * cw)
+    left_gap = rect.x0 - cl
+    right_gap = cr - rect.x1
+    # Touching the left margin wins, and is tested first: a full-width line has
+    # its midpoint on the column centre too, and testing "centred" first called
+    # every ordinary justified paragraph line centred.
+    if left_gap <= tol:
+        return "left-aligned"
+    if right_gap <= tol:
+        return "right-aligned"
+    if abs(left_gap - right_gap) <= tol:
+        return "centred"          # inset from both edges by the same amount
+    return None
+
+
+def _figure_align_issues(prod_path, stage_path, prod_nav, stage_nav,
+                         toc_results, max_findings: int = 2000):
+    """The same figure placed differently in the text column.
+
+    Only figures matched by their own artwork are compared — each PROD figure
+    is paired with the STAGE figure that looks like it, so this never compares
+    two different pictures, which is what made a statistical "does this
+    document centre its figures" test unusable across two layout engines.
+    """
+    if not _CV_OK or os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    p_col = _text_column(prod_path, prod_nav)
+    s_col = _text_column(stage_path, stage_nav)
+    if not p_col or not s_col:
+        return []
+    prod_doc, stage_doc = fitz.open(prod_path), fitz.open(stage_path)
+    findings = []
+    try:
+        p_ranges = _section_ranges(toc_results, "prod", prod_doc.page_count)
+        s_ranges = {t: (a, b) for t, a, b in
+                    _section_ranges(toc_results, "stage", stage_doc.page_count)}
+        for title, p_first, p_last in p_ranges:
+            if len(findings) >= max_findings or title not in s_ranges:
+                continue
+            s_first, s_last = s_ranges[title]
+            p_figs = _section_figures(prod_doc, prod_nav, p_first, p_last)
+            s_last_search = min(stage_doc.page_count, s_last + _SECTION_SPILLOVER)
+            s_figs = _section_figures(stage_doc, stage_nav, s_first, s_last_search)
+            if not p_figs or not s_figs:
+                continue
+            if len(p_figs) > _IMG_MAX_PER_SEC or len(s_figs) > _IMG_MAX_PER_SEC:
+                continue
+            taken = set()
+            for p_pno, p_rect, p_thumb in p_figs:
+                best, best_d = None, None
+                for j, (_s_pno, _s_rect, s_thumb) in enumerate(s_figs):
+                    if j in taken:
+                        continue
+                    d = _thumb_diff(p_thumb, s_thumb)
+                    if d is None:
+                        continue
+                    if best_d is None or d < best_d:
+                        best, best_d = j, d
+                if best is None or best_d is None or best_d > _IMG_MATCH_LIMIT:
+                    continue      # not the same artwork — not this check's business
+                taken.add(best)
+                s_pno, s_rect, _ = s_figs[best]
+                p_align, s_align = _align_of(p_rect, p_col), _align_of(s_rect, s_col)
+                if not p_align or not s_align or p_align == s_align:
+                    continue
+                p_off = (p_rect.x0 + p_rect.x1) / 2.0 - (p_col[0] + p_col[1]) / 2.0
+                s_off = (s_rect.x0 + s_rect.x1) / 2.0 - (s_col[0] + s_col[1]) / 2.0
+                findings.append({
+                    "anchor": title, "page": p_pno, "prod_page": p_pno,
+                    "stage_page": s_pno, "prod_align": p_align,
+                    "stage_align": s_align, "shift": s_off - p_off,
+                })
+    finally:
+        prod_doc.close()
+        stage_doc.close()
+    return findings
+
+
+def _ordinal(n):
+    return f"{n}{'th' if 11 <= n % 100 <= 13 else {1:'st',2:'nd',3:'rd'}.get(n % 10, 'th')}"
+
+
+def _where_on_page(page, rect, siblings):
+    """Plain English for where a figure sits: which one it is, and whereabouts.
+
+    "page 18" alone is not enough to find a picture on a page holding four of
+    them, which is what made these findings hard to act on.
+    """
+    h = page.rect.height or 1.0
+    w = page.rect.width or 1.0
+    band = ("top" if rect.y0 < h * 0.33 else
+            "middle" if rect.y0 < h * 0.66 else "bottom")
+    cx = (rect.x0 + rect.x1) / 2.0
+    side = ("left" if cx < w * 0.4 else
+            "right" if cx > w * 0.6 else "centre")
+    same = sorted(siblings, key=lambda r: (r.y0, r.x0))
+    n = len(same)
+    try:
+        idx = next(i for i, r in enumerate(same, 1)
+                   if abs(r.y0 - rect.y0) < 0.5 and abs(r.x0 - rect.x0) < 0.5)
+    except StopIteration:
+        idx = 1
+    which = (f"the only figure on the page" if n == 1 else
+             f"the {_ordinal(idx)} of {n} figures on the page")
+    return f"{which}, {band} {side}"
+
+
+def _figure_caption_text(page, rect):
+    """The words printed beside a figure, for naming it in the report."""
+    try:
+        cap = _caption_for(page, rect, _page_lines(page))
+    except Exception:
+        cap = None
+    return " ".join((cap or "").split())[:90]
+
+
+def _image_mismatch_issues(prod_path, stage_path, prod_nav, stage_nav,
+                           toc_results, max_findings: int = 2000):
+    """PROD figures a section has more of than STAGE has anywhere to answer for.
+
+    Whether STAGE's picture is pixel-identical to PROD's is not this check's
+    business — a re-touched or re-cropped shot of the same subject still reads
+    as "the picture is there", and judging identity from a thumbnail diff is
+    what made the same STAGE figure read as "a different picture" against
+    several PROD figures at once. This only counts pictures: PROD's figures in
+    a section are matched one-for-one against STAGE's (STAGE's search reaching
+    a couple of pages past the section end for reflow); once STAGE runs out,
+    every PROD figure left over is reported missing. A figure's own caption is
+    still checked separately by the image-label check.
+    """
+    if not _CV_OK or os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    prod_doc, stage_doc = fitz.open(prod_path), fitz.open(stage_path)
+    findings = []
+    try:
+        p_ranges = _section_ranges(toc_results, "prod", prod_doc.page_count)
+        s_ranges = {t: (a, b) for t, a, b in
+                    _section_ranges(toc_results, "stage", stage_doc.page_count)}
+        for title, p_first, p_last in p_ranges:
+            if len(findings) >= max_findings or title not in s_ranges:
+                continue
+            s_first, s_last = s_ranges[title]
+            p_figs = _section_figures(prod_doc, prod_nav, p_first, p_last)
+            if not p_figs or len(p_figs) > _IMG_MAX_PER_SEC:
+                continue
+            s_last_search = min(stage_doc.page_count, s_last + _SECTION_SPILLOVER)
+            s_figs = _section_figures(stage_doc, stage_nav, s_first, s_last_search)
+            if len(s_figs) > _IMG_MAX_PER_SEC:
+                continue
+            shortfall = len(p_figs) - len(s_figs)
+            if shortfall <= 0:
+                continue           # STAGE has at least as many pictures here
+            p_by_page = {}
+            for pno, rect, _t in p_figs:
+                p_by_page.setdefault(pno, []).append(rect)
+            for p_pno, p_rect, _p_thumb in p_figs[-shortfall:]:
+                if len(findings) >= max_findings:
+                    break
+                p_page = prod_doc[p_pno - 1]
+                findings.append({
+                    "section": title, "page": s_first, "prod_page": p_pno,
+                    "kind": "missing",
+                    "prod_where": _where_on_page(p_page, p_rect,
+                                                 p_by_page.get(p_pno, [])),
+                    "caption": _figure_caption_text(p_page, p_rect),
+                })
+    finally:
+        prod_doc.close()
+        stage_doc.close()
+    return findings
+
+
 # ── Text that lives inside artwork ───────────────────────────────────────────
 _FIG_TEXT_CACHE = {}
 
 
 def _figure_text_keys(pdf_path: str, nav_pages: set) -> set:
-    """Canonical text of every line that sits inside a figure.
+    """Canonical text of every line that sits inside a figure, or is repeated
+    verbatim elsewhere on the same page.
 
     Labels printed inside a drawing ("0-40°C" under a thermometer icon) are text
     in one document and part of the artwork in the other. Comparing them reports
     the same visible information as missing or added purely because of how it was
     produced, so they are kept out of the content comparison and left to the
     image-label check, which is anchored and conservative.
+
+    A short line repeated word-for-word elsewhere on the same page is caught
+    too, even when it sits in the gap between two panels rather than literally
+    on top of one — a real sentence is not printed twice on one page, but a
+    "before/after" UI-state caption drawn once per panel is.
     """
     key = (os.path.abspath(pdf_path), tuple(sorted(nav_pages)))
     hit = _FIG_TEXT_CACHE.get(key)
@@ -2600,13 +3187,16 @@ def _figure_text_keys(pdf_path: str, nav_pages: set) -> set:
     for i, page in enumerate(doc, 1):
         if i in nav_pages:
             continue
+        lines = _page_lines(page)
         figs = _detect_figures(page)
-        if not figs:
-            continue
         grown = [fitz.Rect(f.x0 - 6, f.y0 - 6, f.x1 + 6, f.y1 + 6) for f in figs]
-        for txt, rect in _page_lines(page):
+        counts = collections.Counter(txt for txt, _r in lines)
+        for txt, rect in lines:
             mid = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
-            if any(g.contains(mid) for g in grown):
+            in_figure = any(g.contains(mid) for g in grown)
+            n_toks = len(_seq_tokens(txt))
+            duplicated = counts[txt] >= 2 and 3 <= n_toks <= 8
+            if in_figure or duplicated:
                 for tok in _seq_tokens(txt):
                     out.add(tok)
     doc.close()
@@ -2625,43 +3215,108 @@ def _is_artwork_text(fragment: str, fig_tokens: set) -> bool:
 
 
 # ── Diagram callout numbers with gaps ────────────────────────────────────────
-def _callout_gap_issues(pdf_path: str, nav_pages: set, doc_label: str = "STAGE"):
-    """Diagrams whose callout numbers skip values.
-
-    A labelled diagram numbers its parts 1..N. When the rendered page shows
-    1, 2, 3, 4, 8 the leader lines for 5, 6 and 7 are still drawn but their
-    numbers never made it — the label is missing, which is exactly the kind of
-    loss a reader notices and a text comparison cannot see.
-    """
-    doc, found, seen = fitz.open(pdf_path), [], set()
+def _diagram_callout_numbers(pdf_path: str, nav_pages: set) -> dict:
+    """{page: [set(callout numbers), ...]} — one set per figure with >= 3 of
+    them nearby. A bare 1-2 digit number inside a real table is a cell value
+    (a port number, a spec figure) — not a diagram callout, so numbers that
+    land inside a detected table are excluded (see the port-number-table
+    false positive this guards against: 22/53/80 read as callouts 22..80,
+    "missing" 23-79)."""
+    doc, out = fitz.open(pdf_path), {}
     for i, page in enumerate(doc, 1):
         if i in nav_pages:
             continue
         figs = _detect_figures(page)
         if not figs:
             continue
+        try:
+            tbl_boxes = [fitz.Rect(t.bbox) for t in page.find_tables().tables]
+        except Exception:
+            tbl_boxes = []
         lines = _page_lines(page)
         for fig in figs:
             near = fitz.Rect(fig.x0 - 40, fig.y0 - 40, fig.x1 + 40, fig.y1 + 40)
             nums = set()
             for txt, rect in lines:
                 m = _CALLOUT_RE.match(txt)
-                if m and near.intersects(rect):
-                    nums.add(int(m.group(1)))
-            if len(nums) < 3:
-                continue
-            lo, hi = min(nums), max(nums)
-            missing = [n for n in range(lo, hi + 1) if n not in nums]
-            if not missing:
-                continue
-            # Overlapping regions on one page describe the same diagram.
-            key = (i, tuple(sorted(nums)))
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append({"doc": doc_label, "page": i,
-                          "present": sorted(nums), "missing": missing})
+                if not (m and near.intersects(rect)):
+                    continue
+                mid = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+                if any(tb.contains(mid) for tb in tbl_boxes):
+                    continue
+                nums.add(int(m.group(1)))
+            # A real diagram's callouts are a dense run (1..N); a stray page
+            # number or unrelated digit sitting within the search radius of a
+            # small handful of numbered-list markers produces a wide, sparse
+            # set instead (e.g. {1, 2, 3, 4, 62}) — require the numbers found
+            # to cover at least 40% of their own span before trusting them.
+            span = (max(nums) - min(nums) + 1) if nums else 0
+            if len(nums) >= 3 and len(nums) >= span * 0.4:
+                out.setdefault(i, []).append(nums)
     doc.close()
+    return out
+
+
+def _callout_gap_issues(prod_path: str, stage_path: str, prod_nav: set,
+                        stage_nav: set, toc_results):
+    """Diagram callout numbers PROD carries that STAGE does not render.
+
+    A labelled diagram numbers its parts 1..N. Comparing PROD's numbers for a
+    diagram against every callout STAGE carries in the same section catches
+    both ways that loss shows up: STAGE's own sequence skipping a value in its
+    range (1, 2, 3, 4, 8 — the leader lines for 5, 6, 7 are drawn but the
+    numbers never made it), and STAGE simply carrying fewer callouts than
+    PROD's diagram altogether (PROD numbers 1..8, STAGE only 1..3). Scoped to
+    the section, not the whole document, so a number that legitimately repeats
+    across a different diagram elsewhere is not mistaken for "present".
+    """
+    prod_by_page = _diagram_callout_numbers(prod_path, prod_nav)
+    if not prod_by_page:
+        return []
+    stage_by_page = _diagram_callout_numbers(stage_path, stage_nav)
+
+    prod_doc = fitz.open(prod_path)
+    prod_pages = prod_doc.page_count
+    prod_doc.close()
+    stage_doc = fitz.open(stage_path)
+    stage_pages = stage_doc.page_count
+    stage_doc.close()
+
+    p_ranges = _section_ranges(toc_results, "prod", prod_pages)
+    s_ranges = {t: (a, b) for t, a, b in
+               _section_ranges(toc_results, "stage", stage_pages)}
+
+    found, seen = [], set()
+    for title, p_first, p_last in p_ranges:
+        if title not in s_ranges:
+            continue
+        s_first, s_last = s_ranges[title]
+        s_last_search = min(stage_pages, s_last + _SECTION_SPILLOVER)
+        stage_nums_here = set()
+        for pno in range(s_first, s_last_search + 1):
+            for nums in stage_by_page.get(pno, []):
+                stage_nums_here |= nums
+        for pno in range(p_first, p_last + 1):
+            for nums in prod_by_page.get(pno, []):
+                missing = sorted(nums - stage_nums_here)
+                if not missing:
+                    continue
+                key = (pno, tuple(sorted(nums)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                present_s = ", ".join(str(n) for n in sorted(nums))
+                missing_s = ", ".join(str(n) for n in missing)
+                found.append({
+                    "prod_page": pno, "stage_page": s_first,
+                    "stage_first": s_first, "stage_last": s_last_search,
+                    "present": sorted(nums), "missing": missing,
+                    "title": f"Diagram numbered {present_s}",
+                    "detail": (f"PROD numbers this diagram {present_s} — "
+                              f"{missing_s} "
+                              f"{'is' if len(missing) == 1 else 'are'} not "
+                              f"there on STAGE's diagram."),
+                })
     return found
 
 
@@ -2749,12 +3404,60 @@ def _table_page_spans(pdf_path: str, nav_pages: set):
     return out
 
 
+def _span_repeats_header(pdf_path: str, nav_pages: set, header_key: str,
+                         first_page: int, last_page: int) -> bool:
+    """True when every continuation page of a table span re-prints its header.
+
+    A page break inside a table is only a reader problem when the rows on the
+    next page have no column labels. When each continuation page opens with the
+    header row again (PROD and STAGE both do this on the OSD menu tables), the
+    split is ordinary pagination and must not be reported as broken layout.
+    """
+    if last_page <= first_page or not header_key:
+        return False
+    hset = set(header_key.split(" "))
+    if not hset:
+        return False
+    doc = fitz.open(pdf_path)
+    try:
+        for pno in range(first_page + 1, last_page + 1):
+            if pno in nav_pages or pno > doc.page_count:
+                return False
+            page = doc[pno - 1]
+            try:
+                tbls = page.find_tables().tables
+            except Exception:
+                return False
+            ph = page.rect.height or 1.0
+            tops = []
+            for t in tbls:
+                try:
+                    rows = t.extract()
+                except Exception:
+                    continue
+                if not rows or (t.col_count or 0) < 2:
+                    continue
+                tops.append((fitz.Rect(t.bbox).y0 / ph, rows[0]))
+            if not tops:
+                return False
+            _, first_row = min(tops, key=lambda r: r[0])
+            row_key = " ".join(_seq_tokens(" | ".join((c or "") for c in first_row)))
+            cset = set(row_key.split(" "))
+            if row_key != header_key and (
+                    not cset or len(hset & cset) / len(hset) < 0.6):
+                return False
+    finally:
+        doc.close()
+    return True
+
+
 def _table_break_issues(prod_path, stage_path, prod_nav, stage_nav):
     """Tables that STAGE splits over more pages than PROD does.
 
     This is the layout question a reader notices: a table that sits whole on one
     page in PROD but is broken by a page boundary in STAGE, so its rows are cut
-    apart from their header.
+    apart from their header. A split where STAGE re-prints the header on every
+    continuation page is ordinary pagination, not a defect, and is not reported.
     """
     if os.path.abspath(prod_path) == os.path.abspath(stage_path):
         return []
@@ -2769,56 +3472,405 @@ def _table_break_issues(prod_path, stage_path, prod_nav, stage_nav):
         p_pages, s_pages = p1 - p0 + 1, s1 - s0 + 1
         if s_pages <= p_pages:
             continue
+        if _span_repeats_header(stage_path, stage_nav, key, s0, s1):
+            continue          # header repeats on every page — valid pagination
         findings.append({"page": s0, "prod_page": p0,
                          "prod_pages": p_pages, "stage_pages": s_pages,
                          "stage_from": s0, "stage_to": s1, "header": phead})
     return findings
 
 
-# ── Table structure ──────────────────────────────────────────────────────────
-def _table_shape_issues(prod_path, stage_path, prod_nav, stage_nav):
-    """Tables whose column count in STAGE does not match PROD.
+def _table_continuation_header_issues(pdf_path: str, doc_label: str,
+                                      nav_pages: set):
+    """A table that runs onto the next page but does not repeat its header row.
 
-    Not a pixel comparison — the question is structural: a three-column table
-    must still be three columns, and a single cell must not be split apart.
-    Tables are paired by their header wording so differing pagination does not
-    matter.
+    A page break inside a table is fine as long as the continuation carries the
+    same column header — the reader on that page still knows what each column
+    means. When the continuation starts straight into data rows, the columns are
+    unlabelled. STAGE-only structural check.
+    """
+    doc = fitz.open(pdf_path)
+    per_page: dict = {}
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in nav_pages:
+                continue
+            ph = page.rect.height or 1.0
+            try:
+                tbls = page.find_tables().tables
+            except Exception:
+                tbls = []
+            recs = []
+            for t in tbls:
+                try:
+                    rows = t.extract()
+                except Exception:
+                    continue
+                if not rows or (t.col_count or 0) < 2:
+                    continue
+                bb = fitz.Rect(t.bbox)
+                recs.append({"ncol": t.col_count, "rows": rows,
+                             "top": bb.y0 / ph, "bot": bb.y1 / ph})
+            if recs:
+                per_page[i] = recs
+    finally:
+        doc.close()
+
+    def _rowkey(row):
+        return " ".join(_seq_tokens(" | ".join((c or "") for c in row)))
+
+    findings = []
+    for i, recs in per_page.items():
+        nxt = per_page.get(i + 1)
+        if not nxt:
+            continue
+        bottom = max(recs, key=lambda r: r["bot"])
+        if bottom["bot"] < 0.85:
+            continue                       # table did not reach the page end
+        top = min(nxt, key=lambda r: r["top"])
+        if top["top"] > 0.30 or top["ncol"] != bottom["ncol"]:
+            continue                       # a fresh table, not a continuation
+        header_key = _rowkey(bottom["rows"][0])
+        if len(header_key.split(" ")) < 2:
+            continue                       # no real header row to repeat
+        # The first row must read like real column headers — two or more short
+        # label cells. A single long cell ("BenQ LCD Monitor", "Regulatory
+        # Statements") is a boxed layout block, not a data table, and its
+        # "continuation" is just body text flowing onto the next page.
+        real_head = [h for h in
+                     (" ".join((c or "").split()) for c in bottom["rows"][0])
+                     if h and len(h.split()) <= _MAX_HEADER_WORDS
+                     and any(len(w) >= 3 for w in _WORD_TOKEN_RE.findall(h))]
+        if len(real_head) < 2:
+            continue
+        cont_first = _rowkey(top["rows"][0])
+        if cont_first == header_key:
+            continue                       # header repeated — this is fine
+        hset = set(header_key.split(" "))
+        cset = set(cont_first.split(" "))
+        if hset and len(hset & cset) / len(hset) >= 0.6:
+            continue                       # near-match (one column relabelled)
+        head_shown = " | ".join(h for h in
+                                (str(c or "").strip() for c in bottom["rows"][0])
+                                if h)
+        findings.append({"doc": doc_label, "page": i + 1, "prev_page": i,
+                         "header": head_shown, "text": head_shown,
+                         "detail": (f"table continues from page {i} to page "
+                                    f"{i + 1} without repeating its header")})
+    return findings
+
+
+# ── Table structure ──────────────────────────────────────────────────────────
+_TABLE_PAIR_MIN = 0.25    # cell overlap before two tables are the same table
+_MARGIN_TOL_PT = 12.0     # a table may sit this far outside the text column
+                          # before it counts as breaking the margin: table
+                          # borders and cell padding routinely overhang by a few
+                          # points, and reporting that is noise
+
+
+def _text_column(pdf_path: str, nav_pages: set):
+    """(left, right) of the body text column, in points.
+
+    Measured from the paragraphs themselves rather than from the page size: the
+    printable area is wherever the document actually sets its text, and that is
+    what a table has to stay inside to look right.
+    """
+    doc, lefts, rights = fitz.open(pdf_path), [], []
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in nav_pages:
+                continue
+            for b in page.get_text("blocks"):
+                if b[6] != 0 or (b[3] - b[1]) < 8:
+                    continue          # not text, or a single short line
+                if len(_seq_tokens(b[4] or "")) < 6:
+                    continue          # running head, page number, caption
+                lefts.append(b[0])
+                rights.append(b[2])
+    finally:
+        doc.close()
+    if len(lefts) < 10:
+        return None
+    lefts.sort(); rights.sort()
+    return lefts[len(lefts) // 10], rights[-max(1, len(rights) // 10)]
+
+
+def _table_margin_issues(prod_path, stage_path, prod_nav, stage_nav):
+    """STAGE tables that run outside the text column PROD keeps its tables in."""
+    if os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    s_col = _text_column(stage_path, stage_nav)
+    p_col = _text_column(prod_path, prod_nav)
+    if not s_col or not p_col:
+        return []
+
+    def overflow(bbox, col):
+        left = col[0] - bbox[0]
+        right = bbox[2] - col[1]
+        return max(0.0, left), max(0.0, right)
+
+    # A table PROD also sets outside its own column is a house style, not a
+    # STAGE defect, so those are matched by header and left alone.
+    prod_boxes = {}
+    doc = fitz.open(prod_path)
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in prod_nav:
+                continue
+            try:
+                for t in page.find_tables():
+                    head = " ".join(_seq_tokens(" ".join(
+                        c or "" for c in (t.extract() or [[]])[0])))
+                    if head:
+                        l, r = overflow(t.bbox, p_col)
+                        prod_boxes.setdefault(head, max(l, r))
+            except Exception:
+                continue
+    finally:
+        doc.close()
+
+    findings = []
+    doc = fitz.open(stage_path)
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in stage_nav:
+                continue
+            try:
+                tables = page.find_tables()
+            except Exception:
+                continue
+            for t in tables:
+                l, r = overflow(t.bbox, s_col)
+                if max(l, r) <= _MARGIN_TOL_PT:
+                    continue
+                rows = t.extract() or [[]]
+                head_cells = [c for c in (rows[0] if rows else []) if c]
+                head = " ".join(_seq_tokens(" ".join(head_cells)))
+                if head and prod_boxes.get(head, 0.0) > _MARGIN_TOL_PT:
+                    continue          # PROD sets it the same way
+                findings.append({
+                    "page": i,
+                    "header": " | ".join(re.sub(r"\s+", " ", c).strip()
+                                         for c in head_cells) or "(unheaded table)",
+                    "left": round(l), "right": round(r),
+                    "col_left": round(s_col[0]), "col_right": round(s_col[1]),
+                    "x0": round(t.bbox[0]), "x1": round(t.bbox[2]),
+                })
+    finally:
+        doc.close()
+    return findings
+
+
+def _table_shape_issues(prod_path, stage_path, prod_nav, stage_nav):
+    """Tables whose column layout in STAGE does not match PROD's.
+
+    Tables are paired by what is inside them, not by their header: pairing on the
+    header can only ever find tables that already agree, which is the one case
+    with nothing to report. Cells are compared as a set, so a table that STAGE
+    re-orders or re-paginates still pairs with its PROD original.
+
+    Only the headed columns are compared. A table with nested sub-rows makes the
+    detector's grid a column wider while the reader still sees the same columns,
+    and counting the grid reported that as a layout change when it is not one.
     """
     if os.path.abspath(prod_path) == os.path.abspath(stage_path):
         return []
 
     def shapes(path, nav):
-        out = {}
+        out = []
+        for pno, nrow, ncol, rows in _merge_continued_tables(
+                _crawl_tables(path, nav)):
+            if not rows:
+                continue
+            head = [" ".join((c or "").split()) for c in rows[0]]
+            filled = [h for h in head if h]
+            if len(filled) < 2:
+                continue
+            body = set()
+            for r in rows[1:]:
+                for c in r:
+                    k = " ".join(_seq_tokens(c or ""))
+                    if k:
+                        body.add(k)
+            if not body:
+                continue
+            out.append({"page": pno, "head": filled, "rows": nrow, "body": body,
+                        "keys": [" ".join(_seq_tokens(h)) for h in filled]})
+        return out
+
+    prod_t, stage_t = shapes(prod_path, prod_nav), shapes(stage_path, stage_nav)
+    if not prod_t or not stage_t:
+        return []
+
+    # Score every possible pairing, then take them best-first. Walking the PROD
+    # tables in order let an early table claim a STAGE table that was a better
+    # match for a later one, leaving the real counterpart unpaired.
+    scored = []
+    for pi, pt in enumerate(prod_t):
+        for si, st in enumerate(stage_t):
+            inter = len(pt["body"] & st["body"])
+            if not inter:
+                continue
+            scored.append((inter / len(pt["body"] | st["body"]), pi, si))
+    scored.sort(reverse=True)
+
+    findings, used_p, used_s = [], set(), set()
+    for score, pi, si in scored:
+        if score < _TABLE_PAIR_MIN or pi in used_p or si in used_s:
+            continue
+        used_p.add(pi); used_s.add(si)
+        pt, st = prod_t[pi], stage_t[si]
+        if pt["keys"] == st["keys"]:
+            continue
+        extra = [h for h, k in zip(st["head"], st["keys"]) if k not in pt["keys"]]
+        gone = [h for h, k in zip(pt["head"], pt["keys"]) if k not in st["keys"]]
+        reordered = (not extra and not gone)
+        # PROD is the baseline. A STAGE table that keeps every PROD column and
+        # merely adds one is not a PROD→STAGE loss — don't report it. Report a
+        # reordering, or a PROD column STAGE dropped.
+        if not gone and not reordered:
+            continue
+        # gone AND extra with nothing shared = the body overlap paired two
+        # different tables. Not a real column change.
+        if gone and extra and not (set(pt["keys"]) & set(st["keys"])):
+            continue
+        findings.append({
+            "page": st["page"], "prod_page": pt["page"],
+            "prod_cols": len(pt["head"]), "stage_cols": len(st["head"]),
+            "prod_head": pt["head"], "stage_head": st["head"],
+            "extra": extra, "gone": gone,
+            "reordered": reordered,
+            "header": " | ".join(pt["head"]),
+        })
+    return findings
+
+
+def _table_merge_issues(prod_path, stage_path, prod_nav, stage_nav):
+    """Tables where PROD and STAGE split their cells differently.
+
+    The reader-visible columns (the headed ones) are the same, but the body
+    grid underneath them is not: STAGE merges cells PROD keeps separate, or
+    splits a value PROD keeps whole into its own column / row — a nested
+    sub-value pushed into an extra column, a spanned label unspanned, two facts
+    a PROD cell combined ("… @ 30Hz / … 5 Gbps") pulled apart. The header check
+    passes because the headings did not change, so this is the check that
+    notices the merge.
+    """
+    if os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+
+    def grids(path, nav):
+        out = []
         for pno, nrow, ncol, rows in _merge_continued_tables(
                 _crawl_tables(path, nav)):
             if not rows or ncol < 2:
                 continue
-            head = [re.sub(r"\s+", " ", (c or "")).strip() for c in rows[0]]
-            # Count the headed columns, not the detector's grid. A table with
-            # nested sub-rows (STAGE sets "Main / Sub / PIP Size" inside the PIP
-            # row) makes the grid one column wider while the reader still sees
-            # the same three headed columns, and comparing grids reported that
-            # as a column change.
-            filled = [h for h in head if h]
-            if len(filled) < 2:
+            head = [" ".join((c or "").split()) for c in rows[0]]
+            if len([h for h in head if h]) < 2:
                 continue
-            key = " ".join(_seq_tokens(" ".join(filled)))
-            if len(key.split(" ")) >= 2:
-                out.setdefault(key, (pno, len(filled), nrow, " | ".join(filled)))
+            body = set()
+            for r in rows[1:]:
+                for c in r:
+                    k = " ".join(_seq_tokens(c or ""))
+                    if k:
+                        body.add(k)
+            if not body:
+                continue
+            out.append({"page": pno, "ncol": ncol, "nrow": nrow, "body": body,
+                        "rows": [[" ".join((c or "").split()) for c in r]
+                                 for r in rows[1:]],
+                        "hkey": tuple(" ".join(_seq_tokens(h))
+                                      for h in head if h),
+                        "header": " | ".join(h for h in head if h)})
         return out
 
-    prod_sh, stage_sh = shapes(prod_path, prod_nav), shapes(stage_path, stage_nav)
-    findings = []
-    for key, (ppage, pcol, _prow, phead) in prod_sh.items():
-        hit = stage_sh.get(key)
-        if not hit:
+    pg, sg = grids(prod_path, prod_nav), grids(stage_path, stage_nav)
+    if not pg or not sg:
+        return []
+
+    scored = []
+    for pi, p in enumerate(pg):
+        for si, s in enumerate(sg):
+            inter = len(p["body"] & s["body"])
+            if inter:
+                scored.append((inter / len(p["body"] | s["body"]), pi, si))
+    scored.sort(reverse=True)
+
+    findings, used_p, used_s = [], set(), set()
+    for score, pi, si in scored:
+        if score < _TABLE_PAIR_MIN or pi in used_p or si in used_s:
             continue
-        spage, scol, _srow, _ = hit
-        if scol == pcol:
+        used_p.add(pi); used_s.add(si)
+        p, s = pg[pi], sg[si]
+        if p["hkey"] != s["hkey"]:
+            continue                 # a header change — _table_shape_issues owns it
+        col_delta = s["ncol"] - p["ncol"]
+        # Only a column-count change is reported. A body-row-count difference is
+        # almost always find_tables() slicing a wrapped multi-line cell into
+        # extra rows — not a real structural change — and produced a page of
+        # false reports on the dense OSD menu tables.
+        if col_delta == 0:
             continue
-        findings.append({"page": spage, "prod_page": ppage,
-                         "prod_cols": pcol, "stage_cols": scol,
-                         "header": phead})
+        # Point at the actual rows: match each PROD row to the STAGE row that
+        # shares its wording, and keep the ones whose cell count differs.
+        examples = []
+        for pr in p["rows"]:
+            p_cells = [c for c in pr if c]
+            if len(p_cells) < 2:
+                continue
+            # Anchor the match on the row's most distinctive cell (usually the
+            # label), not on any shared word - a loose word overlap paired
+            # "Reset Mode" against an unrelated "(Applicable when...)" note row.
+            anchor = max(p_cells, key=lambda c: len(_seq_tokens(c)))
+            atoks = [t for t in _seq_tokens(anchor) if len(t) > 1]
+            if len(atoks) < 2:
+                continue
+            match = None
+            for sr in s["rows"]:
+                stoks = set(t for c in sr for t in _seq_tokens(c))
+                if sum(1 for t in atoks if t in stoks) >= max(2, len(atoks) - 1):
+                    match = sr
+                    break
+            if match is None:
+                continue
+            s_cells = [c for c in match if c]
+            # Only a genuine content difference is worth a row example: the same
+            # value spread across per-model columns ("3 x 3.0 | 3 x 3.0 | 3 x
+            # 3.0" vs "3 x 3.0 3 x 3.0 3 x 3.0") is one side's detector merging
+            # identical columns, not a real change. Compare the VALUE cells
+            # only - a hyphenation difference in the label ("slot-in" vs
+            # "slotin") is not a merge.
+            p_words = set(w for c in p_cells[1:] for w in _seq_tokens(c)
+                          if len(w) > 1)
+            s_words = set(w for c in s_cells[1:] for w in _seq_tokens(c)
+                          if len(w) > 1)
+            p_nums = set(re.findall(r"\d[\d.,]*", " ".join(p_cells[1:])))
+            s_nums = set(re.findall(r"\d[\d.,]*", " ".join(s_cells[1:])))
+            if (len(p_cells) != len(s_cells)
+                    and (p_words != s_words or p_nums != s_nums)):
+                label = (pr[0] or p_cells[0])[:44]
+                p_show = " | ".join(c[:18] for c in p_cells[:4])
+                s_show = " | ".join(c[:18] for c in s_cells[:4])
+                examples.append(
+                    f"the row for “{label}” — PROD: [{p_show}] "
+                    f"({len(p_cells)} cells); STAGE: [{s_show}] "
+                    f"({len(s_cells)} cells)")
+            if len(examples) >= 3:
+                break
+
+        # Report only when specific rows can be named. A bare grid-size
+        # difference with no identifiable row is almost always find_tables()
+        # fragmenting one side's table, not a real structural change - and it
+        # gives the reader nothing to act on.
+        if not examples:
+            continue
+        verb = ("splits cells into an extra column" if col_delta > 0
+                else "merges cells PROD keeps separate")
+        what = (f"STAGE {verb}. Rows affected: " + "; ".join(examples))
+        findings.append({"page": s["page"], "prod_page": p["page"],
+                         "what": what, "header": p["header"],
+                         "rows_affected": examples,
+                         "text": p["header"], "detail": what})
     return findings
 
 
@@ -2917,16 +3969,9 @@ def _icon_issues(pdf_path: str, doc_label: str, nav_pages: set):
                                 "kind": "Image cannot be decoded",
                                 "text": "the embedded image data is unreadable"})
                     continue
-                pix = fitz.Pixmap(doc, xref)
-                if pix.width >= 2 and pix.height >= 2 and _pixmap_is_blank(pix):
-                    w = max(r.width for r in rects)
-                    h = max(r.height for r in rects)
-                    out.append({
-                        "doc": doc_label, "page": i, "xref": xref,
-                        "kind": "Image is blank",
-                        "text": f"{pix.width}×{pix.height} image drawn at "
-                                f"{w:.0f}×{h:.0f} pt is a single flat colour — "
-                                f"it renders as an empty box"})
+                # A flat single-colour bitmap is not reported: it is routinely a
+                # deliberate background swatch, banner or colour block, not a
+                # broken image, and flagging it produced nothing but noise.
                 pix = None
             except Exception as exc:
                 out.append({"doc": doc_label, "page": i, "xref": xref,
@@ -2997,12 +4042,20 @@ def _italic_issues(prod_path, stage_path, prod_nav, stage_nav, stage_idx):
     return findings
 
 
-# ── Numbered-list alignment ──────────────────────────────────────────────────
-# A numbered step should read "5. Place the monitor properly." on one line. When
-# the layout breaks, the marker is left alone on its own line with the step text
+# ── List alignment ───────────────────────────────────────────────────────────
+# A list item should read "5. Place the monitor properly." on one line. When the
+# layout breaks, the marker is left alone on its own line with the item text
 # wrapped underneath. The text is all still present, so the content comparison
 # sees nothing wrong — this is purely a layout defect and needs its own check.
-_LIST_MARKER_RE = re.compile(r"^\s*(\d{1,2})\s*[.)]\s*$")
+#
+# Bullets (<ul><li>) break exactly the same way and were not covered: the regex
+# matched digits only, so a stranded "•" was invisible to this check while a
+# stranded "5." was reported.
+# A bare "-" or "*" is left out on purpose: alone on a line those are rules and
+# footnote marks far more often than they are list bullets, and the stranded-
+# marker test has no text beside them to tell the difference.
+_LIST_MARKER_RE = re.compile(
+    r"^\s*(?:(?:\d{1,2}|[a-zA-Z])\s*[.)]|[•●▪◦‣⁃])\s*$")
 
 
 def _page_lines(page):
@@ -3128,8 +4181,437 @@ def _alignment_issues(prod_path, stage_path, prod_nav, stage_nav):
     return findings
 
 
+# ── List indent depth (nested <ul>/<ol> flattened) ───────────────────────────
+# A sub-item indented under its parent in PROD and set flush with it in STAGE has
+# lost its nesting: the reader can no longer tell which step it belongs to. Every
+# word is still present, so neither the content comparison nor the marker-style
+# check sees anything wrong. Indent is measured from each document's own text
+# column, so a different page width is not mistaken for a moved list.
+_INDENT_TOL_PT = 9.0     # normal jitter between two renderings of the same item
+_INDENT_MIN_ITEMS = 6    # below this there is no list structure worth judging
+
+
+def _list_indents(pdf_path: str, nav_pages: set, col):
+    """{item wording: (page, indent in points from the column edge, line)}."""
+    left = col[0]
+    doc, out = fitz.open(pdf_path), {}
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in nav_pages:
+                continue
+            for txt, rect in _page_lines(page):
+                if not _marker_style(txt):
+                    continue
+                body = re.sub(r"^\s*(?:\d{1,2}|[a-zA-Z])\s*[.)]\s*", "", txt)
+                body = re.sub(r"^\s*[•●▪‣⁃\-\*]\s*",
+                              "", body)
+                key = " ".join(_seq_tokens(body))
+                # Short items repeat across a manual ("Press OK"); pairing on
+                # them matches the wrong list.
+                if len(key.split(" ")) < 4:
+                    continue
+                if key in out:
+                    out[key] = None          # ambiguous — appears more than once
+                    continue
+                out[key] = (i, rect.x0 - left, txt.strip())
+    finally:
+        doc.close()
+    return {k: v for k, v in out.items() if v}
+
+
+def _list_indent_issues(prod_path, stage_path, prod_nav, stage_nav):
+    """List items whose indent depth differs from PROD's — flattened nesting."""
+    if os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    prod_col = _text_column(prod_path, prod_nav)
+    stage_col = _text_column(stage_path, stage_nav)
+    if not prod_col or not stage_col:
+        return []
+    prod_ind = _list_indents(prod_path, prod_nav, prod_col)
+    stage_ind = _list_indents(stage_path, stage_nav, stage_col)
+    paired = [(k, prod_ind[k], stage_ind[k]) for k in prod_ind if k in stage_ind]
+    if len(paired) < _INDENT_MIN_ITEMS:
+        return []
+
+    # Both documents may sit the whole list at a slightly different offset —
+    # that is a margin difference, not lost nesting. The median shift across
+    # every paired item is removed so only items that moved relative to their
+    # own list are reported.
+    shifts = sorted(s[1] - p[1] for _k, p, s in paired)
+    base = shifts[len(shifts) // 2]
+
+    findings = []
+    for key, (ppage, pind, ptxt), (spage, sind, stxt) in paired:
+        delta = (sind - pind) - base
+        if abs(delta) <= _INDENT_TOL_PT:
+            continue
+        findings.append({
+            "page": spage, "prod_page": ppage,
+            "prod_indent": round(pind, 1), "stage_indent": round(sind, 1),
+            "delta": round(delta, 1), "text": ptxt,
+            "direction": "flattened" if delta < 0 else "over-indented"})
+    return findings
+
+
+# ── Heading and paragraph alignment ──────────────────────────────────────────
+# A title or a paragraph that PROD sets flush left and STAGE centres — or sets
+# at a different indent — reads as a different document even though every word
+# survives. Measured the same way list indent is: from each document's own text
+# column, paired by wording, with the median shift across every pair removed so
+# a plain margin difference is not mistaken for a moved block.
+_TEXT_ALIGN_TOL_PT = 12.0
+_TEXT_ALIGN_MIN_PAIRS = 6
+_TEXT_ALIGN_MAX_FINDINGS = 40
+
+
+def _block_indents(pdf_path: str, nav_pages: set, col, title_keys: set):
+    """{wording: (page, indent from the column edge, kind, text, rect)}."""
+    left = col[0]
+    doc, out = fitz.open(pdf_path), {}
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in nav_pages:
+                continue
+            # Text inside a table or a boxed note sits in its own cell, not in
+            # the page's text column, so its left and right edges say nothing
+            # about how the block is aligned. Measuring those reported every
+            # answer in the two-column Troubleshooting table as right-aligned.
+            try:
+                boxes = [fitz.Rect(t.bbox) for t in page.find_tables().tables]
+            except Exception:
+                boxes = []
+            for txt, rect in _page_lines(page):
+                s = " ".join((txt or "").split())
+                if not s or _marker_style(s):
+                    continue      # list items are _list_indent_issues' business
+                if any(b.intersects(rect) for b in boxes):
+                    continue
+                key = " ".join(_seq_tokens(s))
+                # Short lines repeat all over a manual ("Press OK"), and pairing
+                # on them lines up two unrelated places in the two documents.
+                if len(key.split(" ")) < 4:
+                    continue
+                if key not in title_keys:
+                    # Headings only. A paragraph's alignment cannot be read off
+                    # one line's rectangle: an indented block whose lines run to
+                    # the right margin (every answer in the Troubleshooting Q&A)
+                    # is indistinguishable from right-aligned text that way, and
+                    # measuring it reported ~15 false findings per document.
+                    # Judging a paragraph needs its whole set of lines — left
+                    # edges consistent, right edges ragged or not.
+                    continue
+                if key in out:
+                    out[key] = None            # ambiguous — seen more than once
+                    continue
+                out[key] = (i, rect.x0 - left, "Title", s, rect)
+    finally:
+        doc.close()
+    return {k: v for k, v in out.items() if v}
+
+
+# A numbered item's bold label ("5.  Reset") sitting on its own line, with the
+# description starting fresh underneath, versus the description's first words
+# glued onto the SAME line as the label — the paragraph has visually merged
+# into its own heading.
+_ITEM_MARKER_RE = re.compile(r"^\d{1,2}[.)]$")
+
+
+def _label_desc_lines(pdf_path: str, nav_pages: set):
+    """[(page, canonical label key, run_on, label text)] for every numbered
+    item's label line in the document.
+
+    A numbered list here draws the "N." marker and its content as separate
+    text blocks that merely share a Y position, not one block — so the marker
+    positions have to be collected across the WHOLE page first, then matched
+    against every line's Y, rather than searched block by block.
+    """
+    doc, out = fitz.open(pdf_path), []
+    for i, page in enumerate(doc, 1):
+        if i in nav_pages:
+            continue
+        all_lines = []
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            all_lines.extend(block.get("lines", []))
+        marker_ys = set()
+        for line in all_lines:
+            txt = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+            if _ITEM_MARKER_RE.match(txt):
+                marker_ys.add(round(line["bbox"][1], 1))
+        if not marker_ys:
+            continue
+        for line in all_lines:
+            if round(line["bbox"][1], 1) not in marker_ys:
+                continue
+            spans = line.get("spans", [])
+            if _ITEM_MARKER_RE.match(
+                    "".join(s.get("text", "") for s in spans).strip()):
+                continue    # the marker line itself
+            bold_parts, rest_parts, seen_non_bold = [], [], False
+            for sp in spans:
+                t = sp.get("text", "")
+                if not t.strip():
+                    continue
+                if _span_is_dark(sp) and not seen_non_bold:
+                    bold_parts.append(t)
+                else:
+                    seen_non_bold = True
+                    rest_parts.append(t)
+            label = " ".join(bold_parts).strip()
+            key = " ".join(_seq_tokens(label))
+            if not key:
+                continue
+            out.append((i, key, bool("".join(rest_parts).strip()), label))
+    doc.close()
+    return out
+
+
+def _label_merge_issues(prod_path: str, stage_path: str, prod_nav: set,
+                        stage_nav: set):
+    """Numbered-item labels PROD prints on their own line, that STAGE runs
+    the description onto instead.
+
+    Labels repeat across sections ("Reset" appears for Host Button, Button,
+    Receiver and Multimedia Hub in the same manual) so occurrences are paired
+    by their Nth appearance in document order, not by a plain dict lookup —
+    a dict would silently drop every repeat past the first.
+    """
+    prod_items = _label_desc_lines(prod_path, prod_nav)
+    stage_items = _label_desc_lines(stage_path, stage_nav)
+    stage_by_key = {}
+    for pg, key, run_on, label in stage_items:
+        stage_by_key.setdefault(key, []).append((pg, run_on, label))
+    seen_idx, found = {}, []
+    for pg, key, run_on, label in prod_items:
+        idx = seen_idx.get(key, 0)
+        seen_idx[key] = idx + 1
+        if run_on:
+            continue    # PROD itself runs it on — nothing to compare against
+        cands = stage_by_key.get(key, [])
+        if idx >= len(cands):
+            continue
+        spg, srun_on, _ = cands[idx]
+        if not srun_on:
+            continue    # STAGE also keeps the label on its own line — fine
+        found.append({
+            "prod_page": pg, "stage_page": spg, "label": label,
+            "title": label,
+            "detail": (f"PROD starts the description for \u201c{label}\u201d on "
+                      f"its own line; STAGE runs it on from the label on the "
+                      f"same line instead."),
+        })
+    return found
+
+
+def _text_align_issues(prod_path, stage_path, prod_nav, stage_nav, toc_results):
+    """Titles and paragraphs STAGE aligns differently from PROD."""
+    if os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    prod_col = _text_column(prod_path, prod_nav)
+    stage_col = _text_column(stage_path, stage_nav)
+    if not prod_col or not stage_col:
+        return []
+    title_keys = {" ".join(_seq_tokens(r.get("title") or ""))
+                  for r in (toc_results or [])}
+    title_keys.discard("")
+    prod_b = _block_indents(prod_path, prod_nav, prod_col, title_keys)
+    stage_b = _block_indents(stage_path, stage_nav, stage_col, title_keys)
+    paired = [(k, prod_b[k], stage_b[k]) for k in prod_b if k in stage_b]
+    if len(paired) < _TEXT_ALIGN_MIN_PAIRS:
+        return []
+
+    shifts = sorted(s[1] - p[1] for _k, p, s in paired)
+    base = shifts[len(shifts) // 2]
+
+    findings = []
+    for key, (ppage, pind, kind, ptxt, prect), (spage, sind, _k2, _stxt, srect) in paired:
+        if len(findings) >= _TEXT_ALIGN_MAX_FINDINGS:
+            break
+        p_align = _align_of(prect, prod_col)
+        s_align = _align_of(srect, stage_col)
+        delta = (sind - pind) - base
+        # Only a change of alignment *class* is reported. The raw indent delta
+        # is not trustworthy here: note panels, figure captions and table cells
+        # are laid out differently by the two engines, so comparing their left
+        # edges flagged 28 blocks that were flush left in both documents. A
+        # block that is centred in one and flush in the other is visible to a
+        # reader; a few points of container padding is not.
+        reflowed = bool(p_align and s_align and p_align != s_align)
+        if not reflowed:
+            continue
+        findings.append({
+            "page": spage, "prod_page": ppage, "kind_label": kind,
+            "prod_align": p_align or "indented", "stage_align": s_align or "indented",
+            "prod_indent": round(pind, 1), "stage_indent": round(sind, 1),
+            "delta": round(delta, 1), "reflowed": reflowed,
+            "text": ptxt})
+    return findings
+
+
 # ── Hyperlinks ───────────────────────────────────────────────────────────────
 _DOMAINISH_RE = re.compile(r"^(?:https?://)?(?:[\w-]+\.)+[A-Za-z]{2,}(?:/|$)", re.I)
+
+
+def _link_anchors(pdf_path: str, nav_pages: set):
+    """{canonical anchor text: (page, target)} for every link in a document."""
+    doc, out = fitz.open(pdf_path), {}
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in nav_pages:
+                continue
+            for l in page.get_links():
+                try:
+                    text = " ".join(page.get_textbox(fitz.Rect(l["from"])).split())
+                except Exception:
+                    continue
+                key = " ".join(_seq_tokens(text))
+                if not key:
+                    continue
+                kind = l.get("kind")
+                if l.get("uri") or l.get("file"):
+                    target = l.get("uri") or l.get("file")
+                elif l.get("page", -1) >= 0:
+                    target = f"page {l.get('page', -1) + 1}"
+                elif kind in (fitz.LINK_GOTO, fitz.LINK_NAMED) or l.get("nameddest"):
+                    # An internal jump whose destination AEM stores as a named
+                    # anchor rather than a page index — still a cross-reference.
+                    target = f"internal:{l.get('nameddest') or l.get('to') or ''}"
+                else:
+                    target = ""
+                out.setdefault(key, (i, target, text))
+    finally:
+        doc.close()
+    return out
+
+
+def _link_loss_issues(prod_path, stage_path, prod_nav, stage_nav, stage_idx,
+                      prod_idx=None, titles=None):
+    """Cross-reference hyperlinks present on one side and printed as plain text
+    on the other — reported in BOTH directions, but only when the anchor is a
+    genuine reference (a real section heading or a web address).
+
+    * ``doc="PROD"`` — PROD links the phrase, STAGE prints it plain.
+    * ``doc="STAGE"`` — STAGE links the phrase, PROD prints it plain.
+
+    Matching the anchor against the actual section titles is what separates a
+    real lost/added jump from a mis-sized link rectangle that grabbed a
+    sentence fragment or a run of model numbers — those were almost every
+    earlier false report here. An anchor whose wording is missing from the
+    other document entirely is a content difference, not a link difference,
+    and is left to that check.
+    """
+    if os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    prod_links = _link_anchors(prod_path, prod_nav)
+    stage_links = _link_anchors(stage_path, stage_nav)
+
+    title_by_key = {}
+    for t in (titles or []):
+        k = " ".join(_seq_tokens(t or ""))
+        if len(k.split(" ")) >= 2:
+            title_by_key.setdefault(k, " ".join((t or "").split()))
+    _DANGLE = {"on", "for", "and", "to", "of", "the", "a", "an", "in", "with",
+               "or", "at", "see", "refer", "from", "by"}
+
+    def _pretty_xref(key, shown):
+        """The clean heading/address text if this anchor is a real
+        cross-reference, else None."""
+        toks = key.split(" ")
+        if len(toks) < 2 or len(_WORDCHAR_RE.findall(shown)) < 4:
+            return None
+        # A web-address anchor: report ONLY the address, never the sentence the
+        # over-sized link rectangle happened to sweep up with it.
+        m = re.search(r"(?:https?://)?(?:www\.)?[A-Za-z0-9][\w-]*"
+                      r"(?:\.[A-Za-z0-9][\w-]*)+(?:/\S*)?", shown)
+        if m and re.search(r"\.(?:com|net|org|io|co|tw|cn)\b", m.group(0), re.I):
+            return m.group(0).strip(" .,;:)")
+        if _DOMAINISH_RE.match(shown.strip()):
+            return shown.strip()
+        rem = list(toks)
+        while rem and (rem[-1].isdigit() or rem[-1] in ("page", "pages")):
+            rem.pop()
+        if rem and rem[-1] == "on":
+            rem.pop()
+        while rem and rem[0] in ("see", "refer", "to"):
+            rem.pop(0)
+        core_key = " ".join(rem)
+        if not core_key:
+            return None
+        if core_key in title_by_key:
+            if len(rem) < 2 or rem[-1] in _DANGLE or rem[0] in _DANGLE:
+                return None       # truncated / clipped anchor
+            return title_by_key[core_key]
+        pref = [k for k in title_by_key if k.startswith(core_key + " ")]
+        if len(pref) == 1:
+            if rem[0] in _DANGLE:
+                return None
+            return title_by_key[pref[0]]
+        # A link rectangle can run past the end of the heading and pick up the
+        # start of the next sentence (a PDF authoring artifact, not a
+        # validator gap) -- match a title at the START of the anchor and
+        # tolerate trailing noise, longer titles get proportionally more
+        # slack since a short generic title is more likely to coincide.
+        sup = [k for k in title_by_key if core_key.startswith(k + " ")]
+        if sup:
+            best = max(sup, key=len)
+            tail = len(rem) - len(best.split(" "))
+            if tail <= max(6, len(best.split(" "))):
+                return title_by_key[best]
+        # The reverse case: the anchor's link rectangle starts mid-sentence,
+        # in the tail of the PREVIOUS one, and only reaches a real heading
+        # further in -- look for the title as a SUFFIX of the anchor before
+        # giving up. Real section titles are specific multi-word phrases, so
+        # even a generous search here rarely coincides with random prose.
+        for start in range(1, min(len(rem), 14)):
+            cand = " ".join(rem[start:])
+            if cand in title_by_key:
+                return title_by_key[cand]
+        return None
+
+    def _one_way(src_label, src_links, other_links, other_idx):
+        out = []
+        if other_idx is None:
+            return out
+        # Every clean heading/address the OTHER document still links, so a link
+        # kept under a slightly different hotspot (or in the TOC instead of the
+        # body) counts as "still linked" and is never reported as lost.
+        other_link_names = set()
+        for ak, (apg, atgt, ashown) in other_links.items():
+            pn = _pretty_xref(ak, ashown)
+            if pn:
+                other_link_names.add(" ".join(_seq_tokens(pn)))
+            # also keep every raw anchor that is itself heading-length, since
+            # the other side's rectangles can be over-sized too -- but a short
+            # anchor (a footnote marker, an icon link) is dropped here: as a
+            # substring below it would trivially "match" almost any title.
+            if len(ak) >= 12 and len(ak.split(" ")) >= 2:
+                other_link_names.add(ak)
+        for key, (pno, target, shown) in src_links.items():
+            if key in other_links:
+                continue
+            pretty = _pretty_xref(key, shown)
+            if not pretty:
+                continue
+            pk = " ".join(_seq_tokens(pretty))
+            if not pk:
+                continue
+            # STAGE still links this exact heading (anywhere)?  Not lost.
+            # Containment is only trusted once both sides are a real multi-word
+            # phrase -- otherwise a short anchor matches as a substring of
+            # nearly anything and hides a genuine loss.
+            if pk in other_link_names or any(
+                    len(ak) >= 12 and (pk in ak or ak in pk)
+                    for ak in other_link_names):
+                continue
+            if not _seq_present(other_idx, key.split(" "), max_gap=SEQ_MAX_GAP):
+                continue          # wording absent from the other side: content
+            out.append({"doc": src_label, "page": pno, "text": pretty,
+                        "target": target})
+        return out
+
+    return (_one_way("PROD", prod_links, stage_links, stage_idx)
+            + _one_way("STAGE", stage_links, prod_links, prod_idx))
 
 
 def _hyperlink_issues(prod_path: str, stage_path: str):
@@ -3150,16 +4632,19 @@ def _hyperlink_issues(prod_path: str, stage_path: str):
     findings, prod_uris, stage_uris = [], set(), set()
 
     same_file = os.path.abspath(prod_path) == os.path.abspath(stage_path)
-    sides = [("PROD", prod_path, prod_uris)]
+    # STAGE is the document under test — a broken link is only reported when it
+    # is STAGE's. PROD links are still read, but only to collect the web
+    # addresses PROD carries so the "not linked in STAGE" comparison works.
+    sides = [("PROD", prod_path, prod_uris, False)]
     if not same_file:
-        sides.append(("STAGE", stage_path, stage_uris))
-    for label, path, bucket in sides:
+        sides.append(("STAGE", stage_path, stage_uris, True))
+    for label, path, bucket, report in sides:
         for pno, l, npages in links(path):
             kind = l.get("kind")
             if kind == fitz.LINK_URI:
                 uri = (l.get("uri") or "").strip()
                 bucket.add(uri.lower().rstrip("/"))
-                if not re.match(r"^(https?|mailto):", uri, re.I):
+                if report and not re.match(r"^(https?|mailto):", uri, re.I):
                     findings.append({"doc": label, "page": pno,
                                      "kind": "Hyperlink has no usable scheme",
                                      "text": uri})
@@ -3171,7 +4656,17 @@ def _hyperlink_issues(prod_path: str, stage_path: str):
                 target = (l.get("file") or "").strip()
                 if _DOMAINISH_RE.match(target):
                     bucket.add(target.lower().rstrip("/"))
-            elif kind in (fitz.LINK_GOTO, fitz.LINK_NAMED):
+            if not report:
+                continue
+            rect = fitz.Rect(l.get("from") or (0, 0, 0, 0))
+            if rect.get_area() < 4.0:
+                # A hotspot this small cannot be hit with a pointer, so the link
+                # is present in the file and unusable in the reader.
+                findings.append({"doc": label, "page": pno,
+                                 "kind": "Hyperlink hotspot cannot be clicked",
+                                 "text": (l.get("uri") or l.get("file") or
+                                          f"page {l.get('page', -1) + 1}")})
+            if kind in (fitz.LINK_GOTO, fitz.LINK_NAMED):
                 tgt = l.get("page", -1)
                 if tgt is None or tgt < 0 or tgt >= npages:
                     findings.append({"doc": label, "page": pno,
@@ -3191,20 +4686,313 @@ def _hyperlink_issues(prod_path: str, stage_path: str):
     return findings
 
 
-# ── Page numbering ───────────────────────────────────────────────────────────
-def _page_number_issues(pdf_path: str, doc_label: str, nav_pages: set):
-    """Body pages that carry no page number at all."""
-    doc, out = fitz.open(pdf_path), []
-    for i, page in enumerate(doc, 1):
-        if i in nav_pages:
+# ── Link highlighting (the anchor's drawn appearance) ────────────────────────
+# _link_loss_issues compares link ANNOTATIONS — whether the region is clickable.
+# A reader cannot see an annotation. What tells them a phrase is a link is that
+# it is drawn differently from body text: coloured, or underlined. STAGE can
+# carry the annotation and still print the anchor in plain black, which reads as
+# ordinary prose and is a real defect that the annotation check passes clean.
+_LINK_COLOUR_MIN_DELTA = 60   # sRGB distance from body colour to read as coloured
+_UNDERLINE_MAX_H = 2.5        # a rule thicker than this is not an underline
+_UNDERLINE_GAP_PT = 4.0       # how far below the baseline box a rule may sit
+
+
+def _srgb(color_int) -> tuple:
+    """PyMuPDF stores a span colour as a packed sRGB integer."""
+    try:
+        c = int(color_int)
+    except (TypeError, ValueError):
+        return (0, 0, 0)
+    return ((c >> 16) & 255, (c >> 8) & 255, c & 255)
+
+
+def _colour_distance(a, b) -> float:
+    return sum(abs(x - y) for x, y in zip(a, b))
+
+
+def _body_text_colour(pdf_path: str, nav_pages: set) -> tuple:
+    """The colour the document sets ordinary body text in."""
+    counts, doc = {}, fitz.open(pdf_path)
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in nav_pages:
+                continue
+            for blk in page.get_text("dict").get("blocks", []):
+                for line in blk.get("lines", []):
+                    for span in line.get("spans", []):
+                        n = len(span.get("text", "").strip())
+                        if n:
+                            counts[span.get("color", 0)] = (
+                                counts.get(span.get("color", 0), 0) + n)
+    finally:
+        doc.close()
+    if not counts:
+        return (0, 0, 0)
+    return _srgb(max(counts, key=counts.get))
+
+
+def _underlined(page, rect) -> bool:
+    """True when a thin rule is drawn along the bottom of `rect`."""
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return False
+    for dr in drawings:
+        r = fitz.Rect(dr["rect"])
+        if r.height > _UNDERLINE_MAX_H:
             continue
-        text = page.get_text()
-        if not re.search(r"(?m)^\s*\d{1,4}\s*$", text):
-            out.append({"doc": doc_label, "page": i,
-                        "kind": "Page number missing",
-                        "text": f"page {i} carries no page number"})
-    doc.close()
+        if not (rect.y1 - _UNDERLINE_GAP_PT <= r.y0 <= rect.y1 + _UNDERLINE_GAP_PT):
+            continue
+        # The rule has to run under the words, not merely cross the page near
+        # them — a table border and a footer rule both sit at the right height.
+        overlap = min(r.x1, rect.x1) - max(r.x0, rect.x0)
+        if overlap >= 0.6 * (rect.x1 - rect.x0):
+            return True
+    return False
+
+
+def _anchor_style(page, rect, body_colour):
+    """(is_highlighted, colour, underlined) for the text inside `rect`."""
+    best, best_n = None, 0
+    for blk in page.get_text("dict").get("blocks", []):
+        for line in blk.get("lines", []):
+            for span in line.get("spans", []):
+                sr = fitz.Rect(span["bbox"])
+                if not sr.intersects(rect):
+                    continue
+                n = len(span.get("text", "").strip())
+                if n > best_n:
+                    best, best_n = span, n
+    if best is None:
+        return None
+    colour = _srgb(best.get("color", 0))
+    coloured = _colour_distance(colour, body_colour) >= _LINK_COLOUR_MIN_DELTA
+    under = _underlined(page, rect)
+    return (coloured or under, colour, under)
+
+
+def _link_style_issues(prod_path, stage_path, prod_nav, stage_nav,
+                       max_links: int = 2000):
+    """Anchors PROD draws as links that STAGE draws as plain body text.
+
+    Only anchors PROD actually highlights are considered, and only those whose
+    wording can be found in exactly one place in each document — the same
+    single-hit rule the other anchored checks use, so a repeated phrase is never
+    paired against the wrong occurrence.
+    """
+    if os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    prod_body = _body_text_colour(prod_path, prod_nav)
+    stage_body = _body_text_colour(stage_path, stage_nav)
+
+    findings = []
+    prod_doc = fitz.open(prod_path)
+    stage_doc = fitz.open(stage_path)
+    try:
+        for i, page in enumerate(prod_doc, 1):
+            if i in prod_nav or len(findings) >= max_links:
+                continue
+            for l in page.get_links():
+                rect = fitz.Rect(l["from"])
+                try:
+                    text = " ".join(page.get_textbox(rect).split())
+                except Exception:
+                    continue
+                toks = _seq_tokens(text)
+                # One-word anchors ("here") are too common to pair safely.
+                if len(toks) < 2 or len(text) > 120:
+                    continue
+                p_style = _anchor_style(page, rect, prod_body)
+                if not p_style or not p_style[0]:
+                    continue          # PROD does not highlight it either
+                s_hits = _locate_all_tokens(stage_path, text,
+                                            skip_pages=stage_nav, limit=3)
+                p_hits = _locate_all_tokens(prod_path, text,
+                                            skip_pages=prod_nav, limit=3)
+                if len(s_hits) != 1 or len(p_hits) != 1:
+                    continue
+                s_pg, s_rects = s_hits[0]
+                if not s_pg or not s_rects:
+                    continue
+                box = fitz.Rect(s_rects[0])
+                for r in s_rects[1:]:
+                    box |= fitz.Rect(r)
+                s_page = stage_doc[s_pg - 1]
+                s_style = _anchor_style(s_page, box, stage_body)
+                if not s_style or s_style[0]:
+                    continue          # STAGE highlights it too — nothing wrong
+                findings.append({
+                    "page": s_pg, "prod_page": i, "text": text.strip(),
+                    "target": l.get("uri") or l.get("file") or "",
+                    "prod_colour": "#%02x%02x%02x" % p_style[1],
+                    "stage_colour": "#%02x%02x%02x" % s_style[1],
+                    "prod_underlined": p_style[2],
+                    "why": ("PROD draws this anchor "
+                            + ("underlined" if p_style[2] else "in a link colour")
+                            + "; STAGE draws it as plain body text")})
+    finally:
+        prod_doc.close()
+        stage_doc.close()
+    return findings
+
+
+# ── Page numbering ───────────────────────────────────────────────────────────
+# A page number in the STAGE footer/margin is normal pagination and is not
+# checked — any value there is valid. The only page-number defect worth
+# reporting is one baked into a hyperlink's own visible text (below).
+
+# A hyperlink whose visible text names a page ("… on page 36") has to land on
+# that page. Carrying a page number is NOT itself a defect — those links work —
+# so only a mismatch between what the text promises and where the link goes is
+# reported. The bare-number form ("12") is deliberately not matched: a link
+# label that is only a digit is a diagram callout number or a list marker, and
+# treating those as page references reported perfectly good links as broken.
+_LINK_PAGEREF_RE = re.compile(r"\bpages?\s+(\d{1,4})\b", re.IGNORECASE)
+_FOLIO_CACHE = {}
+
+
+def _printed_folio(doc, pno: int):
+    """The page number printed in this page's margin, or None.
+
+    A PDF's physical page index and the number printed on the page part company
+    as soon as there is front matter, so a link's destination is judged by what
+    the reader actually sees on the page it lands on.
+    """
+    key = (id(doc), pno)
+    if key in _FOLIO_CACHE:
+        return _FOLIO_CACHE[key]
+    value = None
+    try:
+        page = doc[pno - 1]
+        h = page.rect.height or 1.0
+        for b in page.get_text("blocks"):
+            txt = (b[4] or "").strip()
+            if re.fullmatch(r"\d{1,4}", txt) and (b[1] > h * 0.88
+                                                  or b[3] < h * 0.12):
+                value = int(txt)
+                break
+    except Exception:
+        value = None
+    if len(_FOLIO_CACHE) > 4000:
+        _FOLIO_CACHE.clear()
+    _FOLIO_CACHE[key] = value
+    return value
+
+
+def _hyperlink_pageno_issues(pdf_path: str, doc_label: str, nav_pages: set):
+    """Hyperlinks whose text names one page and whose target is another."""
+    doc, out = fitz.open(pdf_path), []
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in nav_pages:
+                continue
+            for l in page.get_links():
+                if l.get("kind") not in (fitz.LINK_GOTO, fitz.LINK_NAMED):
+                    continue
+                try:
+                    text = " ".join(page.get_textbox(fitz.Rect(l["from"])).split())
+                except Exception:
+                    continue
+                m = _LINK_PAGEREF_RE.search(text or "")
+                if not m:
+                    continue
+                said = int(m.group(1))
+                tgt = (l.get("page", -1) or -1) + 1
+                if tgt < 1 or tgt > doc.page_count:
+                    continue      # unresolved target — its own finding covers it
+                folio = _printed_folio(doc, tgt)
+                lands = folio if folio is not None else tgt
+                if lands == said:
+                    continue      # the link goes where its text says it goes
+                shown = text if len(text) <= 90 else text[:87] + "…"
+                out.append({"doc": doc_label, "page": i,
+                            "kind": "Hyperlink goes to the wrong page",
+                            "text": (f"the hyperlink “{shown}” on {doc_label} "
+                                     f"page {i} says page {said}, but it lands "
+                                     f"on page {lands}")})
+    finally:
+        doc.close()
     return out
+
+
+_XREF_RE = re.compile(
+    r"(?:see|refer to|go to|as (?:described|shown|explained) in)\s+"
+    r"([A-Z][A-Za-z0-9 ,/&()’'\-]{3,70}?)\s+on\s+pages?\s+(\d{1,4})",
+    re.IGNORECASE)
+
+
+def _xref_section_issues(stage_path, stage_nav, toc_results, prod_path=None):
+    """Validate printed "see <Section> on page N" cross-references in STAGE.
+
+    For every such reference this checks that STAGE's own section <Section>
+    really is on the page the sentence names.  Reports:
+      * "Cross-reference page number is wrong" - the named section exists in
+        STAGE but on a different page than the one printed;
+      * "Cross-reference points to the wrong section" - STAGE page N holds a
+        different section than the one named.
+    Only references whose wording matches a real STAGE section heading are
+    checked, so a stray "... on page 5" in prose is never flagged.
+    """
+    doc = fitz.open(stage_path)
+    try:
+        # title -> printed folio of the STAGE page the section starts on
+        folio_of_title = {}
+        page_titles = {}       # printed folio -> [section titles starting there]
+        for r in toc_results or []:
+            t = (r.get("title") or "").strip()
+            sp = r.get("stage_page")
+            if not t or not isinstance(sp, int) or sp < 1 or sp > doc.page_count:
+                continue
+            fol = _printed_folio(doc, sp)
+            fol = fol if fol is not None else sp
+            folio_of_title.setdefault(_norm_key(t), fol)
+            page_titles.setdefault(fol, []).append(t)
+
+        def _match_title(phrase):
+            k = _norm_key(phrase)
+            if k in folio_of_title:
+                return k
+            cands = [tk for tk in folio_of_title
+                     if tk and (tk.startswith(k + " ") or k.startswith(tk + " "))]
+            if len(cands) == 1:
+                return cands[0]
+            return None
+
+        out, seen = [], set()
+        for i, page in enumerate(doc, 1):
+            if i in stage_nav:
+                continue
+            text = " ".join(page.get_text("text").split())
+            for m in _XREF_RE.finditer(text):
+                phrase, said = m.group(1).strip(" ,"), int(m.group(2))
+                tkey = _match_title(phrase)
+                if not tkey:
+                    continue
+                actual = folio_of_title[tkey]
+                if actual == said:
+                    continue
+                dedupe = (tkey, said)
+                if dedupe in seen:
+                    continue
+                seen.add(dedupe)
+                here = page_titles.get(said)
+                if here:
+                    out.append({
+                        "doc": "STAGE", "page": i,
+                        "kind": "Cross-reference points to the wrong section",
+                        "text": (f"STAGE page {i} says “see {phrase} on page "
+                                 f"{said}”, but page {said} holds "
+                                 f"“{here[0]}” — “{phrase}” is on page {actual}.")})
+                else:
+                    out.append({
+                        "doc": "STAGE", "page": i,
+                        "kind": "Cross-reference page number is wrong",
+                        "text": (f"STAGE page {i} says “see {phrase} on page "
+                                 f"{said}”, but “{phrase}” is on page {actual} "
+                                 f"in STAGE.")})
+        return out
+    finally:
+        doc.close()
 
 
 # ── Bold / emphasis ──────────────────────────────────────────────────────────
@@ -3617,6 +5405,15 @@ def _bold_issues(prod_path, stage_path, prod_nav, stage_nav, stage_idx):
 
 # ── Table crawling: validate every table cell against STAGE ──────────────────
 _TABLE_CRAWL_CACHE = {}
+# A word a print layout hard-wraps mid-word ("connect-\ning") reads as two
+# tokens ("connect", "ing") that match nothing in STAGE's reflowed text, which
+# has "connecting" as one word. Rejoining at the hyphen+newline is what makes a
+# wrapped cell compare the same as an unwrapped one.
+_CELL_HYPHEN_RE = re.compile(r"-\s*\n\s*")
+
+
+def _dehyphenate_cell(text):
+    return _CELL_HYPHEN_RE.sub("", text) if text else text
 
 
 def _crawl_tables(pdf_path: str, nav_pages: set):
@@ -3644,6 +5441,7 @@ def _crawl_tables(pdf_path: str, nav_pages: set):
             except Exception:
                 continue
             if rows:
+                rows = [[_dehyphenate_cell(c) for c in row] for row in rows]
                 out.append((i, tbl.row_count, tbl.col_count, rows))
     doc.close()
     if len(_TABLE_CRAWL_CACHE) > 8:
@@ -3661,25 +5459,342 @@ def _merge_continued_tables(tables):
     """
     if not tables:
         return []
+
+    def _rk(row):
+        return " ".join(_seq_tokens(" | ".join((c or "") for c in (row or []))))
+
     merged = [list(tables[0])]
     for pno, nrow, ncol, rows in tables[1:]:
         prev = merged[-1]
         if pno == prev[0] + 1 and ncol == prev[2]:
-            prev[1] += nrow
-            prev[3] = prev[3] + rows          # continuation rows join the table
+            add_rows = list(rows)
+            # A table that runs onto the next page usually re-prints its header
+            # row. That repeat is the same header, not a new data row — counting
+            # it inflates the row total and makes an ordinary page break look
+            # like a cell-split. Drop it before the continuation rows join.
+            if add_rows and prev[3]:
+                hk = _rk(prev[3][0])
+                ck = _rk(add_rows[0])
+                hset, cset = set(hk.split(" ")), set(ck.split(" "))
+                if hk and (ck == hk or (hset and cset
+                                        and len(hset & cset) / len(hset) >= 0.6)):
+                    add_rows = add_rows[1:]
+            prev[1] += len(add_rows)
+            prev[3] = prev[3] + add_rows       # continuation rows join the table
         else:
             merged.append([pno, nrow, ncol, rows])
     return [tuple(m) for m in merged]
+
+
+def _row_anchor_tokens(row, exclude_ci: int):
+    """Canonical tokens of the row's longest cell other than the one being
+    checked — the row's most distinctive text, used to locate its STAGE
+    counterpart without depending on column position lining up."""
+    best = []
+    for ci, cell in enumerate(row):
+        if ci == exclude_ci:
+            continue
+        toks = _seq_tokens((cell or "").strip())
+        if len(toks) > len(best):
+            best = toks
+    return best
+
+
+def _find_stage_row(stage_rows, anchor_toks):
+    """The STAGE table row whose text contains `anchor_toks`, else None.
+
+    A short, generic cell ("ON", "OFF", "10 min") reads as present anywhere in
+    the whole STAGE document almost by chance — those same words label a dozen
+    other settings. Anchoring on the row's own longest, most distinctive cell
+    and matching row by row is what makes the comparison specific to this row.
+    Too short an anchor (< 3 words) cannot be trusted to pick one row, so it is
+    left unmatched and the caller falls back to the whole-document check.
+    """
+    if len(anchor_toks) < 3:
+        return None
+    for i, (row, row_idx) in enumerate(stage_rows):
+        if _seq_present(row_idx, anchor_toks, max_gap=2):
+            return i
+    return None
+
+
+# A long option list often does not fit one STAGE row: the layout engine spills
+# the tail into the following row(s), or over a page break into a fresh table.
+# Comparing against the anchored row alone reported those continuations as
+# missing values, so the anchored row plus this many following rows are read as
+# one block.
+_ROW_SPILL = 6
+# Above this many bullets a list is long enough that STAGE re-splitting it
+# across rows/tables/pages is expected, and presence is judged document-wide.
+_BULLET_COUNT_RESPLIT = 8
+
+
+_BULLET_CELL_RE = re.compile(r"[•▪‣·]")
+# A physical-product dimension label ("Dimension (WxDxH)", "Dimensioin (WxDxH)")
+# — the spec value itself varies release to release and a typo in the row
+# label is not content worth reporting, same as image dimensions are skipped.
+_WXDXH_RE = re.compile(r"w\s*[x×]\s*d\s*[x×]\s*h", re.IGNORECASE)
+# A cell that is nothing but an admonition label. PROD prints the word; STAGE
+# renders the same callout with an icon and no word - house style, not lost
+# content. find_tables() also merges these boxes into the real table above them,
+# so a whole-table guard misses some; this is a per-cell skip.
+_ADMONITION_RE = re.compile(
+    r"^(tip|note|notice|warning|caution|important|danger|attention)$", re.I)
+# Anything outside Latin / Latin-Extended: Cyrillic, Greek, Arabic, Hebrew, CJK,
+# Hangul. Cells mixing these (the OSD language list) are not comparable.
+_MIXED_SCRIPT_RE = re.compile(
+    r"[Ͱ-ϿЀ-ӿ֐-׿؀-ۿ"
+    r"　-鿿가-힯ﭐ-﻿]")
+
+
+def _is_bullet_cell(text: str) -> bool:
+    """True for a cell that lists option values ("• OFF • 10 min • 20 min").
+
+    A Range/options cell belongs to one row of one table. Long ones used to be
+    treated as prose and searched for across the whole STAGE document, where
+    the same words label a dozen other settings — so an entirely emptied Range
+    column read as present. Bullet cells are matched against their own STAGE
+    row instead, however long they are.
+    """
+    return bool(_BULLET_CELL_RE.search(text or ""))
+
+
+def _cell_covers(prod_toks, stage_cell_text) -> bool:
+    """True when every PROD token (with repeats) also occurs in the STAGE cell.
+
+    A multiset check, not a sequence match: bullet values in a short cell
+    ("ON", "10 min", "20 min") can be drawn in a different order in STAGE
+    without anything actually being lost.
+    """
+    need = collections.Counter(prod_toks)
+    have = collections.Counter(_seq_tokens(stage_cell_text))
+    return all(have[t] >= n for t, n in need.items())
+
+
+def _split_bullet_values(text: str) -> list:
+    """A bullet cell -> its individual option values, in order.
+
+    "* OFF * 10 min * 20 min" -> ["OFF", "10 min", "20 min"]. Reporting the
+    whole cell as missing when one value was dropped hides which value it is;
+    splitting lets the finding name the exact entry.
+    """
+    parts = re.split(r"[\u2022\u25aa\u2023\u00b7]", text or "")
+    return [" ".join(p.split()) for p in parts if p.strip()]
+
+
+def _row_label(row, exclude_ci: int = -1) -> str:
+    """The plain text a reader would use to find this row: its first filled
+    cell, falling back to its longest, other than the value being checked."""
+    first = ""
+    for ci, cell in enumerate(row):
+        if ci == exclude_ci:
+            continue
+        t = " ".join((cell or "").split())
+        if t:
+            first = first or t
+    if first and len(first.split()) <= 8:
+        return first
+    best = ""
+    for ci, cell in enumerate(row):
+        if ci == exclude_ci:
+            continue
+        t = " ".join((cell or "").split())
+        if 0 < len(t) < len(best) or not best:
+            if t:
+                best = t if not best or len(t) < len(best) else best
+    return (first or best)[:80]
+
+
+def _table_header_label(rows) -> str:
+    """The column names of a table, joined, for naming it in the report."""
+    if not rows:
+        return ""
+    head = " | ".join(" ".join((c or "").split()) for c in rows[0] if (c or "").strip())
+    return head[:120]
+
+
+def _table_finding_detail(page, header, row_label, text, whole_cell) -> str:
+    """Plain-text version of a table finding, for the HTML report / data feed."""
+    where = (f"the table with columns [{header}]" if header
+             else f"a table on PROD page {page}")
+    row = f" the row for '{row_label}'" if row_label else " one row"
+    if whole_cell:
+        return (f"PROD page {page}: in {where},{row} contains \"{text}\" — "
+                f"STAGE's copy of that row does not carry this text anywhere.")
+    return (f"PROD page {page}: in {where},{row} lists the value \"{text}\" — "
+            f"that value is missing from STAGE; the rest of the row is present.")
+
+
+def _table_row_missing_issues(prod_path: str, stage_path: str,
+                              prod_nav: set, stage_nav: set,
+                              stage_full_lower: str):
+    """PROD table rows that have NO counterpart row in STAGE.
+
+    _validate_tables checks each PROD cell and, when a whole row is gone, ends
+    up reporting its cells one by one, scattered. This reports the row as one
+    finding: "the row 'Receiver USB-C-output resolution: DP 1.2 ...' is not in
+    STAGE". A row counts as present when its label wording is found in any STAGE
+    table row, or when the label plus its longest value both appear anywhere in
+    STAGE's text (the row may have been re-laid-out as prose).
+    """
+    if os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+    prod_tables = _merge_continued_tables(_crawl_tables(prod_path, prod_nav))
+    stage_tables = _merge_continued_tables(_crawl_tables(stage_path, stage_nav))
+    if not prod_tables:
+        return []
+
+    # Every STAGE table row as a flat character key, for a fast "is this label
+    # a row somewhere in STAGE" test.
+    stage_row_keys = []
+    for _p, _nr, _nc, s_rows in stage_tables:
+        for r in s_rows:
+            k = _flat_key(" ".join((c or "") for c in r))
+            if k:
+                stage_row_keys.append(k)
+    stage_doc_flat = _flat_document(stage_path, stage_nav)
+    # PROD's own text, flattened - used to reject detector artefacts: a "row"
+    # whose label+value do not read as one unit in PROD (cells mashed together,
+    # a word sliced in half) is not real PROD content and cannot be a STAGE gap.
+    prod_doc_flat = _flat_document(prod_path, prod_nav)
+
+    findings, seen = [], set()
+    for pno, nrow, ncol, rows in prod_tables:
+        filled = sum(1 for r in rows for c in r if (c or "").strip())
+        if ncol < 2 or nrow < 2 or filled < 4:
+            continue
+        if ncol == 2 and not any((r[0] or "").strip() for r in rows):
+            continue          # admonition box, see _validate_tables
+        for ri, row in enumerate(rows):
+            if ri == 0:
+                continue                       # header row
+            cells = [" ".join((c or "").split()) for c in row]
+            nonempty = [c for c in cells if c]
+            if len(nonempty) < 2:
+                continue                       # sub-header / spacer, not a data row
+            label = cells[0] or nonempty[0]
+            value = max((c for c in cells[1:] if c), key=len, default="")
+            if not label or not value:
+                continue
+            label_toks = [t for t in _seq_tokens(label) if len(t) > 1]
+            # A one-word generic label ("Mode", "Color", "Item") is not
+            # distinctive enough to be sure a row is gone rather than reworded.
+            if len(label_toks) < 2 and len(_flat_key(label)) < 8:
+                continue
+            if _script_unreliable(label) or _MIXED_SCRIPT_RE.search(label):
+                continue
+            lk = _flat_key(label)
+            vk = _flat_key(value)
+            if len(lk) < 4 or len(vk) < 3:
+                continue
+            # Reject detector artefacts up front: a real spec row has a short
+            # noun-phrase label with no bullets, no step numbers, no sentence
+            # punctuation, and its label+value read as one unit in PROD itself.
+            if ("\u2022" in label or "\u2022" in value
+                    or re.search(r"\b\d+\.\s", label)
+                    or re.search(r"[.!?;]\s+\S", label)
+                    or len(label_toks) > 7):
+                continue
+            _pl = prod_doc_flat.find(lk)
+            if _pl < 0 or not (0 <= prod_doc_flat.find(vk, _pl) - _pl <= 400):
+                continue        # not a coherent PROD row - artefact
+            # PRESENT if the label heads any STAGE table row (however that row
+            # then rewords its value).
+            if any(lk in k for k in stage_row_keys):
+                continue
+            # PRESENT if the label phrase AND its most distinctive value both
+            # turn up in STAGE's running text within ~400 characters of each
+            # other - the row was re-laid-out as a sentence, not dropped.
+            li = stage_doc_flat.find(lk)
+            if li >= 0 and 0 <= stage_doc_flat.find(vk, li) - li <= 400:
+                continue
+            # PRESENT if the value alone (when it is a long, distinctive string
+            # like a resolution list or a part number) is somewhere in STAGE -
+            # the label may just have been reworded.
+            if len(vk) >= 14 and vk in stage_doc_flat:
+                continue
+            # Otherwise the row is gone: its label heads no STAGE row and its
+            # label+value pair appears nowhere in STAGE's text.
+            key = (pno, lk)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append({
+                "page": pno, "label": label, "value": value[:160],
+                "detail": (f"PROD page {pno}: the table row "
+                           f"\"{label}: {value[:120]}\" has no counterpart "
+                           f"row in STAGE - neither as a table row nor as "
+                           f"text elsewhere.")})
+    return findings
+
+
+def _pair_prod_stage_tables(prod_tables, stage_tables):
+    """{prod table index -> that table's paired STAGE rows}.
+
+    Two tables are the same table when their body cells overlap enough
+    (Jaccard >= _TABLE_PAIR_MIN), the same test _table_merge_issues uses. Once
+    a PROD table is paired, a missing cell can be judged against THAT table's
+    rows - so a value that survives elsewhere in STAGE but was dropped from the
+    row it belongs to is still caught, which a whole-document search misses.
+    """
+    def body(rows):
+        out = set()
+        for r in rows:
+            for c in r:
+                k = " ".join(_seq_tokens(c or ""))
+                if k:
+                    out.add(k)
+        return out
+
+    p_body = [body(rows) for _p, _nr, _nc, rows in prod_tables]
+    s_body = [body(rows) for _p, _nr, _nc, rows in stage_tables]
+    scored = []
+    for pi, pb in enumerate(p_body):
+        if not pb:
+            continue
+        for si, sb in enumerate(s_body):
+            if not sb:
+                continue
+            inter = len(pb & sb)
+            if inter:
+                scored.append((inter / len(pb | sb), pi, si))
+    scored.sort(reverse=True)
+    paired, used_p, used_s = {}, set(), set()
+    for score, pi, si in scored:
+        if score < _TABLE_PAIR_MIN or pi in used_p or si in used_s:
+            continue
+        used_p.add(pi)
+        used_s.add(si)
+        paired[pi] = stage_tables[si][3]        # the STAGE table's rows
+    return paired
+
+
+def _match_row_in(stage_rows, anchor_toks, min_anchor=2):
+    """Index of the STAGE row (in a specific table's rows) that carries
+    anchor_toks - a looser threshold than _find_stage_row because the table is
+    already known to be the right one."""
+    if len(anchor_toks) < min_anchor:
+        return None
+    best, best_hits = None, 0
+    for i, r in enumerate(stage_rows):
+        rtoks = set(t for c in r for t in _seq_tokens(c or ""))
+        hits = sum(1 for t in anchor_toks if t in rtoks)
+        if hits > best_hits and hits >= max(min_anchor, len(anchor_toks) - 1):
+            best, best_hits = i, hits
+    return best
 
 
 def _validate_tables(prod_path: str, stage_path: str,
                      prod_nav: set, stage_nav: set, stage_full_lower: str):
     """Return (summary, [findings]) for PROD tables checked cell by cell.
 
-    Every non-empty PROD cell must have a counterpart in STAGE. Cells are checked
-    with the same gap-tolerant window matcher used for body text, so a cell whose
-    wording STAGE re-wraps or re-orders is not reported — only text with no
-    counterpart anywhere in STAGE is.
+    Prose cells are checked with the same gap-tolerant window matcher used for
+    body text — a cell whose wording STAGE re-wraps or re-orders is not
+    reported, only text with no counterpart anywhere in STAGE is. Short cells
+    (a label, a unit, a bullet value) are matched against their own STAGE row
+    instead: words that short ("ON", "OFF", "min") turn up all over a settings
+    table, so a whole-document search cannot tell this row's value from
+    another row's.
     """
     prod_tables  = _merge_continued_tables(_crawl_tables(prod_path, prod_nav))
     stage_tables = _merge_continued_tables(_crawl_tables(stage_path, stage_nav))
@@ -3695,41 +5810,256 @@ def _validate_tables(prod_path: str, stage_path: str,
     _pd.close()
     prod_idx = _stage_seq_index(_s_norm(re.sub(r"\s+", " ", _praw)).lower())
 
+    # One small per-row token index per STAGE table row, built once up front —
+    # every short PROD cell needs to find its matching row, and rebuilding this
+    # per cell would repeat the same scan over and over.
+    stage_rows = []
+    for _pno, _nrow, _ncol, s_rows in stage_tables:
+        for s_row in s_rows:
+            row_idx = {}
+            for pos, tok in enumerate(_seq_tokens(
+                    " ".join((c or "") for c in s_row))):
+                row_idx.setdefault(tok, []).append(pos)
+            stage_rows.append((s_row, row_idx))
+
+    # Which STAGE table each PROD table pairs with - lets a cell be judged
+    # against its own row rather than the whole document.
+    paired = _pair_prod_stage_tables(prod_tables, stage_tables)
+    stage_doc_flat = _flat_document(stage_path, stage_nav)
+
     findings, n_cells = [], 0
-    for pno, nrow, ncol, rows in prod_tables:
+    for pi, (pno, nrow, ncol, rows) in enumerate(prod_tables):
+        paired_rows = paired.get(pi)
+        # find_tables() also fires on things that are not tables — an image with
+        # a caption, a bordered callout, a single framed paragraph. Their "cells"
+        # then get reported as missing from STAGE even though no table was lost.
+        # A real table has at least two columns, two rows, and several populated
+        # cells; anything thinner is a detection artefact and is skipped.
+        filled = sum(1 for r in rows for c in r if (c or "").strip())
+        if ncol < 2 or nrow < 2 or filled < 4:
+            continue
+        # An admonition box - a narrow icon column plus "Tip / Warning / Note"
+        # and body text - is drawn as a 2-column table and find_tables() picks
+        # it up as one. Its first column is empty in every row (the icon has no
+        # text). STAGE renders the same callouts with an icon and no word, so
+        # the label cell read as "Tip missing from STAGE" on every page. A real
+        # data table has text in its first column.
+        if ncol == 2 and not any((r[0] or "").strip() for r in rows):
+            continue
+        _hdr_keys = {" ".join(_seq_tokens(c or "")) for c in rows[0]
+                     if (c or "").strip()}
         for ri, row in enumerate(rows):
+            if ri == 0:
+                continue          # header row - _table_heading_issues owns it
+            # The STAGE row that matches this PROD row, when the table is paired.
+            row_stage_text = ""
+            if paired_rows:
+                _rmi = _match_row_in(
+                    paired_rows, [t for c in row for t in _seq_tokens(c or "")])
+                if _rmi is not None:
+                    row_stage_text = " ".join(
+                        c or "" for rr in paired_rows[_rmi:_rmi + 2] for c in rr)
             for ci, cell in enumerate(row):
                 text = (cell or "").strip()
                 if not text:
                     continue
+                if _WXDXH_RE.search(text):
+                    continue      # physical product dimension label — not tracked
+                if _ADMONITION_RE.match(text.strip()):
+                    continue      # style label ("Tip", "Warning") — see above
+                _tk = " ".join(_seq_tokens(text))
+                if _tk and _tk in _hdr_keys:
+                    continue      # a header word repeated in the body: the
+                                  # detector split the header - _table_heading
+                                  # owns any real column-heading loss
+                # The detector merges identical per-model columns into one
+                # cell ("1 x 3.0 (PD 65 W), 1 x 1 x 3.0 (PD 65 W), 1 x ..."):
+                # any 10+ char run that repeats three or more times means the
+                # same value was concatenated across columns - not real PROD
+                # text. The merge check reports the column split itself.
+                if len(text) >= 30:
+                    _probe = text[3:18]
+                    if len(_probe.strip()) >= 8 and text.count(_probe) >= 3:
+                        continue
+                    _mid = text[len(text) // 2 - 8:len(text) // 2 + 7]
+                    if len(_mid.strip()) >= 8 and text.count(_mid) >= 3:
+                        continue
                 n_cells += 1
                 toks = _seq_tokens(text)
                 if not toks:
                     continue
                 if _script_unreliable(text):
                     continue      # see _script_unreliable — not comparable
-                if len(toks) <= _SHORT_CELL_WORDS:
+                if _MIXED_SCRIPT_RE.search(text):
+                    # The OSD language list mixes Latin, Cyrillic, Arabic and
+                    # CJK entries, and the two export pipelines mangle those
+                    # differently (one drops them, one garbles them). Comparing
+                    # such a cell says nothing about whether content was lost.
+                    continue
+                if len(toks) <= _SHORT_CELL_WORDS or _is_bullet_cell(text):
                     # A short cell is one atomic label ("Item", "Illustration",
-                    # "5V / 3A"). Either STAGE has it or it does not — checking
-                    # the whole cell catches losses that the 3-word window used
-                    # for prose would silently drop. It must read that way in
-                    # PROD first, or it is a mis-sliced cell.
-                    # Every word present somewhere means the cell is there and
-                    # only the reading order differs — table cells are emitted
-                    # per block, so a two-word cell can be split apart.
-                    if (not _seq_present(idx, toks)
-                            and not _all_words_present(text, idx)
+                    # "5V / 3A") or a bullet value ("ON", "10 min"); a bullet
+                    # cell is a Range/options list of any length. Both belong to
+                    # one row of one table, so they are matched against their own
+                    # STAGE row; only fall back to the whole-document search when
+                    # the row itself cannot be found (its anchor is too short, or
+                    # genuinely absent — already reported separately for it).
+                    si = _find_stage_row(
+                        stage_rows, _row_anchor_tokens(row, ci))
+                    # The paired table's matching row is the strictest, most
+                    # honest place to look: a value dropped from THIS row is
+                    # missing even if the same words survive in another row.
+                    # Unpaired table -> the row _find_stage_row located, plus
+                    # its spill rows; nothing at all -> whole-document search.
+                    if row_stage_text:
+                        sc = row_stage_text
+                    elif si is not None:
+                        sc = " ".join(
+                            (c or "")
+                            for r2, _ in stage_rows[si:si + 1 + _ROW_SPILL]
+                            for c in r2)
+                    else:
+                        sc = ""
+
+                    if sc:
+                        present = _cell_covers(toks, sc)
+                        if not present and not _is_bullet_cell(text):
+                            if row_stage_text and paired_rows:
+                                # a plain label may just have moved cell/row
+                                # within the paired table
+                                present = _cell_covers(
+                                    toks, " ".join(c or "" for rr in paired_rows
+                                                   for c in rr))
+                            else:
+                                present = (_seq_present(idx, toks)
+                                           or _all_words_present(text, idx))
+                        elif not present and _BULLET_COUNT_RESPLIT < len(
+                                _BULLET_CELL_RE.findall(text)):
+                            # A very long list (the OSD language list, 20+
+                            # entries) is routinely re-split across rows, tables
+                            # and a page break, so no row window holds all of it.
+                            # If nearly every entry is somewhere in STAGE it was
+                            # re-laid-out, not dropped.
+                            want = set(toks)
+                            have = sum(1 for t in want if t in idx)
+                            if want and have / len(want) >= 0.85:
+                                present = True
+                    else:
+                        present = (_seq_present(idx, toks)
+                                   or _all_words_present(text, idx))
+                    hdr = _table_header_label(rows)
+                    rlab = _row_label(row, ci)
+                    if _is_bullet_cell(text) and _source_ok(prod_idx, toks):
+                        # Check each option value on its own — and do it whatever
+                        # the coarse `present` check said, because that one drops
+                        # digits ("10 min", "20 min", "30 min" all reduce to
+                        # "min") and so passes a row that has lost two of three
+                        # values. Values are compared as flattened characters,
+                        # against the STAGE row's own block first, then the whole
+                        # STAGE document.
+                        vals = _split_bullet_values(text)
+                        row_flat = _flat_key(sc) if sc else ""
+                        doc_flat = _flat_document(stage_path, stage_nav)
+                        gone = []
+                        for val in vals:
+                            # Drop a trailing model qualifier ("(SW272 only)",
+                            # "(XL2586X+ only)") - STAGE often rewords or moves
+                            # it, and it is not the value itself.
+                            core = re.sub(r"\s*\([^()]*\)\s*$", "", val).strip()
+                            vk = _flat_key(core or val)
+                            if len(vk) < 2:
+                                continue
+                            core_words = [w for w in _seq_tokens(core or val)
+                                          if len(w) > 1]
+                            if len(core_words) >= 3:
+                                # A multi-word text value ("Optimum Resolution
+                                # best with the monitor"): STAGE may re-word or
+                                # re-space it, so it counts as lost only when
+                                # most of its words are absent - a contiguous
+                                # match would flag every rewrite.
+                                absent = sum(1 for w in core_words
+                                             if w not in idx)
+                                if absent <= len(core_words) // 2:
+                                    continue
+                            else:
+                                # A short or numeric value ("20 min", "50 Hz"):
+                                # digits matter and there is nothing to re-word,
+                                # so the flat form must appear verbatim.
+                                if vk in row_flat or vk in doc_flat:
+                                    continue
+                            if _text_in_artwork(stage_path, val, pno, stage_nav):
+                                continue
+                            gone.append(val)
+                        if gone and len(gone) < len(vals):
+                            for val in gone:
+                                findings.append({
+                                    "page": pno, "row": ri, "col": ci,
+                                    "text": val, "row_label": rlab,
+                                    "header": hdr, "whole_cell": False,
+                                    "detail": _table_finding_detail(
+                                        pno, hdr, rlab, val, False)})
+                        elif gone:
+                            findings.append({
+                                "page": pno, "row": ri, "col": ci,
+                                "text": text.replace("\n", " "),
+                                "row_label": rlab, "header": hdr,
+                                "whole_cell": True,
+                                "detail": _table_finding_detail(
+                                    pno, hdr, rlab, text.replace("\n", " "),
+                                    True)})
+                    elif (not present
                             and _source_ok(prod_idx, toks)
+                            # Every word of the cell somewhere in STAGE = the
+                            # cell was reworded / re-split, not dropped. A real
+                            # loss leaves most of the words gone too.
+                            and not _all_words_present(text, idx)
                             and not _text_in_artwork(stage_path, text, pno,
                                                      stage_nav)):
+                        _t = text.replace("\n", " ")
                         findings.append({"page": pno, "row": ri, "col": ci,
-                                         "text": text.replace("\n", " ")})
+                                         "text": _t,
+                                         "row_label": rlab, "header": hdr,
+                                         "whole_cell": True,
+                                         "detail": _table_finding_detail(
+                                             pno, hdr, rlab, _t, True)})
                 else:
-                    for gap in _refine_fragment(_tokenize(text), idx, prod_idx):
+                    hdr = _table_header_label(rows)
+                    rlab = _row_label(row, ci)
+                    # A long value cell that STAGE re-wrapped or re-ordered is
+                    # not a loss - only text with no window match in STAGE is.
+                    # When the table is paired, scope the search to the matched
+                    # STAGE row so a phrase that survives in a DIFFERENT row is
+                    # still reported as missing from THIS one.
+                    for gap in _refine_fragment(_tokenize(text), idx,
+                                                prod_idx):
                         if _script_unreliable(gap):
                             continue
+                        gtoks = _seq_tokens(gap)
+                        # Must genuinely read this way in PROD - reject a cell
+                        # the detector sliced mid-sentence.
+                        if not _source_ok(prod_idx, gtoks):
+                            continue
+                        # Two independent checks must agree it is gone: absent
+                        # from the paired STAGE row (when the table paired) AND
+                        # absent from STAGE as a whole. Either one alone is not
+                        # trusted - the row match can be wrong, and the
+                        # whole-doc search can be fooled by the same words in a
+                        # different setting.
+                        in_row = bool(row_stage_text) and _cell_covers(
+                            gtoks, row_stage_text)
+                        in_doc = (_seq_present(idx, gtoks)
+                                  or _all_words_present(gap, idx))
+                        if in_row or in_doc:
+                            continue
+                        # The words may be baked into a STAGE figure rather than
+                        # laid out as text.
+                        if _text_in_artwork(stage_path, gap, pno, stage_nav):
+                            continue
                         findings.append({"page": pno, "row": ri, "col": ci,
-                                         "text": gap})
+                                         "text": gap, "row_label": rlab,
+                                         "header": hdr, "whole_cell": False,
+                                         "detail": _table_finding_detail(
+                                             pno, hdr, rlab, gap, False)})
     summary = {
         "prod_tables":  len(prod_tables),
         "stage_tables": len(stage_tables),
@@ -3926,7 +6256,8 @@ def _locate_all_tokens(pdf_path: str, needle: str, skip_pages=None,
 
 
 def _page_shot(pdf_path: str, page_no: int, groups=None, max_w_pt: float = 340.0,
-               color=(0.85, 0.1, 0.1), min_height: float = 0.0):
+               color=(0.85, 0.1, 0.1), min_height: float = 0.0,
+               full_width: bool = False):
     """PNG of `page_no`, cropped around `groups` and boxed.
 
     `groups` is either a plain list of rects (drawn in `color`) or a list of
@@ -3971,10 +6302,18 @@ def _page_shot(pdf_path: str, page_no: int, groups=None, max_w_pt: float = 340.0
                 # neighbouring illustration the caption was not talking about.
                 # A generous minimum keeps a short hit in enough context to be
                 # placed on the page.
-                x0, x1 = box.x0 - _SHOT_PAD, box.x1 + _SHOT_PAD
-                if (x1 - x0) < _SHOT_MIN_W:
-                    grow = (_SHOT_MIN_W - (x1 - x0)) / 2.0
-                    x0, x1 = x0 - grow, x1 + grow
+                if full_width:
+                    # Two shots of the same section have to be read against each
+                    # other, so both are cropped the full width of their page and
+                    # to the same height. Cropping each one tightly around its own
+                    # boxes gave the two sides different scales — one pane came
+                    # back magnified several times over.
+                    x0, x1 = page.rect.x0, page.rect.x1
+                else:
+                    x0, x1 = box.x0 - _SHOT_PAD, box.x1 + _SHOT_PAD
+                    if (x1 - x0) < _SHOT_MIN_W:
+                        grow = (_SHOT_MIN_W - (x1 - x0)) / 2.0
+                        x0, x1 = x0 - grow, x1 + grow
                 clip = fitz.Rect(x0, y0, x1, y1) & page.rect
         pix = page.get_pixmap(matrix=fitz.Matrix(_SHOT_ZOOM, _SHOT_ZOOM), clip=clip)
         png = pix.tobytes("png")
@@ -4309,6 +6648,13 @@ _FIX_ADVICE = {
                               "Restore the label on the STAGE figure. If STAGE "
                               "draws the figure as a flat image, publish it with "
                               "a live text layer so the label is selectable."),
+    "Diagram callout number missing":
+                             ("PROD numbers a diagram's parts, but one or more "
+                              "of those callout numbers do not appear anywhere "
+                              "on STAGE's version of the same diagram.",
+                              "Restore the missing callout number(s) so every "
+                              "part STAGE's diagram calls out is labelled, "
+                              "matching PROD."),
     "Image missing":         ("PROD illustrates this topic; STAGE has no figure "
                               "for it.",
                               "Add the figure to the STAGE topic, or confirm the "
@@ -4320,22 +6666,74 @@ _FIX_ADVICE = {
                               "placed — and re-publish. Downscaling on export, "
                               "or re-using a screen-sized asset, is the usual "
                               "cause."),
+    "Image not correctly updated":
+                             ("This section carries different artwork in the two "
+                              "documents — STAGE was not updated with the figure "
+                              "PROD publishes.",
+                              "Replace the figure in this STAGE section with the "
+                              "current artwork, then confirm it renders at the "
+                              "right size and resolution."),
     "Image difference":      ("The two documents show different artwork for the "
                               "same figure.",
                               "Check which artwork is current and re-publish "
                               "STAGE with it."),
+    "Image alignment changed": (
+        "The same picture appears in PROD and STAGE but is placed differently "
+        "in the text column - left where PROD centres it, or the reverse.",
+        "Match PROD's placement: set the figure to the same alignment "
+        "(left / centre / right) in STAGE."),
+    "Image mismatch":        ("PROD prints more figures under this heading than "
+                              "STAGE has anywhere in the same section — one of "
+                              "PROD's pictures has no counterpart in STAGE.",
+                              "Put the PROD artwork back in this STAGE section. "
+                              "Every figure PROD publishes under a heading must "
+                              "appear under that heading in STAGE."),
     "Table heading missing": ("A column heading is not present in any STAGE "
                               "table header.",
                               "Restore the heading so the column is identifiable, "
                               "and check the column itself was not dropped with "
                               "it."),
-    "Table cell missing":    ("A cell PROD carries has no counterpart in STAGE.",
-                              "Restore the cell content, or verify the row was "
-                              "removed on purpose."),
+    "Table row missing":     ("A whole row PROD prints in a table - its label "
+                              "and its values - is not in STAGE, as a table row "
+                              "or as text anywhere else.",
+                              "Add the row back to the STAGE table, or confirm "
+                              "the row was removed on purpose."),
+    "Table cell missing":    ("A value PROD prints in a table row is not present "
+                              "anywhere in STAGE's copy of that row — the "
+                              "wording was matched against the whole document, "
+                              "not just the same cell position, so re-wrapping "
+                              "or a moved column is not what triggered this.",
+                              "Put the missing value back in the STAGE table "
+                              "row, or confirm the row was cut on purpose."),
+    "Table breaking the margins":
+                             ("The table is wider than the text column and spills "
+                              "into the page margin.",
+                              "Narrow the table to the text column — reduce column "
+                              "widths, wrap long cell text, or set the table to "
+                              "the page width the rest of the content uses."),
+    "Table cell layout differs":
+                             ("The columns are the same but the cells inside the "
+                              "table are merged or split differently from PROD.",
+                              "Match the cell structure to PROD: keep the same "
+                              "cells merged and the same values together in one "
+                              "cell."),
+    "Table continuation missing its header":
+                             ("The table runs onto this page but the column "
+                              "header row is not repeated, so the columns on "
+                              "this page are unlabelled.",
+                              "Set the table's header row to repeat on every "
+                              "page it continues onto."),
     "Table layout broken":   ("A page break splits the table, separating rows "
                               "from their header.",
                               "Keep the table on one page, or repeat the header "
                               "row on each page it continues onto."),
+    "Table column layout differs":
+                             ("STAGE lays this table out with different columns "
+                              "than PROD — a column is added, dropped or moved.",
+                              "Match the column definition to PROD. A merged, "
+                              "split or re-ordered column changes what each value "
+                              "belongs to, so check the cells landed in the right "
+                              "column as well."),
     "Table columns differ":  ("The table is laid out with a different number of "
                               "columns than PROD.",
                               "Re-check the column definition: a merged or split "
@@ -4356,16 +6754,79 @@ _FIX_ADVICE = {
     "List marker changed":   ("The list uses a different marker style than PROD.",
                               "Match PROD's marker style so numbered and bulleted "
                               "steps stay distinguishable."),
+    "Text alignment changed":
+                             ("A title or paragraph is aligned differently than it "
+                              "is in PROD — centred where PROD sets it flush, or "
+                              "set at a different indent.",
+                              "Match PROD's paragraph/heading style so the block "
+                              "sits where PROD sits it."),
+    "List indent changed":   ("A list item sits at a different depth than it does "
+                              "in PROD. A sub-item set flush with its parent has "
+                              "lost its nesting, and the reader can no longer see "
+                              "which step it belongs to.",
+                              "Restore the nesting in the STAGE list so sub-items "
+                              "indent under their parent as they do in PROD."),
+    "Paragraph merged with heading":
+                             ("PROD prints this numbered item's label on its own "
+                              "line and starts the description underneath; STAGE "
+                              "runs the description straight on from the label "
+                              "on the same line.",
+                              "Break the paragraph onto its own line under the "
+                              "label in STAGE, matching PROD."),
     "Content missing":       ("Text PROD carries under this topic is absent from "
                               "STAGE.",
                               "Restore the sentence in the STAGE topic, or confirm "
                               "it was withdrawn deliberately."),
+    "Hyperlink lost":        ("PROD links this text; STAGE publishes the same "
+                              "words with no link on them.",
+                              "Restore the hyperlink on this text in STAGE and "
+                              "point it at the same destination PROD uses."),
+    "Hyperlink not highlighted in STAGE":
+                             ("STAGE carries the link, but draws the anchor in "
+                              "plain body text — no colour, no underline. The "
+                              "link works if you happen to click it, but nothing "
+                              "on the page tells the reader it is there.",
+                              "Apply the link character style in STAGE so the "
+                              "anchor is drawn the way PROD draws it."),
+    "Hyperlink added in STAGE":
+                             ("STAGE links this cross-reference; PROD prints the "
+                              "same words as plain text with no link.",
+                              "Confirm the STAGE link is wanted; if PROD is the "
+                              "baseline, add the same link in PROD or drop it "
+                              "from STAGE."),
     "Hyperlink":             ("A link differs between the two documents.",
                               "Point the STAGE link at the same destination as "
                               "PROD and confirm it resolves."),
+    "Hyperlink goes to the wrong page":
+                             ("The link's own text names one page, but clicking it "
+                              "lands the reader on a different one.",
+                              "Re-generate the cross-reference so the page it names "
+                              "and the page it jumps to are the same."),
+    "Hyperlink goes to the wrong section":
+                             ("The link names one section but its target lands the "
+                              "reader in a different section.",
+                              "Re-point the link at the heading it names, then "
+                              "click it and confirm it arrives at that section."),
+    "Cross-reference page number is wrong":
+                             ("STAGE prints “see … on page N” but the "
+                              "named section is not on STAGE page N.",
+                              "Re-generate all page cross-references after the final "
+                              "STAGE pagination so each printed page number is "
+                              "correct."),
+    "Cross-reference points to the wrong section":
+                             ("A “see … on page N” reference in STAGE "
+                              "lands on a page that holds a different section.",
+                              "Fix the reference so the section name and the page it "
+                              "sends the reader to match."),
     "Page number":           ("A page reference does not match.",
                               "Re-generate the cross-references after the final "
                               "pagination."),
+    "Image highlight box missing":
+                             ("One document draws a coloured box / highlight on "
+                              "this figure that the other does not.",
+                              "Add the same coloured highlight to the figure in "
+                              "the document that is missing it, or remove it from "
+                              "the one that has it, so both match."),
     "Broken image":          ("An image did not render.",
                               "Re-link or re-upload the asset, then confirm it "
                               "renders in the published output."),
@@ -4373,6 +6834,447 @@ _FIX_ADVICE = {
 _FIX_DEFAULT = ("STAGE does not match PROD at this location.",
                 "Compare the two documents here and bring STAGE in line with "
                 "PROD, or record why the difference is intended.")
+
+
+def _llm_verify_missing(content_results, prod_text, stage_text):
+    """Optional second-opinion pass over the mechanical content diff.
+
+    The shingle matcher flags any run of PROD characters it cannot find in
+    STAGE (and vice versa).  Many flags are false positives: PyMuPDF
+    concatenates page text in draw order, so screenshot captions, on-screen
+    display menu labels and table cells come out as reordered word-salad that
+    never existed as a sentence.  This asks Claude to separate genuine dropped
+    prose from extraction artifacts and prunes the artifacts in place.
+
+    Best-effort — returns silently (leaving findings untouched) when the
+    ``anthropic`` package or credentials are missing or the call fails.
+    Disable entirely with ``VALIDATOR_LLM_VERIFY=0``.
+    """
+    if os.environ.get("VALIDATOR_LLM_VERIFY", "").strip() == "0":
+        return
+    try:
+        import anthropic
+    except ImportError:
+        return
+
+    cand = []
+    for ri, r in enumerate(content_results):
+        for kind in ("missing", "extra"):
+            for mi, frag in enumerate(r.get(kind) or []):
+                cand.append({"id": len(cand), "ri": ri, "kind": kind,
+                             "mi": mi, "title": r.get("title", ""),
+                             "text": frag})
+    if not cand:
+        return
+
+    try:
+        client = anthropic.Anthropic()
+    except Exception:
+        return
+
+    listing = "\n".join(
+        f'[{c["id"]}] ({c["kind"]}; topic {c["title"]!r}) {c["text"]}'
+        for c in cand)
+    system = (
+        "You verify a PDF documentation diff. Two revisions of one product "
+        "manual (PROD = older, STAGE = newer) were compared by a mechanical "
+        "character matcher that flags text present in one revision but not "
+        "found in the other. The PDF text extractor concatenates page content "
+        "in draw order, so screenshot captions, on-screen-display menu labels "
+        "and table cells often come out as reordered word-salad that never "
+        "existed as a real sentence — those are false positives. For each "
+        "flagged fragment decide GENUINE (a readable sentence or phrase of "
+        "body text that really is absent from the other revision) or ARTIFACT "
+        "(reordered/garbled extraction, OCR noise, or duplicated boilerplate "
+        "that should not be reported). When unsure, answer GENUINE. Reply with "
+        'ONLY a JSON object: {"verdicts":[{"id":<int>,"verdict":"GENUINE"|'
+        '"ARTIFACT"}, ...]} covering every id.')
+    user = ("PROD full text:\n<<<\n" + prod_text + "\n>>>\n\n"
+            "STAGE full text:\n<<<\n" + stage_text + "\n>>>\n\n"
+            "Flagged fragments ('missing' = claimed absent from STAGE, "
+            "'extra' = claimed absent from PROD):\n" + listing)
+
+    try:
+        resp = client.messages.create(
+            model="claude-opus-5",
+            max_tokens=8000,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception as e:
+        print(f"  LLM verify skipped: {e}")
+        return
+
+    raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return
+    try:
+        verdicts = json.loads(m.group(0)).get("verdicts", [])
+    except Exception:
+        return
+
+    drop = {v["id"] for v in verdicts
+            if str(v.get("verdict", "")).upper() == "ARTIFACT"}
+    if not drop:
+        print("  LLM verify: all content fragments confirmed genuine")
+        return
+
+    by_row = {}
+    for c in cand:
+        if c["id"] in drop:
+            by_row.setdefault((c["ri"], c["kind"]), set()).add(c["mi"])
+    n_dropped = 0
+    for (ri, kind), idxs in by_row.items():
+        r = content_results[ri]
+        orig = r.get(kind) or []
+        r[kind] = [f for i, f in enumerate(orig) if i not in idxs]
+        n_dropped += len(orig) - len(r[kind])
+    for r in content_results:
+        if r.get("status") == "Fail" and not (r.get("missing") or r.get("extra")):
+            r["status"] = "Pass"
+    print(f"  LLM verify: dropped {n_dropped} extraction-artifact fragment(s)")
+
+
+def _ai_cross_check(content_results, prod_path, stage_path,
+                    prod_raw="", stage_raw="", prod_nav=None, stage_nav=None,
+                    prod_sections=None, stage_sections=None, stage_lookup=None):
+    """Heading-scoped cross-check that ADDS content missing from STAGE that the
+    main pass did not report.
+
+    Two independent passes, both keyed on the *heading*, never on page numbers
+    (PROD content under a heading may sit on one page and the matching STAGE
+    content spill across two):
+
+      1. Table-row multiset diff - every "label / value" row from both PDFs'
+         tables; a row PROD has more copies of than STAGE is a dropped row
+         (catches a single spec row removed from a table that repeats the same
+         labels for other product variants).
+      2. Section prose diff - for each PROD section, diff its text against the
+         *whole* matching STAGE section (all pages it spans), and report the
+         runs of PROD wording that appear nowhere in that STAGE section.
+
+    Findings render in the normal report under "Content missing".  A local
+    Ollama model, when reachable, prunes extraction noise.  Disable with
+    ``VALIDATOR_AI_CROSSCHECK=0``.
+    """
+    if os.environ.get("VALIDATOR_AI_CROSSCHECK", "").strip() == "0":
+        print("  AI cross-check: disabled (checkbox off) - plain report")
+        return
+
+    prod_nav = prod_nav or {1}
+    stage_nav = stage_nav or {1}
+    prod_sections = prod_sections or {}
+    stage_sections = stage_sections or {}
+    stage_lookup = stage_lookup or {}
+
+    _alpha = re.compile(r"[a-z]{3,}")
+    _tokrx = re.compile(r"[a-z0-9][a-z0-9.\-/%°]*")
+    _UNIT = re.compile(r"\b\d+(\.\d+)?\s?(w|kw|g|kg|mg|mm|cm|m|km|hz|khz|mhz|ghz|"
+                       r"mbps|gbps|kbps|fps|pcs|pc|v|va|a|ma|db|dba|ppi|dpi|bit|"
+                       r"nits?|cd|lm|hrs?|hours?|min|sec|ms|inch|inches|lbs?|"
+                       r"°c|°f)\b", re.I)
+    _SENT = re.compile(r"[a-z]{3,}(\s+[a-z’'a-z]{2,}){5,}", re.I)
+    _XREF = re.compile(r"^(see|refer to|for more information|for details|"
+                       r"for the location|on page)\b", re.I)
+    _JUNK = re.compile(r"all rights reserved|benq corporation|modification reserved"
+                       r"|^\W*$", re.I)
+    _XREF_WORDS = {"see", "refer", "page", "pages", "information", "instructions",
+                   "details", "section", "chapter", "above", "below", "following"}
+    _FUNC = {"a", "an", "the", "is", "are", "to", "of", "and", "or", "for", "in",
+             "on", "with", "you", "your", "this", "that", "it", "will", "can",
+             "do", "not", "be", "as", "at", "by", "from", "when", "if", "no"}
+    _CONTENTS_TITLE = re.compile(r"table of contents?|^contents?$|\bindex\b", re.I)
+
+    def _tok(s):
+        out = []
+        for w in _tokrx.findall((s or "").lower()):
+            w = w.strip(".-/")
+            if w:
+                out.append(w)
+        return out
+
+    def _sig(t):
+        return re.sub(r"[^a-z0-9]+", "", str(t or "").lower())
+
+    def _prettify(run):
+        t = re.sub(r"\s+([.,;:%)])", r"\1", " ".join(run))
+        t = re.sub(r"\s{2,}", " ", t).strip()
+        return (t[:1].upper() + t[1:])[:400]
+
+    def _is_content(frag):
+        w = [x.lower() for x in frag.split()]
+        if len(w) < 5:
+            return False
+        if sum(1 for x in w if len(x) <= 2) / len(w) >= 0.45:
+            return False
+        if _XREF.match(frag) or _JUNK.search(frag):
+            return False
+        if sum(1 for x in w if x in _XREF_WORDS) >= 3:
+            return False
+        has_unit = bool(_UNIT.search(frag))
+        if not has_unit and sum(1 for x in w if x in _FUNC) / len(w) < 0.18:
+            return False
+        return bool(_SENT.search(frag) or has_unit)
+
+    # de-dup against everything already reported (exact + fuzzy word-set)
+    seen = set()
+    kept_wsets = []
+
+    def _wset(t):
+        return frozenset(w for w in re.findall(r"[a-z]{3,}", str(t or "").lower()))
+
+    for r in content_results:
+        for k in ("missing", "extra"):
+            for frag in (r.get(k) or []):
+                s = _sig(frag)
+                if len(s) >= 12:
+                    seen.add(s)
+                ws = _wset(frag)
+                if len(ws) >= 4:
+                    kept_wsets.append(ws)
+
+    def _dup(frag):
+        if _sig(frag) in seen:
+            return True
+        ws = _wset(frag)
+        if len(ws) < 4:
+            return False
+        for other in kept_wsets:
+            inter = len(ws & other)
+            if inter and inter / min(len(ws), len(other)) >= 0.75:
+                return True
+        return False
+
+    def _mark_seen(frag):
+        seen.add(_sig(frag))
+        ws = _wset(frag)
+        if len(ws) >= 4:
+            kept_wsets.append(ws)
+
+    def _row_for_title(title):
+        key = _norm_key(title)
+        for r in content_results:
+            if _norm_key(r.get("title", "")) == key:
+                return r
+        r = {"title": title, "level": 2, "status": "Fail",
+             "prod_page": "?", "stage_page": "?",
+             "coverage": 0.0, "missing": [], "extra": []}
+        content_results.append(r)
+        return r
+
+    # ── Pass 1: table-row multiset diff ──
+    def _dehyph(s):
+        s = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", s or "")
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _clean_cell(s):
+        return _dehyph(re.sub(r"[•▪◦·‣■●∙]", " ", s or "")).strip()
+
+    def _good_label(raw):
+        """A real row label: starts upper/digit, <=5 words, not a sentence."""
+        t = raw.strip()
+        if not t or len(t) > 45 or "," in t or t.rstrip().endswith((".", ":")):
+            return False
+        if not re.match(r"[A-Z0-9]", t):
+            return False
+        return 1 <= len(re.findall(r"\S+", t)) <= 5
+
+    def _split_vals(cell):
+        """A cell like 'YES NO' or 'Model Name Version Usage Time' -> list."""
+        parts = re.split(r"\s*[•\n]\s*|\s{2,}", cell)
+        parts = [p.strip() for p in parts if p.strip()]
+        return parts or ([cell.strip()] if cell.strip() else [])
+
+    def _tables(path, nav):
+        """[(page, [header], {row_label: [cells]})] for every real-looking table."""
+        d = fitz.open(path)
+        out = []
+        for i in range(d.page_count):
+            if (i + 1) in nav:
+                continue
+            try:
+                tabs = d[i].find_tables().tables
+            except Exception:  # noqa: BLE001
+                tabs = []
+            for t in tabs:
+                try:
+                    grid = t.extract()
+                except Exception:  # noqa: BLE001
+                    continue
+                if not grid or len(grid) < 3 or len(grid[0]) < 2:
+                    continue
+                header = [_clean_cell(c).lower() for c in grid[0]]
+                rows = {}
+                for row in grid[1:]:
+                    if len(row) < 2 or not _good_label(_clean_cell(row[0])):
+                        continue
+                    rows[_clean_cell(row[0]).lower()] = [
+                        _clean_cell(c) for c in row[1:]]
+                if len(rows) >= 2:
+                    out.append((i + 1, header, rows))
+        d.close()
+        return out
+
+    n_tbl = 0
+    try:
+        p_tabs = _tables(prod_path, prod_nav)
+        s_tabs = _tables(stage_path, stage_nav)
+
+        _pmarks = sorted((r["prod_page"], r.get("title", ""))
+                         for r in content_results
+                         if isinstance(r.get("prod_page"), int))
+
+        def _sec_of_ppage(pg):
+            name = _pmarks[0][1] if _pmarks else ""
+            for mp, mt in _pmarks:
+                if mp <= pg:
+                    name = mt
+                else:
+                    break
+            return name
+
+        for ppg, phdr, prows in p_tabs:
+            # match STAGE's table with the most shared row labels
+            best, best_n = None, 0
+            for spg, shdr, srows in s_tabs:
+                n = len(set(prows) & set(srows))
+                if n > best_n:
+                    best, best_n = (spg, shdr, srows), n
+            if not best or best_n < 2:
+                continue
+            spg, shdr, srows = best
+            sec = _sec_of_ppage(ppg)
+            for rlab, pcells in prows.items():
+                scells = srows.get(rlab)
+                if scells is None:
+                    continue
+                s_join = " ".join(scells).lower()
+                lost = []
+                for ci, pc in enumerate(pcells):
+                    for v in _split_vals(pc):
+                        vl = v.lower()
+                        if len(re.findall(r"[a-z0-9]", vl)) < 2 or len(v) > 90:
+                            continue
+                        if vl in s_join or v in " ".join(pcells[:ci]):
+                            continue
+                        col = (phdr[ci + 1] if ci + 1 < len(phdr) and phdr[ci + 1]
+                               else "")
+                        lost.append((col, v))
+                if not lost:
+                    continue
+                items, seents = [], set()
+                for col, v in lost:
+                    key = v.lower()
+                    if key in seents:
+                        continue
+                    seents.add(key)
+                    items.append((f"[{col}] " if col else "") + v)
+                frag = (f"table “{rlab.title()}” row — STAGE is missing: "
+                        + "; ".join(items))[:500]
+                if _dup(frag):
+                    continue
+                r = _row_for_title(sec)
+                r.setdefault("missing", [])
+                r["missing"].append(f"(AI) p{ppg} (STAGE p{spg}): {frag}")
+                if r.get("status") in ("Pass", "NO CONTENT"):
+                    r["status"] = "Fail"
+                n_tbl += 1
+                _mark_seen(frag)
+        if n_tbl:
+            print(f"  AI cross-check: {n_tbl} table row(s) with dropped cells")
+    except Exception as _e:  # noqa: BLE001
+        print(f"  AI cross-check: table-cell pass skipped ({_e})")
+
+    # ── Pass 2: heading-scoped sentence diff ──
+    # For each PROD section, split into sentences and report any whole sentence
+    # whose 5-grams appear nowhere in the matching STAGE section.  A complete
+    # sentence either survives verbatim or it is genuinely gone -- reflow across
+    # pages does not fragment it, so this is far quieter than a token diff.
+    cand = []   # (title, fragment)
+    _SPLIT = re.compile(r"(?<=[.!?;])\s+")
+    for title, ptext in prod_sections.items():
+        if not ptext or _CONTENTS_TITLE.search(title or ""):
+            continue
+        stext = (stage_sections.get(title)
+                 or stage_lookup.get(_norm_key(title)) or "")
+        if not stext:
+            continue                       # "missing section" already handled
+        st = _tok(stext)
+        if len(st) < 20:
+            continue
+        s3 = {" ".join(st[k:k + 3]) for k in range(len(st) - 2)}
+        s5 = {" ".join(st[k:k + 5]) for k in range(len(st) - 4)}
+        for sent in _SPLIT.split(ptext):
+            w = _tok(sent)
+            real = [x for x in w if _alpha.fullmatch(x)]
+            if len(real) < 12:
+                continue
+            g5 = [" ".join(w[k:k + 5]) for k in range(len(w) - 4)]
+            g3 = [" ".join(w[k:k + 3]) for k in range(len(w) - 2)]
+            if not g5:
+                continue
+            # present if a third of its 5-grams OR two-thirds of its 3-grams
+            # already appear in STAGE (covers light rewording / reflow)
+            if (sum(1 for x in g5 if x in s5) / len(g5) >= 0.30
+                    or sum(1 for x in g3 if x in s3) / max(1, len(g3)) >= 0.66):
+                continue
+            frag = _prettify(w)
+            if _is_content(frag) and not _dup(frag):
+                cand.append((title, frag))
+                _mark_seen(frag)
+
+    # every candidate that survives the checks above is reported -- no cap,
+    # so a heavily-restructured section does not have its later findings
+    # silently dropped once an arbitrary count is reached
+    keep = list(range(len(cand)))
+    if cand:
+        try:
+            import urllib.request as _u
+            from content_validation import ai_validate as _ai
+            _u.urlopen(_ai.OLLAMA_HOST + "/api/version", timeout=3).read()
+            sysmsg = ("Each line is text present in the OLD manual revision but "
+                      "not found in the matching section of the NEW one. Mark "
+                      "'real' if it is readable content a reader would miss (a "
+                      "sentence, a spec row, a table row, a warning) or 'noise' "
+                      "if it is garbled word-salad or a stray fragment. Unsure "
+                      '-> real. JSON only: {"r":[{"i":<int>,"v":"real"|"noise"}]}')
+            n_b = max(1, (len(cand) + 11) // 12)
+            for bi, base in enumerate(range(0, len(cand), 12)):
+                _emit(0.52 + 0.10 * (bi + 1) / n_b, f"AI cross-check {bi+1}/{n_b}")
+                chunk = cand[base:base + 12]
+                txt = "\n".join(f'[{base+k}] {c[1][:180]}'
+                                for k, c in enumerate(chunk))
+                body = json.dumps({"model": _ai.OLLAMA_MODEL, "system": sysmsg,
+                                   "prompt": txt, "stream": False,
+                                   "format": "json",
+                                   "options": {"temperature": 0, "num_ctx": 4096,
+                                               "num_predict": 500}}).encode()
+                rq = _u.Request(_ai.OLLAMA_HOST + "/api/generate", data=body,
+                                headers={"Content-Type": "application/json"})
+                raw = json.loads(_u.urlopen(rq, timeout=180).read())["response"]
+                for vm in re.finditer(
+                        r'"i"\s*:\s*(\d+)\s*,\s*"v"\s*:\s*"([a-z]+)"', raw):
+                    if vm.group(2).lower().startswith("nois"):
+                        keep = [i for i in keep if i != int(vm.group(1))]
+            print(f"  AI cross-check: model kept {len(keep)}/{len(cand)} prose "
+                  f"candidate(s)")
+        except Exception as _e:  # noqa: BLE001
+            print(f"  AI cross-check: model unavailable, phrase-check only ({_e})")
+
+    added = 0
+    for i in keep:
+        title, frag = cand[i]
+        r = _row_for_title(title)
+        r.setdefault("missing", [])
+        r["missing"].append(f"(AI) {frag}")
+        added += 1
+        if r.get("status") in ("Pass", "NO CONTENT"):
+            r["status"] = "Fail"
+
+    print(f"  AI cross-check: added {added} prose finding(s) + {n_tbl} table "
+          f"row(s) the section matcher missed")
+
 
 
 def _fix_for(issue: str):
@@ -4385,25 +7287,212 @@ def _fix_for(issue: str):
     return _FIX_ADVICE[hit] if hit else _FIX_DEFAULT
 
 
+# Issues are grouped by the kind of defect they are, because that is how they
+# get fixed: encoding problems go to whoever owns the publishing pipeline, table
+# problems to whoever owns the templates, image problems to whoever owns the
+# artwork. A single flat list forced every reader to sort it themselves.
+_CATEGORIES = [
+    ("encoding",  "Encoding &amp; text-layer issues",
+     "Characters that were published wrong, or text the page draws correctly but "
+     "no machine can read."),
+    ("content",   "Content differences",
+     "Wording PROD carries that STAGE does not."),
+    ("image",     "Image issues",
+     "Figures, their labels, and the quality they are published at."),
+    ("table",     "Table issues",
+     "Table structure and the cells inside it."),
+    ("alignment", "Alignment &amp; formatting issues",
+     "Layout and emphasis: markers separated from their text, weight and slant "
+     "that did not survive."),
+    ("other",     "Links &amp; references",
+     "Hyperlinks and page references."),
+]
+
+# Which category an issue belongs to, by the issue label it is reported under.
+_ISSUE_CATEGORY = {
+    "Text layer":            "encoding",
+    "HTML entity":           "encoding",
+    "Content missing":       "content",
+    "Image label missing":   "image",
+    "Diagram callout number missing": "image",
+    "Image missing":         "image",
+    "Image difference":      "image",
+    "Image not correctly updated": "image",
+    "Image mismatch":        "image",
+    "Image alignment changed": "image",
+    "Images pixelated":      "image",
+    "Image highlight box missing": "image",
+    "Broken image":          "image",
+    "Table heading missing": "table",
+    "Table continuation missing its header": "table",
+    "Table cell layout differs": "table",
+    "Table row missing":     "table",
+    "Table cell missing":    "table",
+    "Table layout broken":   "table",
+    "Table breaking the margins": "table",
+    "Table columns differ":  "table",
+    "Table column layout differs": "table",
+    "List alignment broken": "alignment",
+    "List indent changed":   "alignment",
+    "Text alignment changed": "alignment",
+    "List marker changed":   "alignment",
+    "Bold lost":             "alignment",
+    "Italic lost":           "alignment",
+    "Paragraph merged with heading": "alignment",
+    "Hyperlink not highlighted in STAGE": "other",
+    "Hyperlink":             "other",
+    "Hyperlink lost":        "other",
+    "Web address in PROD not linked in STAGE": "other",
+    "Hyperlink added in STAGE": "other",
+    "Hyperlink goes to the wrong page": "other",
+    "Hyperlink goes to the wrong section": "other",
+    "Cross-reference page number is wrong": "other",
+    "Cross-reference points to the wrong section": "other",
+    "Page number":           "other",
+}
+
+
+def _category_for(issue: str) -> str:
+    """The section an issue belongs in — longest matching label wins."""
+    hit = max((k for k in _ISSUE_CATEGORY if issue.lower().startswith(k.lower())),
+              key=len, default=None)
+    if hit is None:
+        hit = max((k for k in _ISSUE_CATEGORY if k.lower() in issue.lower()),
+                  key=len, default=None)
+    return _ISSUE_CATEGORY.get(hit, "other")
+
+
+# The report is scoped to the defects that were asked for: things missing,
+# alignment, table layout and margin breakage, and hyperlinks that are gone or
+# broken. Everything the validator can still detect stays detected — it is only
+# the reporting that is narrowed — so widening this set is the whole change
+# needed to bring a kind of issue back.
+_REPORTED_ISSUES = (
+    # encoding — leads the list. Garbled text or a broken text layer makes every
+    # other reading of the page unreliable, so it has to be visible in the
+    # report rather than detected and dropped.
+    "Text layer",
+    "HTML entity",
+    "Encoding",
+    "Garbled",
+    # missing
+    "Content missing",
+    "Image label missing",
+    "Diagram callout number missing",
+    "Image missing",
+    "Table row missing",
+    "Table cell missing",
+    "Table heading missing",
+    # image: the picture PROD prints in a section must be the picture STAGE
+    # prints there, and it must sit where PROD sits it.
+    "Image mismatch",
+    # "Image not correctly updated" is NOT reported: PROD and STAGE are rendered
+    # by different pipelines, so an SSIM/pixel comparison scores the *same*
+    # artwork anywhere from 0.06 to 0.82 (measured across 109 figure pairs) and a
+    # genuinely changed image lands in that same band — there is no threshold
+    # that separates them, so every reading is a coin-flip.  A missing or
+    # re-placed figure is caught by "Image mismatch" / "Image alignment changed"
+    # in terms of the picture itself.
+    # figure placed left where PROD centres it (or the reverse) - a clear
+    # left/centre/right change only, small shifts are not reported
+    "Image alignment changed",
+    # one side paints a coloured callout box / highlight on a figure, the other
+    # does not - a strongly-coloured region reads the same in both pipelines
+    "Image highlight box missing",
+    # a figure whose STAGE artwork will not decode / renders blank
+    "Broken image",
+    # alignment
+    # a step list PROD numbers 1. 2. 3. that STAGE draws a. b. c. or as bullets
+    "List marker changed",
+    "List alignment broken",
+    "List indent changed",
+    "Text alignment changed",
+    "Paragraph merged with heading",
+    # table layout and breakage
+    "Table layout broken",
+    "Table columns differ",
+    "Table column layout differs",
+    "Table breaking the margins",
+    "Table cell layout differs",
+    # a table that runs onto the next page without repeating its header leaves
+    # the continuation as unlabelled columns
+    "Table continuation missing its header",
+    # A link STAGE carries but draws as plain body text: the reader has no way
+    # to know it is there. Asked for explicitly, so it is reported.
+    "Hyperlink not highlighted in STAGE",
+    # A cross-reference PROD makes clickable that STAGE prints as plain text:
+    # the reader loses the jump.  Asked for explicitly, so it is reported.
+    "Hyperlink lost",
+    "Web address in PROD not linked in STAGE",
+    # STAGE links a cross-reference PROD prints as plain text: a formatting
+    # difference between the two documents, reported in both directions.
+    "Hyperlink added in STAGE",
+    # the link text names one page and the link lands on another
+    "Hyperlink goes to the wrong page",
+    # a cross-reference whose target is a different section than the one it names
+    "Hyperlink goes to the wrong section",
+    # a printed "see X on page N" whose page number or section is wrong in STAGE
+    "Cross-reference page number is wrong",
+    "Cross-reference points to the wrong section",
+    # hyperlink not working
+    "Internal link target does not resolve",
+    "Hyperlink has no usable scheme",
+    "Hyperlink hotspot cannot be clicked",
+)
+
+
+def _is_reported(issue: str) -> bool:
+    """True when this issue label is one the report is scoped to."""
+    low = (issue or "").lower()
+    return any(low.startswith(k.lower()) or k.lower() in low
+               for k in _REPORTED_ISSUES)
+
+
+# ── Attributing every finding to the section it falls in ─────────────────────
+def _section_page_index(toc_results, side: str):
+    """[(page, title)] sorted, for resolving a page to the section holding it."""
+    key = "prod_page" if side == "prod" else "stage_page"
+    marks = []
+    for r in toc_results or []:
+        try:
+            pg = int(r.get(key))
+        except (TypeError, ValueError):
+            continue
+        if pg > 0 and r.get("title"):
+            marks.append((pg, r["title"]))
+    marks.sort(key=lambda t: t[0])
+    return marks
+
+
 def generate_report(prod_path, stage_path, toc_results, content_results,
                     image_results, icon_doc_summary, report_path,
                     tm_counts=None, tm_dropped=None,
                     prod_encoding_issue=False, stage_encoding_issue=False,
-                    table_summary=None, table_findings=None,
+                    table_summary=None, table_findings=None, tablerow_findings=None,
                     figure_summary=None, glitches=None,
                     heading_findings=None, label_findings=None,
                     prod_nav_pages=None, stage_nav_pages=None,
-                    link_findings=None, pageno_findings=None,
+                    link_findings=None, linkloss_findings=None,
+                    pageno_findings=None,
                     bold_findings=None, figure_findings=None,
                     icon_findings=None, align_findings=None,
                     italic_findings=None, callout_counts=None,
                     figdiff_findings=None, pixel_findings=None,
                     liststyle_findings=None,
                     tableshape_findings=None, tablebreak_findings=None,
-                    callgap_findings=None):
+                    tablemargin_findings=None,
+                    tablecont_findings=None,
+                    tablemerge_findings=None,
+                    callgap_findings=None,
+                    figalign_findings=None, listindent_findings=None,
+                    textalign_findings=None,
+                    linkstyle_findings=None, imgmismatch_findings=None,
+                    labelmerge_findings=None, colour_findings=None):
+    colour_findings = colour_findings or []
     prod_nav_pages   = prod_nav_pages or set()
     stage_nav_pages  = stage_nav_pages or set()
     link_findings    = link_findings or []
+    linkloss_findings = linkloss_findings or []
     pageno_findings  = pageno_findings or []
     bold_findings    = bold_findings or []
     figure_findings  = figure_findings or []
@@ -4416,13 +7505,23 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
     liststyle_findings  = liststyle_findings or []
     tableshape_findings = tableshape_findings or []
     tablebreak_findings = tablebreak_findings or []
+    tablemargin_findings = tablemargin_findings or []
+    tablecont_findings = tablecont_findings or []
+    tablemerge_findings = tablemerge_findings or []
+    figalign_findings   = figalign_findings or []
+    listindent_findings = listindent_findings or []
+    textalign_findings = textalign_findings or []
+    linkstyle_findings  = linkstyle_findings or []
+    imgmismatch_findings = imgmismatch_findings or []
     callgap_findings    = callgap_findings or []
+    labelmerge_findings = labelmerge_findings or []
     glitches         = glitches or []
     heading_findings = heading_findings or []
     label_findings   = label_findings or []
     tm_counts = tm_counts or []
     tm_dropped = tm_dropped or []
     table_findings = table_findings or []
+    tablerow_findings = tablerow_findings or []
 
     # The same finding can reach the report twice (two detectors agreeing, or a
     # table/figure straddling pages so it is collected once per page). Duplicates
@@ -4438,21 +7537,52 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             out.append(it)
         return out
 
+    def _dedupe_count(items, *keys):
+        """Like _dedupe, but a repeated key is folded into ONE finding carrying
+        how many separate instances it stood for, instead of silently dropping
+        the rest — three identical images on a page each missing the same
+        caption is three real defects, not one."""
+        agg, order = {}, []
+        for it in items or []:
+            k = tuple(str(it.get(x, "")) for x in keys)
+            if k not in agg:
+                agg[k] = dict(it)
+                agg[k]["_count"] = 1
+                order.append(k)
+            else:
+                agg[k]["_count"] += 1
+        return [agg[k] for k in order]
+
     glitches            = _dedupe(glitches, "doc", "page", "kind", "text")
     icon_findings       = _dedupe(icon_findings, "doc", "page", "kind", "text")
-    label_findings      = _dedupe(label_findings, "page", "text")
+    label_findings      = _dedupe_count(label_findings, "page", "text")
     figure_findings     = _dedupe(figure_findings, "page", "stage_page", "title")
     heading_findings    = _dedupe(heading_findings, "page", "text", "row")
     table_findings      = _dedupe(table_findings, "page", "row", "col", "text")
+    tablerow_findings   = _dedupe(tablerow_findings, "page", "label")
     tableshape_findings = _dedupe(tableshape_findings, "prod_page", "page", "header")
     tablebreak_findings = _dedupe(tablebreak_findings, "prod_page", "stage_from",
                                   "stage_to", "header")
+    tablemargin_findings = _dedupe(tablemargin_findings, "page", "header")
+    tablecont_findings  = _dedupe(tablecont_findings, "doc", "page", "header")
+    tablemerge_findings = _dedupe(tablemerge_findings, "prod_page", "page", "header")
     figdiff_findings    = _dedupe(figdiff_findings, "page", "stage_page", "anchor")
-    callgap_findings    = _dedupe(callgap_findings, "doc", "page", "missing")
+    callgap_findings    = _dedupe(callgap_findings, "prod_page", "missing")
+    labelmerge_findings = _dedupe(labelmerge_findings, "prod_page", "stage_page", "label")
     italic_findings     = _dedupe(italic_findings, "page", "text")
     align_findings      = _dedupe(align_findings, "doc", "page", "marker", "text")
     liststyle_findings  = _dedupe(liststyle_findings, "doc", "page", "text")
     link_findings       = _dedupe(link_findings, "doc", "page", "kind", "text")
+    linkloss_findings   = _dedupe(linkloss_findings, "doc", "page", "text", "target")
+    # Keyed on where the figure sits, not just its page: two different pictures
+    # on one PROD page are two findings, and collapsing them on "kind" hid one.
+    imgmismatch_findings = _dedupe(imgmismatch_findings, "section", "prod_page",
+                                   "prod_where")
+    figalign_findings   = _dedupe(figalign_findings, "page", "stage_page", "anchor")
+    colour_findings     = _dedupe(colour_findings, "page", "stage_page", "colour")
+    listindent_findings = _dedupe(listindent_findings, "prod_page", "page", "text")
+    textalign_findings  = _dedupe(textalign_findings, "prod_page", "page", "text")
+    linkstyle_findings  = _dedupe(linkstyle_findings, "prod_page", "page", "text")
     bold_findings       = _dedupe(bold_findings, "page", "stage_page", "text")
     pixel_findings      = _dedupe(pixel_findings, "count", "total", "worst")
     pageno_findings     = _dedupe(pageno_findings, "doc", "page", "kind", "text")
@@ -4492,6 +7622,99 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
     story.append(Spacer(1, 8))
 
     # ═══════════════════════════════════════════
+    # TOC / SECTION STATUS — every PROD topic and whether STAGE has it
+    # ═══════════════════════════════════════════
+    # This table validates ONE thing: does the TOC entry (heading) itself exist
+    # in both documents. Content differences, table/image/link issues etc. are
+    # already reported in full detail in their own sections below — repeating
+    # them here as a second, differently-worded "Fail" on the same section was
+    # confusing, not additive.
+    _toc_status_rows, _n_toc_pass, _n_toc_miss, _n_toc_extra = [], 0, 0, 0
+    _n_toc_level = 0
+    for r in toc_results:
+        title = r.get("title") or "—"
+        ts = r.get("toc_status")
+        _plvl, _slvl = r.get("prod_level"), r.get("stage_level")
+        _lvl_changed = r.get("level_status") == "Changed"
+        if _lvl_changed:
+            _n_toc_level += 1
+        if ts == "Extra in Stage":
+            label, sty = "Extra in STAGE", extra_s
+            _n_toc_extra += 1
+        elif ts == "Missing in Stage":
+            label, sty = "Missing in STAGE", miss_s
+            _n_toc_miss += 1
+        else:
+            # The heading matches on both sides — a level change alone is
+            # informational (shown in the "Level" column), not a fail.
+            label, sty = "Pass", pass_s
+            _n_toc_pass += 1
+        # Indent the title by its own depth so the outline reads as a hierarchy
+        # rather than a flat list of every heading at every level.
+        _depth = _plvl if isinstance(_plvl, int) else (_slvl if isinstance(_slvl, int) else 1)
+        _indent = "&nbsp;" * (4 * max(0, _depth - 1))
+        if _lvl_changed:
+            _lvl_txt = f"L{_plvl} \u2192 L{_slvl}"
+        elif isinstance(_plvl, int) and isinstance(_slvl, int):
+            _lvl_txt = f"L{_plvl}"
+        elif isinstance(_plvl, int):
+            _lvl_txt = f"L{_plvl} / —"
+        elif isinstance(_slvl, int):
+            _lvl_txt = f"— / L{_slvl}"
+        else:
+            _lvl_txt = "—"
+        _toc_status_rows.append([
+            Paragraph(_indent + _esc(title), cell_s),
+            Paragraph(_lvl_txt, fail_s if _lvl_changed else cell_s),
+            Paragraph(str(r.get("prod_page") or "—"), cell_s),
+            Paragraph(str(r.get("stage_page") or "—"), cell_s),
+            Paragraph(label, sty),
+        ])
+    _toc_overall = "FAIL" if _n_toc_miss else "PASS"
+    # Every outline depth on either side, so the reader can see the nesting the
+    # two documents use — not just the headings that happen to differ.
+    _depths = sorted({d for r in toc_results
+                      for d in (r.get("prod_level"), r.get("stage_level"))
+                      if isinstance(d, int)})
+    _level_breakdown = " &middot; ".join(
+        f"L{d}: {sum(1 for r in toc_results if r.get('prod_level') == d)}"
+        f"/{sum(1 for r in toc_results if r.get('stage_level') == d)}"
+        for d in _depths)
+    story.append(Paragraph(
+        f"TOC / section status: <b>{_toc_overall}</b> &nbsp;—&nbsp; "
+        f"{_n_toc_pass} pass &middot; "
+        f"<font color='#e65100'>{_n_toc_miss} missing in STAGE</font> &middot; "
+        f"<font color='#1565c0'>{_n_toc_extra} extra in STAGE</font> &middot; "
+        f"<font color='#b71c1c'>{_n_toc_level} level change(s)</font>",
+        ParagraphStyle("TocVerdict", parent=styles["Normal"], fontSize=10,
+                       leading=13, spaceAfter=6,
+                       textColor=(colors.red if _toc_overall == "FAIL"
+                                  else colors.HexColor("#2e7d32")))))
+    if _depths:
+        story.append(Paragraph(
+            f"TOC levels validated (PROD/STAGE entries per depth): "
+            f"<b>{_level_breakdown}</b>",
+            ParagraphStyle("TocLevels", parent=styles["Normal"], fontSize=9,
+                           leading=12, spaceAfter=6,
+                           textColor=colors.HexColor("#37474f"))))
+    if _toc_status_rows:
+        _tsr = [[Paragraph(f"<b>{h}</b>", hdr_s) for h in
+                 ["Section (TOC entry)", "Level", "PROD pg", "STAGE pg",
+                  "Status"]]]
+        _tsr += _toc_status_rows
+        _tst = Table(_tsr, colWidths=[290, 52, 46, 46, 220], repeatRows=1)
+        _tst.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (-1, 0), colors.HexColor("#37474f")),
+            ("GRID",         (0, 0), (-1, -1), 0.5, colors.grey),
+            ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING",   (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.white, colors.HexColor("#f7f7f7")]),
+        ]))
+        story += [_tst, Spacer(1, 12)]
+
+    # ═══════════════════════════════════════════
     # ISSUES ONLY — like-for-like comparison
     # ═══════════════════════════════════════════
     diff_rows = [r for r in content_results if r["status"] == "Fail"]
@@ -4517,16 +7740,22 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
     n_cxtra = 0     # "extra in STAGE" is not reported: PROD is the reference
     n_only_prod  = sum(1 for r in toc_results if r["toc_status"] == "Missing in Stage")
     n_only_stage = sum(1 for r in toc_results if r["toc_status"] == "Extra in Stage")
-    total_issues = (len(glitches) + len(heading_findings) + len(label_findings)
-                    + len(table_findings) + n_cmiss + n_cxtra
-                    + len(link_findings) + len(pageno_findings)
+    n_label = sum(f.get("_count", 1) for f in label_findings)
+    total_issues = (len(glitches) + len(heading_findings) + n_label
+                    + len(table_findings) + len(tablerow_findings) + n_cmiss + n_cxtra
+                    + len(link_findings) + len(linkloss_findings)
+                    + len(pageno_findings)
                     + len(figure_findings) + len(figdiff_findings)
                     + len(icon_findings) + len(align_findings)
                     + len(italic_findings)
                     + len(bold_findings)
-                    + len(pixel_findings)
                     + len(liststyle_findings) + len(tableshape_findings)
-                    + len(tablebreak_findings) + len(callgap_findings))
+                    + len(tablebreak_findings) + len(tablemargin_findings)
+                    + len(tablecont_findings) + len(tablemerge_findings)
+                    + len(callgap_findings)
+                    + len(imgmismatch_findings) + len(figalign_findings)
+                    + len(listindent_findings) + len(linkstyle_findings)
+                    + len(textalign_findings))
 
     if not total_issues:
         story.append(Paragraph("No issues found — STAGE matches PROD.",
@@ -4536,28 +7765,93 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
     else:
         # One row per issue, grouped by kind. The table keeps every issue on a
         # single line so the whole list can be scanned at a glance.
-        rows = [[Paragraph(f"<b>{h}</b>", hdr_s) for h in
-                 ["#", "Topic / Location", "Where", "Issue", "Detail",
-                  "What it means &amp; how to fix it"]]]
-        n = 0
+        def _pageno(v):
+            """A TOC page as an int; entries missing on a side carry "-"."""
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
 
+        _p_marks = sorted(((_pageno(r.get("prod_page")), r["title"])
+                           for r in toc_results
+                           if _pageno(r.get("prod_page")) and r.get("title")),
+                          key=lambda x: x[0])
+        _s_marks = sorted(((_pageno(r.get("stage_page")), r["title"])
+                           for r in toc_results
+                           if _pageno(r.get("stage_page")) and r.get("title")),
+                          key=lambda x: x[0])
+        _pair_page = {r["title"]: (r.get("prod_page"), r.get("stage_page"))
+                      for r in toc_results if r.get("title")}
+
+        def _topic_at(marks, page, path=None, defect_rects=None):
+            """The heading whose section contains this spot.
+
+            Several headings can start on one page, so the last one at or before
+            the page is not necessarily the one the defect sits under. When the
+            defect's position is known, the heading printed nearest above it on
+            that page wins — that is the section a reader would say it is in.
+            """
+            candidates = [t for start, t in marks if start <= page]
+            hit = candidates[-1] if candidates else None
+            if not (path and defect_rects and candidates):
+                return hit
+            top = min(fitz.Rect(r).y0 for r in defect_rects)
+            best_y, best = -1.0, None
+            below = set()
+            for title in candidates[-6:]:
+                pg, rects = _locate_tokens(path, title, page)
+                if pg != page or not rects:
+                    continue
+                y = min(fitz.Rect(r).y0 for r in rects)
+                if y <= top:
+                    if y > best_y:
+                        best_y, best = y, title
+                else:
+                    below.add(title)      # printed under the defect, so not its section
+            if best:
+                return best
+            # Nothing on this page sits above it, so the section began earlier.
+            # Headings printed lower down this page are not candidates at all —
+            # taking the last one regardless named a section the defect is not in.
+            earlier = [t for start, t in marks if start <= page and t not in below]
+            return earlier[-1] if earlier else hit
+
+
+        def _section_for(where, probe=None):
+            """The manual section an issue sits in, named for the report.
+
+            Read from the document the issue was found in: the page comes from
+            the issue's own location, and when the issue's text can be placed on
+            that page the heading printed nearest above it wins.
+            """
+            m = re.search(r"\b(PROD|STAGE)\s*p(\d+)", where or "")
+            if not m:
+                return "\u2014"
+            side, pg = m.group(1), int(m.group(2))
+            path = prod_path if side == "PROD" else stage_path
+            marks = _p_marks if side == "PROD" else _s_marks
+            rects = None
+            if probe:
+                p2, r2 = _locate_tokens(path, probe, pg)
+                if p2 == pg:
+                    rects = r2
+            title = _topic_at(marks, pg, path if rects else None, rects)
+            return title or "\u2014"
+
+        # Collected per category and rendered as one section each. Numbering runs
+        # within a section (E1, C1, I1 …) so an issue's id says what kind it is.
+        buckets = {key: [] for key, _t, _d in _CATEGORIES}
         _seen_rows = set()
 
-        def add(issue, where, topic, detail, style):
-            nonlocal n
+        def add(issue, where, topic, detail, style, probe=None):
+            if not _is_reported(issue):
+                return
             key = (issue, where, topic, detail)
             if key in _seen_rows:
                 return
             _seen_rows.add(key)
-            n += 1
-            means, fix = _fix_for(issue)
-            rows.append([Paragraph(str(n), cell_s),
-                         Paragraph(topic, topic_s),
-                         Paragraph(where, cell_s),
-                         Paragraph(issue, style),
-                         Paragraph(detail, cell_s),
-                         Paragraph(f"{_esc(means)}<br/><b>Fix:</b> {_esc(fix)}",
-                                   fix_s)])
+            buckets[_category_for(issue)].append(
+                (issue, where, topic, detail, style, probe))
 
         for g in glitches:
             if g["kind"].startswith("Text layer"):
@@ -4572,16 +7866,24 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 f"{g['doc']} page {g['page']}", detail, fail_s)
 
         for f in icon_findings:
-            add(f["kind"], f"{f['doc']} p{f['page']}",
+            add("Broken image", f"{f['doc']} p{f['page']}",
                 f"Image on {f['doc']} page {f['page']}",
-                f"<font color='#b71c1c'>{_esc(_trunc(f['text'], 260))}</font>", fail_s)
+                f"<b>{_esc(f['kind'])}</b> — "
+                f"<font color='#b71c1c'>{_esc(_trunc(f['text'], 240))}</font>",
+                fail_s)
 
         for f in label_findings:
+            n = f.get("_count", 1)
+            times = (f" This label is missing from <b>{n} separate figures</b> "
+                     f"on this page, not just one." if n > 1 else "")
             add("Image label missing", f"PROD p{f['page']}",
                 f"Figure on PROD page {f['page']}",
-                f"The figure on PROD page {f['page']} is labelled "
-                f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 200))}</b></font> "
-                f"— that label text is not present in STAGE.", fail_s)
+                f"<b>Look at PROD page {f['page']}</b>. A figure there carries "
+                f"the label <font color='#b71c1c'><b>"
+                f"“{_esc(_trunc(f['text'], 200))}”</b></font>.<br/>"
+                f"<b>That wording appears nowhere in STAGE</b> — not beside the "
+                f"figure, not drawn inside the artwork, and not in the body "
+                f"text.{times}", fail_s, probe=f["text"])
 
         for f in figure_findings:
             add("Image missing", f"PROD p{f['page']} / STAGE p{f['stage_page']}",
@@ -4590,12 +7892,52 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 f"for the same topic have none.", fail_s)
 
         for f in figdiff_findings:
-            add("Image difference",
+            add("Image not correctly updated",
                 f"PROD p{f['page']} / STAGE p{f['stage_page']}",
-                f"Figure captioned \u201c{_esc(_trunc(f['anchor'], 46))}\u201d",
-                f"This section's image is different. Structural similarity "
-                f"<b>{f['similarity']:.2f}</b> (identical artwork scores near "
-                f"1.00). Both figures are shown below.", fail_s)
+                f"Section \u201c{_esc(_trunc(f['anchor'], 46))}\u201d",
+                f"<font color='#b71c1c'><b>The image in this section is "
+                f"different between PROD and STAGE.</b></font> Both figures "
+                f"carry the same caption, but the picture is not the same — a "
+                f"changed screenshot, diagram or photo. Compare the two crops "
+                f"below and put the correct image in STAGE.", fail_s)
+
+        for f in imgmismatch_findings:
+            # Spelled out in the order a reader needs it: which picture, on
+            # which page, and what is wrong with it.
+            named = (f"the figure captioned “{_esc(_trunc(f['caption'], 70))}”"
+                     if f.get("caption") else "an illustration")
+            detail = (
+                f"<b>Look at PROD page {f['prod_page']}</b> — "
+                f"{_esc(f.get('prod_where') or 'a figure on that page')}. "
+                f"PROD prints {named} there.<br/>"
+                f"<font color='#b71c1c'><b>STAGE has no matching picture "
+                f"anywhere in this section.</b></font>")
+            add("Image mismatch", f"PROD p{f['prod_page']}",
+                f"Section “{_esc(_trunc(f['section'], 46))}”",
+                detail, fail_s, probe=f.get("caption") or None)
+
+        for f in figalign_findings:
+            add("Image alignment changed",
+                f"PROD p{f['prod_page'] if 'prod_page' in f else f['page']} / "
+                f"STAGE p{f['stage_page']}",
+                f"Section “{_esc(_trunc(f['anchor'], 46))}”",
+                f"The same picture appears on both sides, but it is placed "
+                f"differently.<br/>"
+                f"<b>PROD page {f['prod_page']}</b> — the figure is "
+                f"<b>{f['prod_align']}</b>.<br/>"
+                f"<b>STAGE page {f['stage_page']}</b> — the same figure is "
+                f"<font color='#b71c1c'><b>{f['stage_align']}</b></font>.",
+                fail_s, probe=f["anchor"])
+
+        for f in colour_findings:
+            add("Image highlight box missing",
+                f"PROD p{f['page']} / STAGE p{f['stage_page']}",
+                f"Section “{_esc(_trunc(f['anchor'], 46))}”",
+                f"<b>{f['has']}</b> draws a <b>{f['colour']}</b> box / highlight "
+                f"on this figure (about <b>{f['pct']}%</b> of the picture) — "
+                f"<font color='#b71c1c'><b>{f['missing']} has no {f['colour']} "
+                f"mark on the same figure.</b></font> Look at the two crops "
+                f"below.", fail_s, probe=f["anchor"])
 
         for f in pixel_findings:
             add("Images pixelated", f"STAGE ({len(f['pages'])} pages)",
@@ -4611,6 +7953,29 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 + (f" \u2026 and {len(f['topics']) - 15} more topics"
                    if len(f['topics']) > 15 else ""), fail_s)
 
+        for f in linkloss_findings:
+            src = f.get("doc", "PROD")
+            other = "STAGE" if src == "PROD" else "PROD"
+            label = "Hyperlink lost" if src == "PROD" else "Hyperlink added in STAGE"
+            add(label, f"{src} p{f['page']}",
+                f"Cross-reference on {src} page {f['page']}",
+                f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 160))}</b></font> "
+                f"is a link to <b>{_esc(f['target'])}</b> in {src}. {other} prints "
+                f"the same wording as plain text, with no link on it.",
+                fail_s, probe=f["text"])
+
+        for f in linkstyle_findings:
+            add("Hyperlink not highlighted in STAGE",
+                f"PROD p{f['prod_page']} / STAGE p{f['page']}",
+                f"Link on STAGE page {f['page']}",
+                f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 160))}</b></font> "
+                f"{_esc(f['why'])}"
+                + (f" (PROD {f['prod_colour']}, STAGE {f['stage_colour']})")
+                + (f", target <b>{_esc(_trunc(f['target'], 80))}</b>"
+                   if f.get("target") else "")
+                + ". A reader cannot tell it is a link.",
+                fail_s, probe=f["text"])
+
         for f in link_findings:
             add(f["kind"],
                 f"{f['doc']}" + (f" p{f['page']}" if f["page"] else ""),
@@ -4618,15 +7983,42 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 f"<font color='#b71c1c'>{_esc(_trunc(f['text'], 260))}</font>", fail_s)
 
         for f in callgap_findings:
-            add("Image label missing",
-                f"{f['doc']} p{f['page']}",
-                f"Diagram on {f['doc']} page {f['page']}",
-                f"The diagram is numbered <b>"
-                f"{', '.join(str(n) for n in f['present'])}</b> — the label(s) "
+            stage_where = (f"STAGE p{f['stage_first']}"
+                          if f['stage_first'] == f['stage_last']
+                          else f"STAGE p{f['stage_first']}-{f['stage_last']}")
+            add("Diagram callout number missing",
+                f"PROD p{f['prod_page']} / {stage_where}",
+                f"Diagram on PROD page {f['prod_page']}",
+                f"PROD numbers this diagram <b>"
+                f"{', '.join(str(n) for n in f['present'])}</b> — "
                 f"<font color='#b71c1c'><b>"
-                f"{', '.join(str(n) for n in f['missing'])}</b></font> are not "
-                f"there. The leader lines are drawn but their numbers are "
-                f"missing.", fail_s)
+                f"{', '.join(str(n) for n in f['missing'])}</b></font> "
+                f"{'is' if len(f['missing']) == 1 else 'are'} not there on "
+                f"STAGE's diagram ({stage_where}).", fail_s)
+
+        for f in labelmerge_findings:
+            add("Paragraph merged with heading",
+                f"PROD p{f['prod_page']} / STAGE p{f['stage_page']}",
+                f"“{_esc(f['label'])}” on STAGE page {f['stage_page']}",
+                f"PROD starts the description for <b>{_esc(f['label'])}</b> "
+                f"on its own line, underneath the label. "
+                f"<font color='#b71c1c'>STAGE runs the description on from "
+                f"the label on the same line</font> instead — the paragraph "
+                f"reads as part of its own heading.", fail_s, probe=f["label"])
+
+        for f in tablemargin_findings:
+            side = []
+            if f["left"]:
+                side.append(f"<b>{f['left']}pt</b> past the left margin")
+            if f["right"]:
+                side.append(f"<b>{f['right']}pt</b> past the right margin")
+            add("Table breaking the margins", f"STAGE p{f['page']}",
+                f"Table \u201c{_esc(_trunc(f['header'], 44))}\u201d",
+                f"The table runs outside the text column: it spans "
+                f"x={f['x0']}\u2013{f['x1']}pt where the body text sits between "
+                f"{f['col_left']} and {f['col_right']}pt \u2014 "
+                f"{' and '.join(side)}. PROD keeps this table inside its column.",
+                fail_s, probe=f.get("header"))
 
         for f in tablebreak_findings:
             add("Table layout broken",
@@ -4635,39 +8027,121 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 f"The table is split by a page break in STAGE: it runs over "
                 f"<b>{f['stage_pages']} pages</b> (p{f['stage_from']}\u2013"
                 f"{f['stage_to']}) where PROD keeps it on <b>{f['prod_pages']}</b>. "
-                f"Rows are separated from their header.", fail_s)
+                f"Rows are separated from their header.", fail_s,
+                probe=f.get("header"))
+
+        for f in tablemerge_findings:
+            ra = f.get("rows_affected") or []
+            lead = f["what"].split(". Rows affected:")[0]
+            body = (f"The reader-visible columns match PROD, but the cells "
+                    f"inside the table are merged/split differently — "
+                    f"<font color='#b71c1c'>{_esc(lead)}</font>.")
+            if ra:
+                body += "<br/><b>Where:</b><br/>" + "<br/>".join(
+                    f"&nbsp;&nbsp;• {_esc(_trunc(x, 200))}" for x in ra)
+            add("Table cell layout differs",
+                f"PROD p{f['prod_page']} / STAGE p{f['page']}",
+                f"Table “{_esc(_trunc(f['header'], 44))}”", body, fail_s,
+                probe=f.get("header"))
+
+        for f in tablecont_findings:
+            _sect = _section_for(f"{f['doc']} p{f['page']}", f.get("header"))
+            add("Table continuation missing its header",
+                f"{f['doc']} p{f['page']}",
+                f"Table “{_esc(_trunc(f['header'], 40))}” under "
+                f"“{_esc(_sect)}”, continued on {f['doc']} page {f['page']}",
+                f"The table from page {f['prev_page']} continues onto page "
+                f"{f['page']} without repeating its header row "
+                f"(<font color='#b71c1c'><b>{_esc(_trunc(f['header'], 90))}</b>"
+                f"</font>), so the columns on this page are unlabelled.", fail_s,
+                probe=f.get("header"))
 
         for f in tableshape_findings:
-            add("Table columns differ",
+            def _cols(names, bad):
+                return ", ".join(
+                    (f"<font color='#b71c1c'><b>{_esc(n)}</b></font>"
+                     if n in bad else _esc(n)) for n in names)
+            if f["reordered"]:
+                what = ("The same columns are present but in a different order.")
+            else:
+                bits = []
+                if f["gone"]:
+                    bits.append("PROD column(s) <font color='#b71c1c'><b>"
+                                + _esc(", ".join(f["gone"]))
+                                + "</b></font> are not in STAGE")
+                if f["extra"]:
+                    bits.append("STAGE adds <font color='#b71c1c'><b>"
+                                + _esc(", ".join(f["extra"])) + "</b></font>")
+                what = "; ".join(bits) + "."
+            add("Table column layout differs",
                 f"PROD p{f['prod_page']} / STAGE p{f['page']}",
                 f"Table \u201c{_esc(_trunc(f['header'], 44))}\u201d",
-                f"PROD lays this table out in <b>{f['prod_cols']} columns</b>; "
-                f"STAGE renders it in <b>{f['stage_cols']}</b>.", fail_s)
+                f"{what}<br/><b>PROD ({f['prod_cols']}):</b> "
+                f"{_cols(f['prod_head'], f['gone'])}"
+                f"<br/><b>STAGE ({f['stage_cols']}):</b> "
+                f"{_cols(f['stage_head'], f['extra'])}", fail_s,
+                probe=f.get("header"))
 
         for f in heading_findings:
+            _sect = _section_for(f"PROD p{f['page']}", f.get("row"))
             add("Table heading missing", f"PROD p{f['page']}",
-                f"Table on PROD page {f['page']}",
+                f"Table under “{_esc(_sect)}”, PROD page {f['page']}",
                 f"Column heading(s) <font color='#b71c1c'><b>"
                 f"{_esc(_trunc(f['text'], 140))}</b></font> dropped. PROD header: "
-                f"<i>{_esc(_trunc(f.get('row',''), 170))}</i>", fail_s)
+                f"<i>{_esc(_trunc(f.get('row',''), 170))}</i>", fail_s,
+                probe=f.get("row") or f["text"])
+
+        for f in tablerow_findings:
+            _sect = _section_for(f"PROD p{f['page']}", f["label"])
+            add("Table row missing", f"PROD p{f['page']}",
+                f"Table under “{_esc(_sect)}”, PROD page {f['page']}",
+                f"<b>PROD page {f['page']}</b> has a table row<br/>"
+                f"<font color='#b71c1c'><b>{_esc(_trunc(f['label'], 80))}</b>"
+                f"{(' : ' + _esc(_trunc(f['value'], 150))) if f.get('value') else ''}"
+                f"</font><br/>"
+                f"<b>This whole row is absent from STAGE</b> — not as a table "
+                f"row and not as text anywhere else in the document.",
+                fail_s, probe=f["label"])
 
         for f in table_findings:
+            hdr = f.get("header") or ""
+            rlab = f.get("row_label") or ""
+            where_tbl = (f"the table with columns [{_esc(_trunc(hdr, 90))}]"
+                         if hdr else f"a table on PROD page {f['page']}")
+            row_bit = (f" the row for <b>{_esc(_trunc(rlab, 70))}</b>"
+                       if rlab else " one row")
+            if f.get("whole_cell", True):
+                detail = (f"<b>PROD page {f['page']}</b> — in {where_tbl},"
+                          f"{row_bit} contains<br/>"
+                          f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 240))}"
+                          f"</b></font><br/>"
+                          f"<b>STAGE's copy of that row does not carry this "
+                          f"text anywhere.</b>")
+            else:
+                detail = (f"<b>PROD page {f['page']}</b> — in {where_tbl},"
+                          f"{row_bit} lists the value<br/>"
+                          f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 200))}"
+                          f"</b></font><br/>"
+                          f"<b>That value is missing from STAGE</b> — the rest "
+                          f"of the row's values are present.")
+            _sect = _section_for(f"PROD p{f['page']}", f["text"])
             add("Table cell missing", f"PROD p{f['page']}",
-                f"Table on PROD page {f['page']}",
-                f"Row {f['row']}, column {f['col']} — "
-                f"<font color='#b71c1c'>{_esc(_trunc(f['text'], 240))}</font>", fail_s)
+                f"Table under “{_esc(_sect)}”, PROD page {f['page']}", detail,
+                fail_s,
+                probe=f["text"])
 
         for f in bold_findings:
             add("Bold lost", f"PROD p{f['page']} / STAGE p{f['stage_page']}",
                 f"Text on PROD page {f['page']}",
                 f"<b>{_esc(_trunc(f['text'], 220))}</b> is set bold in PROD; "
-                f"STAGE draws it in the ordinary body face.", fail_s)
+                f"STAGE draws it in the ordinary body face.", fail_s,
+                probe=f["text"])
 
         for f in italic_findings:
             add("Italic lost", f"PROD p{f['page']}",
                 f"Text on PROD page {f['page']}",
                 f"<i>{_esc(_trunc(f['text'], 220))}</i> is italic in PROD but is "
-                f"rendered upright in STAGE.", fail_s)
+                f"rendered upright in STAGE.", fail_s, probe=f["text"])
 
         for f in align_findings:
             add("List alignment broken", f"{f['doc']} p{f['page']}",
@@ -4676,7 +8150,53 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 f"sits on its own line; its text "
                 f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 160))}</b></font> "
                 f"wraps to the line below \u2014 the number and its text are not "
-                f"aligned. {_esc(f.get('why', ''))}.", fail_s)
+                f"aligned. {_esc(f.get('why', ''))}.", fail_s, probe=f["text"])
+
+        for f in listindent_findings:
+            add("List indent changed",
+                f"PROD p{f['prod_page']} / STAGE p{f['page']}",
+                f"List item on STAGE page {f['page']}",
+                f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 160))}</b></font> "
+                f"is indented <b>{f['prod_indent']:.0f} pt</b> from the text "
+                f"column in PROD and <b>{f['stage_indent']:.0f} pt</b> in STAGE "
+                f"— <b>{f['direction']}</b> by "
+                f"{abs(f['delta']):.0f} pt relative to the rest of its list. "
+                f"A sub-item set flush with its parent has lost its nesting.",
+                fail_s, probe=f["text"])
+
+        _STYLE_WORD = {"number": "numbered 1. 2. 3.", "letter": "lettered a. b. c.",
+                       "bullet": "bulleted"}
+        for f in liststyle_findings:
+            add("List marker changed",
+                f"PROD p{f['prod_page']} / STAGE p{f['page']}",
+                f"List item on STAGE page {f['page']}",
+                f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 150))}</b></font>"
+                f"<br/>PROD marks this step as "
+                f"<b>{_STYLE_WORD.get(f['prod_style'], f['prod_style'])}</b>; "
+                f"STAGE marks it as <font color='#b71c1c'><b>"
+                f"{_STYLE_WORD.get(f['stage_style'], f['stage_style'])}</b></font>. "
+                f"The wording is the same but the list has changed meaning for "
+                f"the reader.", fail_s, probe=f["text"])
+
+        for f in textalign_findings:
+            if f["reflowed"]:
+                why = (f"PROD sets it <b>{_esc(f['prod_align'])}</b> in the text "
+                       f"column; STAGE sets it "
+                       f"<font color='#b71c1c'><b>{_esc(f['stage_align'])}</b>"
+                       f"</font>.")
+            else:
+                why = (f"It sits <b>{f['prod_indent']:.0f} pt</b> from the text "
+                       f"column in PROD and <b>{f['stage_indent']:.0f} pt</b> in "
+                       f"STAGE — <font color='#b71c1c'><b>"
+                       f"{abs(f['delta']):.0f} pt "
+                       f"{'right' if f['delta'] > 0 else 'left'}</b></font> of "
+                       f"where PROD puts it, after allowing for the margin "
+                       f"difference between the two documents.")
+            add("Text alignment changed",
+                f"PROD p{f['prod_page']} / STAGE p{f['page']}",
+                f"{f['kind_label']} on STAGE page {f['page']}",
+                f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 150))}</b>"
+                f"</font> — {why}", fail_s, probe=f["text"])
 
         for f in pageno_findings:
             add(f["kind"], f"{f['doc']} p{f['page']}",
@@ -4687,177 +8207,88 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             for m in r.get("missing", []):
                 add("Content missing", where, _esc(r["title"]),
                     f"In PROD, absent from STAGE: <font color='#b71c1c'>"
-                    f"{_highlight_notice_labels(_trunc(m, 300))}</font>", fail_s)
+                    f"{_highlight_notice_labels(_trunc(m, 300))}</font>", fail_s,
+                    probe=m)
 
 
-        it = Table(rows, colWidths=[26, 114, 70, 90, 246, 188], repeatRows=1)
-        it.setStyle(TableStyle([
-            ("BACKGROUND",   (0,0), (-1,0), colors.HexColor("#37474f")),
-            ("GRID",         (0,0), (-1,-1), 0.5, colors.grey),
-            ("VALIGN",       (0,0), (-1,-1), "TOP"),
-            ("TOPPADDING",   (0,0), (-1,-1), 4),
-            ("BOTTOMPADDING",(0,0), (-1,-1), 4),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, colors.HexColor("#f7f7f7")]),
-        ]))
-        story.append(it)
-
-        # ── Evidence: one pane per issue, on the page proven to carry it ──
-        # Single-sided by design. Showing "the same place in the other document"
-        # needed an anchor to line two pages up, and that repeatedly framed
-        # unrelated regions. A shot of the page that actually contains the text,
-        # with the exact words boxed, is verifiable: the locator matches the same
-        # canonical tokens the finding was made from, and when it cannot find
-        # them no picture is produced rather than a wrong one.
-        ev = []
-
-        _seen_shots = set()
-
-        def _shot(doc_path, needle, hint, caption, doc_label):
-            pg, rects = _locate_tokens(doc_path, needle, hint)
-            if not pg or not rects:
-                return []
-            key = (doc_path, pg, caption,
-                   tuple(round(c, 1) for r in rects for c in tuple(r)))
-            if key in _seen_shots:
-                return []
-            _seen_shots.add(key)
-            png = _page_shot(doc_path, pg, [(rects, _DEFECT_COLOR)])
-            img = _shot_flowable(png, max_w=690.0, max_h=180.0)
-            if img is None:
-                return []
-            return [Paragraph(caption, ParagraphStyle(
-                        "EvCap2", parent=styles["Normal"], fontSize=8.5,
-                        leading=11.5, spaceAfter=2)),
-                    Paragraph(f"<b>{doc_label}</b> page {pg} — boxed in red",
-                              ParagraphStyle("EvLab2", parent=styles["Normal"],
-                                             fontSize=7.5,
-                                             textColor=colors.HexColor("#37474f"))),
-                    img, Spacer(1, 6),
-                    HRFlowable(width="100%", thickness=0.6,
-                               color=colors.HexColor("#cfd8dc"),
-                               spaceBefore=2, spaceAfter=10)]
-
-        def _num(v, d=0):
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return d
-
-        for g in glitches:
-            ev += _shot(stage_path, g.get("probe") or g["text"], g["page"],
-                        f"<b>{g['kind']}</b> — "
-                        f"<font color='#b71c1c'>{_esc(g['text'])}</font>", "STAGE")
-        for f in figdiff_findings:
-            try:
-                dp = fitz.open(prod_path)
-                pp = dp[f["page"] - 1].get_pixmap(
-                    clip=fitz.Rect(*f["prod_rect"]), matrix=fitz.Matrix(2.4, 2.4)
-                ).tobytes("png")
-                dp.close()
-                ds = fitz.open(stage_path)
-                sp = ds[f["stage_page"] - 1].get_pixmap(
-                    clip=fitz.Rect(*f["stage_rect"]), matrix=fitz.Matrix(2.4, 2.4)
-                ).tobytes("png")
-                ds.close()
-            except Exception:
-                continue
-            pi, si = _shot_flowable(pp, 330, 250), _shot_flowable(sp, 330, 250)
-            if not pi or not si:
-                continue
-            lab = ParagraphStyle("FigLab", parent=styles["Normal"], fontSize=7.5,
-                                 textColor=colors.HexColor("#37474f"))
-            tbl = Table([[Paragraph(f"<b>PROD</b> page {f['page']}", lab),
-                          Paragraph(f"<b>STAGE</b> page {f['stage_page']}", lab)],
-                         [pi, si]], colWidths=[345, 345])
-            tbl.setStyle(TableStyle([
-                ("GRID",       (0,0), (-1,-1), 0.5, colors.HexColor("#b0bec5")),
-                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#eceff1")),
-                ("VALIGN",     (0,0), (-1,-1), "TOP"),
-                ("TOPPADDING", (0,0), (-1,-1), 4),
-                ("BOTTOMPADDING",(0,0),(-1,-1), 4),
-            ]))
-            ev += [Paragraph(f"<b>Image difference</b> — this section's image is "
-                             f"different (captioned \u201c"
-                             f"{_esc(_trunc(f['anchor'], 60))}\u201d)",
-                             ParagraphStyle("FigCap", parent=styles["Normal"],
-                                            fontSize=8.5, leading=11.5,
-                                            spaceAfter=2)),
-                   tbl, Spacer(1, 6),
-                   HRFlowable(width="100%", thickness=0.6,
-                              color=colors.HexColor("#cfd8dc"),
-                              spaceBefore=2, spaceAfter=10)]
-
-        for f in callgap_findings:
-            ev += _shot(stage_path, str(f["present"][0]), f["page"],
-                        f"<b>Image label missing</b> — diagram numbered "
-                        f"{', '.join(str(n) for n in f['present'])}; "
-                        f"<font color='#b71c1c'>"
-                        f"{', '.join(str(n) for n in f['missing'])}</font> absent",
-                        f["doc"])
-
-        for f in icon_findings:
-            ev += _shot(stage_path, "", f["page"],
-                        f"<b>{f['kind']}</b> — {_esc(_trunc(f['text'],120))}",
-                        "STAGE")
-        for f in label_findings:
-            ev += _shot(prod_path, f["text"], f["page"],
-                        f"<b>Image label missing</b> — the figure on PROD page "
-                        f"{f['page']} is labelled "
-                        f"<font color='#b71c1c'>{_esc(_trunc(f['text'],110))}</font>"
-                        f", which STAGE does not have", "PROD")
-        for f in heading_findings:
-            ev += _shot(prod_path, f.get("row", f["text"]), f["page"],
-                        f"<b>Table heading missing</b> — column(s) "
-                        f"<font color='#b71c1c'>{_esc(_trunc(f['text'],110))}</font>"
-                        f" are not in any STAGE table header", "PROD")
-        for f in table_findings:
-            ev += _shot(prod_path, f["text"], f["page"],
-                        f"<b>Table cell missing</b> — "
-                        f"<font color='#b71c1c'>{_esc(_trunc(f['text'],110))}</font>",
-                        "PROD")
-        for f in tableshape_findings:
-            ev += _shot(prod_path, f["header"], f["prod_page"],
-                        f"<b>Table columns differ</b> — {f['prod_cols']} columns "
-                        f"in PROD, {f['stage_cols']} in STAGE", "PROD")
-        for f in bold_findings:
-            ev += _shot(prod_path, f["text"], f["page"],
-                        f"<b>Bold lost</b> — "
-                        f"<b>{_esc(_trunc(f['text'], 110))}</b> is bold in PROD, "
-                        f"plain in STAGE", "PROD")
-        for f in italic_findings:
-            ev += _shot(prod_path, f["text"], f["page"],
-                        f"<b>Italic lost</b> — "
-                        f"<i>{_esc(_trunc(f['text'],110))}</i>", "PROD")
-        for f in liststyle_findings:
-            ev += _shot(stage_path, f["text"], f["page"],
-                        f"<b>List marker changed</b> — {f['prod_style']} in PROD, "
-                        f"{f['stage_style']} in STAGE", "STAGE")
-        for f in align_findings:
-            ev += _shot(prod_path if f["doc"] == "PROD" else stage_path,
-                        f["text"], f["page"],
-                        f"<b>List alignment broken</b> — marker "
-                        f"<b>{_esc(f['marker'])}</b> separated from "
-                        f"<font color='#b71c1c'>{_esc(_trunc(f['text'],90))}</font>",
-                        f["doc"])
-        for r in diff_rows:
-            for m in r.get("missing", []):
-                ev += _shot(prod_path, m, _num(r.get("prod_page")),
-                            f"<b>Content missing</b> — {_esc(r['title'])}: "
-                            f"<font color='#b71c1c'>{_esc(_trunc(m,110))}</font>"
-                            f" is in PROD, absent from STAGE", "PROD")
-
-
-        if ev:
-            story.append(PageBreak())
-            story.append(Paragraph("Evidence", head_s))
+        # ── Summary: how many of each kind ──
+        story.append(Paragraph(
+            f"Metrics &nbsp;—&nbsp; "
+            f"<font color='{'#b71c1c' if diff_rows else '#2e7d32'}'>"
+            f"<b>{len(diff_rows)}</b> section(s) with content issues</font> &middot; "
+            f"<font color='#e65100'><b>{_n_toc_miss}</b> section(s) missing in "
+            f"STAGE</font> &middot; <b>{n_cmiss}</b> content fragment(s) dropped "
+            f"&middot; <b>{total_issues}</b> issue(s) total",
+            ParagraphStyle("MetricsLine", parent=styles["Normal"], fontSize=9,
+                           leading=12, spaceAfter=6)))
+        present = [(k, title, blurb) for k, title, blurb in _CATEGORIES
+                   if buckets[k]]
+        if not present:
+            # Everything detected fell outside the reported scope. Say so rather
+            # than rendering an empty summary.
             story.append(Paragraph(
-                "Each shot is a page that was verified to contain the text, with "
-                "the exact words boxed in red. Where the text exists in only one "
-                "document, only that side is shown — a page is never displayed as "
-                "evidence unless it actually carries the text.",
-                ParagraphStyle("EvIntro", parent=styles["Normal"], fontSize=8,
-                               textColor=colors.grey, spaceAfter=8)))
-            story.extend(ev)
+                "No issues found in the reported categories — STAGE matches PROD "
+                "for missing content, alignment, table layout and hyperlinks.",
+                ParagraphStyle("AllOk2", parent=styles["Normal"], fontSize=10,
+                               textColor=colors.HexColor("#2e7d32"))))
+            present = []
+        srow_h = [Paragraph(f"<b>{t}</b>", hdr_s) for _k, t, _b in present]
+        if not present:
+            srow_h = []
+        srow_v = [Paragraph(f"<font color='{'#b71c1c' if buckets[k] else '#2e7d32'}'"
+                            f" size='15'><b>{len(buckets[k])}</b></font>", cell_s)
+                  for k, _t, _b in present]
+        sm = (Table([srow_h, srow_v],
+                    colWidths=[734.0 / len(present)] * len(present))
+              if present else None)
+        if sm is not None:
+            sm.setStyle(TableStyle([
+                ("BACKGROUND",   (0,0), (-1,0), colors.HexColor("#37474f")),
+                ("BACKGROUND",   (0,1), (-1,1), colors.HexColor("#f5f7f8")),
+                ("GRID",         (0,0), (-1,-1), 0.5, colors.grey),
+                ("ALIGN",        (0,0), (-1,-1), "CENTER"),
+                ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+                ("TOPPADDING",   (0,0), (-1,-1), 6),
+                ("BOTTOMPADDING",(0,0), (-1,-1), 6),
+            ]))
+            story += [sm, Spacer(1, 4)]
+
+        # ── One section per category ──
+        for key, title, blurb in present:
+            story.append(Paragraph(title, head_s))
+            story.append(Paragraph(blurb, ParagraphStyle(
+                "CatBlurb", parent=styles["Normal"], fontSize=8,
+                textColor=colors.grey, spaceAfter=6)))
+            rows = [[Paragraph(f"<b>{h}</b>", hdr_s) for h in
+                     ["#", "Section", "Where", "Issue", "Detail",
+                      "What it means &amp; how to fix it"]]]
+            tag = key[0].upper()
+            for idx, (issue, where, topic, detail, style, probe) in enumerate(
+                    buckets[key], 1):
+                means, fix = _fix_for(issue)
+                sect = _section_for(where, probe)
+                rows.append([Paragraph(f"{tag}{idx}", cell_s),
+                             Paragraph(f"{_esc(sect)}<br/>"
+                                       f"<font size='6.5' color='#6b7280'>"
+                                       f"{topic}</font>", topic_s),
+                             Paragraph(where, cell_s),
+                             Paragraph(issue, style),
+                             Paragraph(detail, cell_s),
+                             Paragraph(f"{_esc(means)}<br/><b>Fix:</b> {_esc(fix)}",
+                                       fix_s)])
+            # Detail carries the "which picture, which page, what is wrong"
+            # narrative now, so it gets the room; the fix column repeats the
+            # same advice for every row of a kind and needs less.
+            it = Table(rows, colWidths=[24, 116, 62, 84, 288, 160], repeatRows=1)
+            it.setStyle(TableStyle([
+                ("BACKGROUND",   (0,0), (-1,0), colors.HexColor("#37474f")),
+                ("GRID",         (0,0), (-1,-1), 0.5, colors.grey),
+                ("VALIGN",       (0,0), (-1,-1), "TOP"),
+                ("TOPPADDING",   (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING",(0,0), (-1,-1), 4),
+                ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, colors.HexColor("#f7f7f7")]),
+            ]))
+            story += [it, Spacer(1, 10)]
 
     # Structure note — NOT counted as content issues (not like-for-like)
     if n_only_prod or n_only_stage:
@@ -4954,17 +8385,30 @@ def validate(prod_path, stage_path, report_path):
             continue
         k = _norm_key(title)
         if k in stage_keys:
+            stage_lvl = stage_keys[k][1]
+            # A heading can survive the move and still be re-nested — promoted to
+            # a top-level topic, or demoted under a sibling. The text matches, so
+            # every other check passes; only the outline depth gives it away.
+            level_changed = (isinstance(stage_lvl, int) and stage_lvl != lvl)
             toc_results.append({
                 "title": title, "level": lvl,
+                "prod_level": lvl, "stage_level": stage_lvl,
+                "level_status": "Changed" if level_changed else "Match",
                 "prod_page": pg, "stage_page": stage_keys[k][2],
                 "toc_status": "Match",
-                "note": ""
+                "note": (f"TOC level L{lvl} in PROD, L{stage_lvl} in STAGE"
+                         if level_changed else "")
             })
         else:
             pno = _find_heading_in_texts(title, stage_page_texts)
             if pno is not None:
+                # Found in the page text but not in STAGE's outline, so STAGE has
+                # no bookmark level to compare against — the depth is unknown,
+                # not unchanged.
                 toc_results.append({
                     "title": title, "level": lvl,
+                    "prod_level": lvl, "stage_level": None,
+                    "level_status": "No STAGE bookmark",
                     "prod_page": pg, "stage_page": pno,
                     "toc_status": "Match",
                     "note": f"Heading found inside page: {pno}"
@@ -4972,6 +8416,8 @@ def validate(prod_path, stage_path, report_path):
             else:
                 toc_results.append({
                     "title": title, "level": lvl,
+                    "prod_level": lvl, "stage_level": None,
+                    "level_status": "",
                     "prod_page": pg, "stage_page": "-",
                     "toc_status": "Missing in Stage",
                     "note": ""
@@ -4988,6 +8434,8 @@ def validate(prod_path, stage_path, report_path):
                 continue
             toc_results.append({
                 "title": title, "level": lvl,
+                "prod_level": None, "stage_level": lvl,
+                "level_status": "",
                 "prod_page": "-", "stage_page": pg,
                 "toc_status": "Extra in Stage",
                 "note": ""
@@ -5000,7 +8448,20 @@ def validate(prod_path, stage_path, report_path):
     n_m = sum(1 for r in toc_results if r["toc_status"] == "Match")
     n_mi = sum(1 for r in toc_results if r["toc_status"] == "Missing in Stage")
     n_e  = sum(1 for r in toc_results if r["toc_status"] == "Extra in Stage")
-    print(f"  TOC: Match={n_m} | Missing in Stage={n_mi} | Extra in Stage={n_e}")
+    n_lv = sum(1 for r in toc_results if r.get("level_status") == "Changed")
+    print(f"  TOC: Match={n_m} | Missing in Stage={n_mi} | Extra in Stage={n_e}"
+          f" | Level changed={n_lv}")
+    # Every outline depth present on either side, so a report reader can see the
+    # nesting the two documents actually use rather than only the leaf titles.
+    _depths = sorted({d for r in toc_results
+                      for d in (r.get("prod_level"), r.get("stage_level"))
+                      if isinstance(d, int)})
+    if _depths:
+        _per = ", ".join(
+            f"L{d}: {sum(1 for r in toc_results if r.get('prod_level') == d)} PROD /"
+            f" {sum(1 for r in toc_results if r.get('stage_level') == d)} STAGE"
+            for d in _depths)
+        print(f"  TOC levels — {_per}")
 
     # ── Content extraction ──
     _emit(0.10, "extracting section text")
@@ -5088,6 +8549,9 @@ def validate(prod_path, stage_path, report_path):
             coverage, missing = _section_missing(
                 prod_words, stage_ns, stage_cset, stage_full_lower,
                 stage_section_lower="", source_idx=prod_seq_idx)
+            _stage_hint = r["stage_page"] if isinstance(r.get("stage_page"), int) else 0
+            missing = [m for m in missing
+                      if not _text_in_artwork(stage_path, m, _stage_hint, stage_nav)]
             status = "Pass" if not missing else "Fail"
             content_results.append({
                 "title":      title,
@@ -5137,6 +8601,14 @@ def validate(prod_path, stage_path, report_path):
         # Drop labels that live inside artwork — see _figure_text_keys.
         missing = [m for m in missing if not _is_artwork_text(m, prod_fig_tokens)]
         extra   = [x for x in extra   if not _is_artwork_text(x, stage_fig_tokens)]
+        # A "missing" fragment can genuinely be there, just baked into a STAGE
+        # picture instead of laid out as text (PROD prints a lettered option
+        # list as body text; STAGE's equivalent diagram carries the same
+        # labels as pixels). The table-cell and image-label checks already OCR
+        # STAGE's artwork before believing a gap; the main content pass did not.
+        _stage_hint = r["stage_page"] if isinstance(r.get("stage_page"), int) else 0
+        missing = [m for m in missing
+                  if not _text_in_artwork(stage_path, m, _stage_hint, stage_nav)]
 
         status = "Pass" if not (missing or extra) else "Fail"
         content_results.append({
@@ -5149,6 +8621,29 @@ def validate(prod_path, stage_path, report_path):
             "coverage":   round(coverage, 1),
             "missing":    missing,
         })
+
+    # ── Optional LLM second opinion: prune extraction-artifact fragments ──
+    _emit(0.50, "LLM verifying content fragments")
+    try:
+        _sd = fitz.open(stage_path)
+        _stage_raw = " ".join(
+            _normalize(_strip_formatting(_sd[i].get_text()))
+            for i in range(_sd.page_count) if (i + 1) not in stage_nav)
+        _sd.close()
+        _llm_verify_missing(content_results, _prod_raw, _stage_raw)
+    except Exception as _e:
+        print(f"  LLM verify skipped: {_e}")
+
+    # ── Local-AI (Ollama) cross-check: add genuine differences the
+    #    section-by-section matcher missed (offline, no API key) ──
+    _emit(0.52, "AI cross-check (local)")
+    try:
+        _ai_cross_check(content_results, prod_path, stage_path,
+                        _prod_raw, _stage_raw, _prod_nav, stage_nav,
+                        prod_sections, stage_sections, stage_lookup)
+    except Exception as _e:
+        import traceback as _tb
+        print(f"  AI cross-check skipped: {_e}\n{_tb.format_exc()}")
 
     n_p = sum(1 for r in content_results if r["status"] == "Pass")
     n_f = sum(1 for r in content_results if r["status"] == "Fail")
@@ -5262,13 +8757,17 @@ def validate(prod_path, stage_path, report_path):
     try:
         table_summary, table_findings = _validate_tables(
             prod_path, stage_path, prod_nav, stage_nav, stage_full_lower)
+        tablerow_findings = _table_row_missing_issues(
+            prod_path, stage_path, prod_nav, stage_nav, stage_full_lower)
         print(f"  tables: PROD {table_summary['prod_tables']} "
               f"({table_summary['prod_cells']} cells) | "
               f"STAGE {table_summary['stage_tables']} "
               f"({table_summary['stage_cells']} cells) | "
-              f"cells missing in STAGE: {len(table_findings)}")
+              f"cells missing in STAGE: {len(table_findings)} | "
+              f"whole rows missing: {len(tablerow_findings)}")
     except Exception as exc:
         print(f"  table validation failed: {exc}")
+        tablerow_findings = []
         table_summary, table_findings = None, []
 
     _emit(0.93, "checking encoding, table headings, image labels")
@@ -5286,7 +8785,8 @@ def validate(prod_path, stage_path, report_path):
         th_findings = _table_heading_issues(prod_path, stage_path, prod_nav,
                                             stage_nav, stage_seq_idx, prod_seq_idx)
         il_findings = _image_label_issues(prod_path, stage_path, prod_nav,
-                                          stage_nav, stage_seq_idx, prod_seq_idx)
+                                          stage_nav, stage_seq_idx, prod_seq_idx,
+                                          to_stage_page=_page_mapper(toc_results))
         print(f"  table headings missing: {len(th_findings)} | "
               f"image labels missing: {len(il_findings)}")
     except Exception as exc:
@@ -5296,7 +8796,17 @@ def validate(prod_path, stage_path, report_path):
     _emit(0.94, "checking links, page numbers, emphasis, figures")
     try:
         link_findings = _hyperlink_issues(prod_path, stage_path)
-        pageno_findings = _page_number_issues(stage_path, "STAGE", stage_nav)
+        linkloss_findings = _link_loss_issues(
+            prod_path, stage_path, prod_nav, stage_nav, stage_seq_idx,
+            prod_idx=_stage_seq_index(prod_ref_full),
+            titles=([r["title"] for r in toc_results]
+                    + list(prod_sections.keys()) + list(stage_sections.keys())))
+        pageno_findings = _hyperlink_pageno_issues(stage_path, "STAGE", stage_nav)
+        try:
+            pageno_findings += _xref_section_issues(
+                stage_path, stage_nav, toc_results, prod_path)
+        except Exception as _xe:  # noqa: BLE001
+            print(f"  cross-reference check failed: {_xe}")
         # Emphasis: text PROD sets bold that STAGE draws plain. Judged on the
         # face the words are drawn in rather than a measured ink ratio, which is
         # what made the earlier version report list items whose marker had
@@ -5305,25 +8815,82 @@ def validate(prod_path, stage_path, report_path):
                                      stage_nav, stage_seq_idx)
         figure_findings = _missing_figure_issues(prod_path, stage_path, prod_nav,
                                                  stage_nav, content_results)
-        pixel_findings = _pixelation_issue(prod_path, stage_path, prod_nav,
-                                           stage_nav, toc_results)
+        # Pixelation is not reported (a resolution difference between two
+        # rendering pipelines is not a content defect), so it is not computed.
+        pixel_findings = []
         liststyle_findings = _list_style_issues(prod_path, stage_path,
                                                prod_nav, stage_nav)
         tableshape_findings = _table_shape_issues(prod_path, stage_path,
                                                  prod_nav, stage_nav)
         tablebreak_findings = _table_break_issues(prod_path, stage_path,
                                                   prod_nav, stage_nav)
-        callgap_findings = _callout_gap_issues(stage_path, stage_nav, "STAGE")
+        tablemargin_findings = _table_margin_issues(prod_path, stage_path,
+                                                    prod_nav, stage_nav)
+        # A table running onto the next page has to repeat its header there, or
+        # the continuation is a grid of values with nothing naming the columns.
+        tablecont_findings = _table_continuation_header_issues(
+            stage_path, "STAGE", stage_nav)
+        tablemerge_findings = _table_merge_issues(prod_path, stage_path,
+                                                  prod_nav, stage_nav)
+        print(f"  tables with merged/split cell differences: "
+              f"{len(tablemerge_findings)}")
+        callgap_findings = _callout_gap_issues(prod_path, stage_path, prod_nav,
+                                               stage_nav, toc_results)
         print(f"  diagram callout numbers missing: {len(callgap_findings)}")
+        labelmerge_findings = _label_merge_issues(prod_path, stage_path,
+                                                  prod_nav, stage_nav)
+        print(f"  numbered-item labels merged with their paragraph in STAGE: "
+              f"{len(labelmerge_findings)}")
+        print(f"  table continuations with no repeated header: "
+              f"{len(tablecont_findings)}")
         print(f"  tables broken across pages: {len(tablebreak_findings)}")
+        print(f"  tables breaking the margins: {len(tablemargin_findings)}")
         print(f"  list-marker style: {len(liststyle_findings)} | "
               f"table shape: {len(tableshape_findings)}")
         figdiff_findings = _figure_diff_issues(prod_path, stage_path, prod_nav,
                                                stage_nav, stage_seq_idx)
         print(f"  figures differing from PROD: {len(figdiff_findings)}")
+        # Each new check stands on its own: the surrounding try covers a dozen
+        # checks at once, so one of these raising would silently discard every
+        # finding the others had already produced.
+        def _safe(name, fn, *a):
+            try:
+                return fn(*a)
+            except Exception as exc:
+                print(f"  {name} check failed: {exc}")
+                return []
+
+        imgmismatch_findings = _safe(
+            "image mismatch", _image_mismatch_issues,
+            prod_path, stage_path, prod_nav, stage_nav, toc_results)
+        print(f"  images not matching PROD in the same section: "
+              f"{len(imgmismatch_findings)}")
+        figalign_findings = _safe(
+            "image alignment", _figure_align_issues,
+            prod_path, stage_path, prod_nav, stage_nav, toc_results)
+        print(f"  figures placed differently from PROD: {len(figalign_findings)}")
+        colour_findings = _safe(
+            "figure colour", _figure_colour_issues,
+            prod_path, stage_path, prod_nav, stage_nav, toc_results)
+        print(f"  figures with a coloured box one side lacks: "
+              f"{len(colour_findings)}")
+        linkstyle_findings = _safe(
+            "link highlighting", _link_style_issues,
+            prod_path, stage_path, prod_nav, stage_nav)
+        print(f"  links PROD highlights that STAGE draws plain: "
+              f"{len(linkstyle_findings)}")
         italic_findings = _italic_issues(prod_path, stage_path, prod_nav,
                                          stage_nav, stage_seq_idx)
         align_findings = _alignment_issues(prod_path, stage_path, prod_nav, stage_nav)
+        listindent_findings = _safe(
+            "list indent", _list_indent_issues,
+            prod_path, stage_path, prod_nav, stage_nav)
+        print(f"  list items indented differently: {len(listindent_findings)}")
+        textalign_findings = _safe(
+            "text alignment", _text_align_issues,
+            prod_path, stage_path, prod_nav, stage_nav, toc_results)
+        print(f"  titles/paragraphs aligned differently: "
+              f"{len(textalign_findings)}")
         print(f"  italic lost: {len(italic_findings)}")
         callout_counts = {"prod":  _callout_counts(prod_path, prod_nav),
                           "stage": _callout_counts(stage_path, stage_nav)}
@@ -5337,17 +8904,27 @@ def validate(prod_path, stage_path, report_path):
                   f"below {_PIXELATED_DPI}dpi (PROD median {_p['prod_median']}dpi)")
         icon_findings = _icon_issues(stage_path, "STAGE", stage_nav)
         print(f"  broken icons/images: {len(icon_findings)}")
+        print(f"  hyperlinks lost: {len(linkloss_findings)}")
         print(f"  hyperlinks: {len(link_findings)} | page numbers: "
               f"{len(pageno_findings)} | figures missing: {len(figure_findings)}")
     except Exception as exc:
         print(f"  link/format checks failed: {exc}")
         link_findings = pageno_findings = bold_findings = []
+        linkloss_findings = []
         figure_findings = icon_findings = align_findings = italic_findings = []
         pixel_findings = []
         callout_counts = {}
         figdiff_findings = liststyle_findings = tableshape_findings = []
+        tablemargin_findings = []
         tablebreak_findings = []
+        tablecont_findings = []
+        tablemerge_findings = []
         callgap_findings = []
+        labelmerge_findings = []
+        figalign_findings = listindent_findings = linkstyle_findings = []
+        textalign_findings = []
+        imgmismatch_findings = []
+        colour_findings = []
 
     _emit(0.95, "checking figures")
     try:
@@ -5364,6 +8941,7 @@ def validate(prod_path, stage_path, report_path):
                     stage_encoding_issue=stage_garbled,
                     table_summary=table_summary,
                     table_findings=table_findings,
+                    tablerow_findings=tablerow_findings,
                     figure_summary=figure_summary,
                     glitches=glitches,
                     heading_findings=th_findings,
@@ -5371,6 +8949,7 @@ def validate(prod_path, stage_path, report_path):
                     prod_nav_pages=prod_nav,
                     stage_nav_pages=stage_nav,
                     link_findings=link_findings,
+                    linkloss_findings=linkloss_findings,
                     pageno_findings=pageno_findings,
                     bold_findings=bold_findings,
                     figure_findings=figure_findings,
@@ -5383,7 +8962,17 @@ def validate(prod_path, stage_path, report_path):
                     liststyle_findings=liststyle_findings,
                     tableshape_findings=tableshape_findings,
                     tablebreak_findings=tablebreak_findings,
-                    callgap_findings=callgap_findings)
+                    tablemargin_findings=tablemargin_findings,
+                    tablecont_findings=tablecont_findings,
+                    tablemerge_findings=tablemerge_findings,
+                    callgap_findings=callgap_findings,
+                    figalign_findings=figalign_findings,
+                    colour_findings=colour_findings,
+                    listindent_findings=listindent_findings,
+                    textalign_findings=textalign_findings,
+                    linkstyle_findings=linkstyle_findings,
+                    imgmismatch_findings=imgmismatch_findings,
+                    labelmerge_findings=labelmerge_findings)
     _emit(1.0, "done")
     print("Done.")
 
