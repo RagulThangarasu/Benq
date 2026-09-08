@@ -19,4 +19,4 @@ services:
       # Dockerfile CMD let /progress polls be served while /validate runs a long
       # job in another thread.
       - key: VALIDATOR_MAX_PARALLEL
-        value: "1"
+        value: "5"

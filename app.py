@@ -18,6 +18,7 @@ import time
 import traceback
 import uuid
 import zipfile
+from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
 
@@ -214,9 +215,10 @@ def _report_language_coverage():
 
 _report_language_coverage()
 
-# Free-tier memory is tight (~512 MB); each parallel job is a full PyMuPDF
-# subprocess. Cap concurrency via env so we don't OOM-kill the worker.
-MAX_PARALLEL = max(1, int(os.environ.get("VALIDATOR_MAX_PARALLEL", "1")))
+# Each worker is an isolated PyMuPDF subprocess. Ten workers are enabled by
+# Five workers balance throughput with the memory cost of isolated PDF
+# subprocesses; lower VALIDATOR_MAX_PARALLEL if the host runs low on RAM.
+MAX_PARALLEL = max(1, int(os.environ.get("VALIDATOR_MAX_PARALLEL", "5")))
 
 
 def allowed_file(filename: str) -> bool:
@@ -993,17 +995,40 @@ def _finalize_result(produced, run_id=None):
                             "run_id": run_id})
         return
 
-    archive = io.BytesIO()
-    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-        summary_pdf = _consolidated_summary_pdf(reports)
-        if summary_pdf:
-            bundle.writestr("0_CONSOLIDATED_SUMMARY.pdf", summary_pdf)
-        for folder, data in reports:
-            prefix = _clean_folder(folder)
-            bundle.writestr(f"{prefix}_validation_report.pdf", data)
+    # One consolidated PDF: the per-product issue overview first, then each
+    # product's full report, bookmarked. No zip.
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    LAST_RESULT.update({"data": archive.getvalue(), "mime": "application/zip",
-                        "name": f"validation_reports_{stamp}.zip",
+    summary_pdf = _consolidated_summary_pdf(reports)
+    merged, toc = fitz.open(), []
+    if summary_pdf:
+        try:
+            _s = fitz.open(stream=summary_pdf, filetype="pdf")
+            merged.insert_pdf(_s)
+            toc.append([1, "Consolidated overview", 1])
+            _s.close()
+        except Exception as exc:
+            print(f"[report] consolidated overview skipped: {exc}", flush=True)
+    for folder, data in reports:
+        try:
+            part = fitz.open(stream=data, filetype="pdf")
+        except Exception as exc:
+            print(f"[report] skipping unreadable report for '{folder}': {exc}",
+                  flush=True)
+            continue
+        toc.append([1, _clean_folder(folder), merged.page_count + 1])
+        merged.insert_pdf(part)
+        part.close()
+    if merged.page_count == 0:
+        merged.close()
+        LAST_RESULT.update({"data": None, "name": None, "mime": None,
+                            "run_id": run_id})
+        return
+    if toc:
+        merged.set_toc(toc)
+    out = merged.tobytes(deflate=True, garbage=3)
+    merged.close()
+    LAST_RESULT.update({"data": out, "mime": "application/pdf",
+                        "name": f"consolidated_validation_{stamp}.pdf",
                         "run_id": run_id})
 
 
@@ -1018,13 +1043,54 @@ _SUMMARY_METRICS_RE = re.compile(
     r".*?(\d+)\s*issue\(s\) total", re.S)
 
 
+def _report_issue_rows(text: str):
+    """[(section, issue label)] scraped from a generated report PDF.
+
+    Each finding renders as: an id line ("I1", "C3", "O2"), the section on the
+    next line, then a "Where" line, a "PROD p.. / STAGE p.." line, then the
+    issue label (which may wrap over two lines).  The label is matched against
+    the known set, so a wrapped or slightly-spaced label still resolves.
+    """
+    known = [
+        "Text layer", "HTML entity", "Encoding", "Garbled",
+        "Content missing", "Image label missing", "Image mismatch",
+        "Image alignment changed", "Image highlight box missing",
+        "Image not correctly updated", "Images pixelated",
+        "Diagram callout number missing", "Image missing", "Broken image",
+        "Table heading missing", "Table cell missing", "Table row missing",
+        "Table cell layout differs", "Table column layout differs",
+        "Table columns differ", "Table continuation missing its header",
+        "Table breaking the margins", "Table broken", "Table layout broken",
+        "List marker changed", "List alignment broken", "List indent changed",
+        "Text alignment changed", "Paragraph merged with heading",
+        "Bold lost", "Italic lost",
+        "Hyperlink lost", "Hyperlink added in STAGE",
+        "Hyperlink not highlighted in STAGE", "Hyperlink goes to the wrong page",
+        "Hyperlink goes to the wrong section",
+        "Cross-reference page number is wrong",
+        "Cross-reference points to the wrong section",
+        "Internal link target does not resolve",
+        "Hyperlink has no usable scheme", "Hyperlink hotspot cannot be clicked",
+        "Page number",
+    ]
+    lines = [ln.strip() for ln in text.splitlines()]
+    out = []
+    for i, ln in enumerate(lines):
+        if not re.fullmatch(r"[A-Z]{1,3}\d{1,3}", ln):
+            continue
+        section = lines[i + 1] if i + 1 < len(lines) else ""
+        window = " ".join(lines[i + 1:i + 8])
+        window = re.sub(r"\s+", " ", window)
+        found = next((k for k in known if k.lower() in window.lower()), None)
+        if found and section and section.lower() not in ("where", "section"):
+            out.append((section[:80], found))
+    return out
+
+
 def _extract_report_summary(folder: str, data: bytes) -> dict:
-    """Best-effort key metrics scraped from an already-generated report PDF,
-    so the consolidated summary needs no changes to the validators themselves."""
-    row = {"product": folder, "toc_status": "-", "toc_pass": "-",
-          "toc_missing": "-", "toc_extra": "-",
-          "content_issues": "-", "content_dropped": "-",
-          "total_issues": "-", "verdict": "See report"}
+    """Product name + its issue list, scraped from an already-generated report
+    PDF, so the consolidated report needs no change to the validators."""
+    row = {"product": folder, "issues": [], "n_issues": 0}
     try:
         import fitz
         doc = fitz.open(stream=data, filetype="pdf")
@@ -1032,24 +1098,16 @@ def _extract_report_summary(folder: str, data: bytes) -> dict:
         doc.close()
     except Exception:
         return row
-    m = _SUMMARY_TOC_RE.search(text)
-    if m:
-        row.update(toc_status=m.group(1), toc_pass=m.group(2),
-                   toc_missing=m.group(3), toc_extra=m.group(4))
-    m = _SUMMARY_METRICS_RE.search(text)
-    if m:
-        row.update(content_issues=m.group(1), content_dropped=m.group(3),
-                   total_issues=m.group(4))
-        row["verdict"] = "Pass" if m.group(4) == "0" else f"Fail — {m.group(4)} issue(s)"
-    elif row["toc_status"] != "-":
-        row["verdict"] = row["toc_status"].title()
+    row["issues"] = _report_issue_rows(text)
+    # the count is the issues actually listed below — not the raw metric total,
+    # which also folds in page counts and advisory numbers a reader can't action
+    row["n_issues"] = len(row["issues"])
     return row
 
 
 def _consolidated_summary_pdf(reports) -> bytes | None:
-    """One-page-per-many-products overview: every product this run validated,
-    side by side, so a multi-product run doesn't require opening every
-    individual report just to see which ones need attention."""
+    """One report for a whole run: each product as a heading, its issues listed
+    underneath.  No TOC pass/fail status — only the issues that need action."""
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4, landscape
@@ -1068,53 +1126,66 @@ def _consolidated_summary_pdf(reports) -> bytes | None:
     doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
                             leftMargin=14 * mm, rightMargin=14 * mm,
                             topMargin=14 * mm, bottomMargin=14 * mm,
-                            title="Consolidated Validation Summary")
-    styles = getSampleStyleSheet()
-    cell = ParagraphStyle("cell", parent=styles["Normal"], fontSize=8, leading=10)
-    story = [Paragraph("Consolidated Validation Summary", styles["Title"]),
-            Paragraph(f"{len(rows)} product(s) validated in this run — "
-                     f"{datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                     styles["Normal"]),
-            Spacer(1, 8)]
+                            title="Consolidated Validation Report")
+    ss = getSampleStyleSheet()
+    cell = ParagraphStyle("cell", parent=ss["Normal"], fontSize=8, leading=10)
+    prod_h = ParagraphStyle("ph", parent=ss["Heading2"], fontSize=12,
+                             spaceBefore=14, spaceAfter=4)
+    total = sum(r["n_issues"] for r in rows)
+    story = [Paragraph("Consolidated Validation Report", ss["Title"]),
+             Paragraph(f"{len(rows)} product(s) validated "
+                       f"{datetime.now().strftime('%Y-%m-%d %H:%M')} — "
+                       f"{total} issue(s) in total.", ss["Normal"]),
+             Spacer(1, 6)]
 
-    n_pass = sum(1 for r in rows if r["verdict"] == "Pass")
-    story.append(Paragraph(
-        f"<b>{n_pass}/{len(rows)} passed</b> — the rest have issues; open that "
-        f"product's own report (in this zip) for the full detail.",
-        styles["Normal"]))
-    story.append(Spacer(1, 10))
-
-    head = ["Product", "TOC status", "TOC pass", "Missing in STAGE",
-           "Extra in STAGE", "Content issues", "Total issues", "Verdict"]
-    data_rows = [head]
     for r in rows:
-        verdict_style = ("Pass" not in r["verdict"]) and colors.HexColor("#b71c1c") \
-            or colors.HexColor("#2e7d32")
-        data_rows.append([
-            Paragraph(r["product"], cell), r["toc_status"], r["toc_pass"],
-            r["toc_missing"], r["toc_extra"], r["content_issues"],
-            r["total_issues"], Paragraph(f"<font color='{verdict_style}'>"
-                                         f"<b>{r['verdict']}</b></font>", cell)])
-    table = Table(data_rows, repeatRows=1,
-                 colWidths=[70 * mm, 22 * mm, 20 * mm, 28 * mm, 24 * mm,
-                            26 * mm, 24 * mm, 40 * mm])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f2f2f")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#999999")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-         [colors.white, colors.HexColor("#f2f2f2")]),
-    ]))
-    story.append(table)
+        clean = 0 if r["n_issues"] else 1
+        story.append(Paragraph(
+            f"{r['product']} &nbsp;—&nbsp; "
+            f"<font color='{'#2e7d32' if clean else '#b71c1c'}'>"
+            f"<b>{r['n_issues']} issue(s)</b></font>", prod_h))
+        if not r["issues"]:
+            story.append(Paragraph("No issues to report for this product."
+                                   if clean else
+                                   "See this product's section further in this "
+                                   "document for the detail.", cell))
+            continue
+        # group: issue type -> [sections]
+        by_kind = collections.OrderedDict()
+        for sec, kind in r["issues"]:
+            by_kind.setdefault(kind, []).append(sec)
+        data_rows = [[Paragraph("<b>Issue</b>", cell),
+                      Paragraph("<b>Count</b>", cell),
+                      Paragraph("<b>Sections affected</b>", cell)]]
+        for kind, secs in by_kind.items():
+            uniq = list(dict.fromkeys(secs))
+            data_rows.append([
+                Paragraph(kind, cell), Paragraph(str(len(secs)), cell),
+                Paragraph(_esc_html("; ".join(uniq[:12]))
+                          + (" …" if len(uniq) > 12 else ""), cell)])
+        t = Table(data_rows, repeatRows=1,
+                  colWidths=[70 * mm, 16 * mm, 170 * mm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f2f2f")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#999999")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.white, colors.HexColor("#f4f4f4")]),
+        ]))
+        story.append(t)
+
     try:
         doc.build(story)
     except Exception as exc:
         print(f"[summary] consolidated PDF build failed: {exc}", flush=True)
         return None
     return buf.getvalue()
+
+
+def _esc_html(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
 
 
 @app.route("/validate", methods=["POST"])
@@ -1609,6 +1680,27 @@ def _candidate_match_names(pdf_path: Path) -> list[str]:
     return names
 
 
+def _match_stage_pdf_fallback(candidates: list[Path], *names: str):
+    """Find the best older Stage PDF when no current exact match exists."""
+    def clean(value):
+        return (_norm_name(value).replace("benqpdf", "")
+                .replace("usermanual", "").replace("series", ""))
+
+    wanted = [clean(name) for name in names if clean(name)]
+    best = None
+    for candidate in candidates:
+        candidate_names = [clean(name) for name in _candidate_match_names(candidate)]
+        score = max((SequenceMatcher(None, want, have).ratio()
+                     for want in wanted for have in candidate_names), default=0.0)
+        if best is None or score > best[0] or (
+                score == best[0] and candidate.stat().st_mtime < best[1].stat().st_mtime):
+            best = (score, candidate)
+    # Keep every remaining product selectable. The UI/report marks this as an
+    # oldest fallback so nobody mistakes a low-confidence pairing for a current
+    # exact DAM match.
+    return (best[1], best[0]) if best else (None, 0.0)
+
+
 def _match_stage_pdf(candidates: list[Path], *names: str):
     """Best STAGE PDF match for a product/friendly PROD name."""
     want = set()
@@ -1660,13 +1752,29 @@ def _product_entry(product: str, prod_pdf: Path, prod_root: Path,
         "stage_path": None,
         "source": None,
         "has_stage": False,
+        "stage_match": None,
+        "stage_match_score": None,
     }
     stage_pdf = _match_stage_pdf(stage_pdfs, product, prod_pdf.name)
     if stage_pdf:
         entry.update(stage_pdf_name=stage_pdf.name,
                      stage_pdf_kb=stage_pdf.stat().st_size // 1024,
                      stage_path=str(stage_pdf), source=_stage_source_label(stage_pdf),
+                     stage_match="exact",
                      has_stage=True)
+        return entry
+
+    # Some DAM exports use a different product code or an old document name.
+    # Keep the product selectable when a close Stage PDF exists, but expose that
+    # it is an older/alternate fallback rather than pretending it is exact.
+    stage_pdf, score = _match_stage_pdf_fallback(
+        stage_pdfs, product, prod_pdf.name)
+    if stage_pdf:
+        entry.update(stage_pdf_name=stage_pdf.name,
+                     stage_pdf_kb=stage_pdf.stat().st_size // 1024,
+                     stage_path=str(stage_pdf), source=_stage_source_label(stage_pdf),
+                     stage_match="oldest available",
+                     stage_match_score=round(score, 3), has_stage=True)
         return entry
 
     m = _match_cleanup(cleanup_idx, product)
@@ -1710,15 +1818,24 @@ def _matched_products() -> list:
     stage_pdfs = _stage_pdf_candidates()
     downloaded_pdfs = _downloaded_pdf_candidates()
     out = []
-    seen_products = set()
+    by_product = {}
 
     def add_entry(product: str, prod_pdf: Path, prod_root: Path,
                   candidates: list[Path]):
-        label = product
-        if label in seen_products:
-            label = f"{product} ({prod_root.name})"
-        seen_products.add(label)
-        out.append(_product_entry(label, prod_pdf, prod_root, candidates, idx))
+        key = _norm_name(product)
+        if not key:
+            return
+        entry = _product_entry(product, prod_pdf, prod_root, candidates, idx)
+        existing_index = by_product.get(key)
+        if existing_index is None:
+            by_product[key] = len(out)
+            out.append(entry)
+            return
+        # The same manual can be present in more than one local source tree.
+        # Keep one catalog row, preferring the copy that can actually be paired.
+        existing = out[existing_index]
+        if entry["has_stage"] and not existing["has_stage"]:
+            out[existing_index] = entry
 
     if BENQ_PDFS_DIR.is_dir():
         for pdf in sorted(BENQ_PDFS_DIR.rglob("*.pdf")):
@@ -1787,6 +1904,9 @@ def add_to_validation(product: str):
     match = next((m for m in _matched_products() if m["product"] == product), None)
     if not match:
         return jsonify(error="Unknown product."), 404
+    queue = load_queue()
+    if any(item.get("label") == product for item in queue):
+        return jsonify(queue=queue, added=product, duplicate=True)
     prod_src = Path(match.get("prod_path") or (BENQ_PDFS_DIR / product / match["pdf_name"]))
     stage_src = Path(match["stage_path"]) if match.get("stage_path") else None
     zip_path = (Path(match["zip_path"]) if match.get("zip_path")

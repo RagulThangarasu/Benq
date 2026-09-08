@@ -24,6 +24,7 @@ import hashlib
 import bisect
 import io
 import json
+import html as _html
 import difflib
 
 # Configure local TESSDATA_PREFIX before importing fitz (PyMuPDF)
@@ -1668,7 +1669,7 @@ def _encoding_glitches(pdf_path: str, nav_pages: set, doc_label: str):
     bad_fonts = _untrusted_fonts(doc)
     out, seen = [], set()
 
-    def add(pno, kind, text, ctx, probe=""):
+    def add(pno, kind, text, ctx, probe="", **extra):
         key = (kind, text, pno)
         if key in seen:
             return
@@ -1678,7 +1679,8 @@ def _encoding_glitches(pdf_path: str, nav_pages: set, doc_label: str):
                     # `probe` is the literal string as it appears on the page —
                     # what the screenshot locator searches for. `text` may be a
                     # font name, which is not on the page at all.
-                    "probe": probe or text})
+                    "probe": probe or text,
+                    **extra})
 
     for i, page in enumerate(doc, 1):
         if i in nav_pages:
@@ -1690,8 +1692,31 @@ def _encoding_glitches(pdf_path: str, nav_pages: set, doc_label: str):
             return flat[max(0, pos - width):pos + width].strip()
 
         for m in _ENTITY_RE.finditer(flat):
-            add(i, "HTML entity left in text", m.group(0), ctx_at(m.start()),
-                m.group(0))
+            ent = m.group(0)
+            # The token the entity is stuck inside, and what that token should
+            # read once the entity is decoded — so the report can say "STAGE
+            # prints X where it should print Y" instead of just quoting "&#xea".
+            ws = m.start()
+            while ws > 0 and (flat[ws - 1].isalnum() or flat[ws - 1] in "&#;"):
+                ws -= 1
+            we = m.end()
+            while we < len(flat) and (flat[we].isalnum() or flat[we] in "&#;"):
+                we += 1
+            word_raw = flat[ws:we].strip()
+            ent_semi = ent if ent.endswith(";") else ent + ";"
+            try:
+                decoded = _html.unescape(ent_semi)
+                decoded = decoded if decoded and decoded != ent_semi else ""
+            except Exception:
+                decoded = ""
+            try:
+                fixed = _html.unescape(
+                    word_raw if word_raw.endswith(";") else word_raw + ";")
+                word_fixed = fixed.rstrip(";") if fixed and "&" not in fixed else ""
+            except Exception:
+                word_fixed = ""
+            add(i, "HTML entity left in text", ent, ctx_at(m.start()), ent,
+                decoded=decoded, word_raw=word_raw, word_fixed=word_fixed)
 
         # Text drawn with a font that has no Unicode mapping: the page renders
         # correctly, but copy/paste, search and screen readers get wrong
@@ -3470,13 +3495,20 @@ def _table_break_issues(prod_path, stage_path, prod_nav, stage_nav):
             continue
         s0, s1, _sc, _sh = hit
         p_pages, s_pages = p1 - p0 + 1, s1 - s0 + 1
-        if s_pages <= p_pages:
+        # "Table broken" is only the clean regression: a table PROD prints whole
+        # on ONE page that STAGE splits across a page boundary. A table PROD
+        # already paginates over several pages is not "broken" by STAGE running
+        # it over one or two more — both versions break it, and the row/header
+        # separation the report describes is not what changed. Requiring PROD to
+        # keep it whole is what the finding claims, so it is what is checked.
+        if p_pages != 1 or s_pages < 2:
             continue
         if _span_repeats_header(stage_path, stage_nav, key, s0, s1):
             continue          # header repeats on every page — valid pagination
         findings.append({"page": s0, "prod_page": p0,
                          "prod_pages": p_pages, "stage_pages": s_pages,
-                         "stage_from": s0, "stage_to": s1, "header": phead})
+                         "stage_from": s0, "stage_to": s1, "header": phead,
+                         "header_key": key})
     return findings
 
 
@@ -6738,6 +6770,14 @@ _FIX_ADVICE = {
                               "this page are unlabelled.",
                               "Set the table's header row to repeat on every "
                               "page it continues onto."),
+    "Table broken":          ("PROD prints this table whole on one page; STAGE "
+                              "splits it across a page break, or carries it onto "
+                              "the next page without repeating the header row, so "
+                              "rows end up separated from the columns that name "
+                              "them.",
+                              "Keep the table on one page in STAGE, or set its "
+                              "header row to repeat on every page it continues "
+                              "onto, matching PROD."),
     "Table layout broken":   ("A page break splits the table, separating rows "
                               "from their header.",
                               "Keep the table on one page, or repeat the header "
@@ -7208,6 +7248,33 @@ def _ai_cross_check(content_results, prod_path, stage_path,
     # pages does not fragment it, so this is far quieter than a token diff.
     cand = []   # (title, fragment)
     _SPLIT = re.compile(r"(?<=[.!?;])\s+")
+
+    # Document-wide STAGE index. PROD and STAGE do not cut their content into
+    # the same headings — 50 sections against 100 on the PD20U pair — so a
+    # sentence PROD keeps under one heading routinely sits under a *different*
+    # STAGE heading. Judging it against the paired section alone reported that
+    # relocated text as deleted (54 of 57 findings on PD20U). A candidate is
+    # reported only when it is absent from the STAGE document as a whole, which
+    # is the rule this module's docstring already states: reorganised content
+    # that appears elsewhere in STAGE is not reported.
+    _doc_t = _tok(stage_raw or "")
+    _doc5 = {" ".join(_doc_t[k:k + 5]) for k in range(len(_doc_t) - 4)}
+    _doc3 = {" ".join(_doc_t[k:k + 3]) for k in range(len(_doc_t) - 2)}
+
+    def _elsewhere_in_stage(w):
+        """True when this wording already appears somewhere in STAGE.
+
+        Same thresholds as the section-local test above, so a sentence is
+        judged present by exactly the same measure wherever it is found.
+        """
+        if not _doc5:
+            return False        # no STAGE text to check against — behave as before
+        g5 = [" ".join(w[k:k + 5]) for k in range(len(w) - 4)]
+        if not g5:
+            return False
+        g3 = [" ".join(w[k:k + 3]) for k in range(len(w) - 2)]
+        return (sum(1 for x in g5 if x in _doc5) / len(g5) >= 0.30
+                or sum(1 for x in g3 if x in _doc3) / max(1, len(g3)) >= 0.66)
     for title, ptext in prod_sections.items():
         if not ptext or _CONTENTS_TITLE.search(title or ""):
             continue
@@ -7234,6 +7301,8 @@ def _ai_cross_check(content_results, prod_path, stage_path,
             if (sum(1 for x in g5 if x in s5) / len(g5) >= 0.30
                     or sum(1 for x in g3 if x in s3) / max(1, len(g3)) >= 0.66):
                 continue
+            if _elsewhere_in_stage(w):
+                continue        # moved to another heading, not deleted
             frag = _prettify(w)
             if _is_content(frag) and not _dup(frag):
                 cand.append((title, frag))
@@ -7339,6 +7408,7 @@ _ISSUE_CATEGORY = {
     "Image highlight box missing": "image",
     "Broken image":          "image",
     "Table heading missing": "table",
+    "Table broken":          "table",
     "Table continuation missing its header": "table",
     "Table cell layout differs": "table",
     "Table row missing":     "table",
@@ -7398,16 +7468,13 @@ _REPORTED_ISSUES = (
     "Table row missing",
     "Table cell missing",
     "Table heading missing",
-    # image: the picture PROD prints in a section must be the picture STAGE
-    # prints there, and it must sit where PROD sits it.
-    "Image mismatch",
-    # "Image not correctly updated" is NOT reported: PROD and STAGE are rendered
-    # by different pipelines, so an SSIM/pixel comparison scores the *same*
-    # artwork anywhere from 0.06 to 0.82 (measured across 109 figure pairs) and a
-    # genuinely changed image lands in that same band — there is no threshold
-    # that separates them, so every reading is a coin-flip.  A missing or
-    # re-placed figure is caught by "Image mismatch" / "Image alignment changed"
-    # in terms of the picture itself.
+    # Neither "Image mismatch" nor "Image not correctly updated" is reported.
+    # Both rest on comparing two renderings of a figure pixel by pixel, and PROD
+    # and STAGE come out of different pipelines: the *same* artwork scores
+    # anywhere from 0.06 to 0.82 (measured across 109 figure pairs) and genuinely
+    # different artwork lands in that same band. No threshold separates them, so
+    # every reading is a coin-flip. Figures that are actually absent are caught
+    # by "Image missing", which counts figures instead of comparing pixels.
     # figure placed left where PROD centres it (or the reverse) - a clear
     # left/centre/right change only, small shifts are not reported
     "Image alignment changed",
@@ -7424,14 +7491,15 @@ _REPORTED_ISSUES = (
     "Text alignment changed",
     "Paragraph merged with heading",
     # table layout and breakage
-    "Table layout broken",
+    # one label for both ways a table comes apart in STAGE: a page break that
+    # splits a table PROD keeps whole, and a continuation page that drops the
+    # header row. Both detectors feed this single "Table broken" row so a table
+    # is never reported twice.
+    "Table broken",
     "Table columns differ",
     "Table column layout differs",
     "Table breaking the margins",
     "Table cell layout differs",
-    # a table that runs onto the next page without repeating its header leaves
-    # the continuation as unlabelled columns
-    "Table continuation missing its header",
     # A link STAGE carries but draws as plain body text: the reader has no way
     # to know it is there. Asked for explicitly, so it is reported.
     "Hyperlink not highlighted in STAGE",
@@ -7852,6 +7920,57 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             title = _topic_at(marks, pg, path if rects else None, rects)
             return title or "\u2014"
 
+        # \u2500\u2500 Genuine page references for the "Where" column \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # A reviewer turns to the page named here, so it must be the page the
+        # text is actually on \u2014 not the page its SECTION happens to start on.
+        # Inside the long OSD-menu tables a section runs ~10 pages, so the
+        # section-start page was routinely that far from the real one.
+        #   * PROD side  \u2014 the fragment is located in PROD and its true page used.
+        #   * STAGE side \u2014 a fragment dropped by STAGE has no single STAGE page;
+        #     the report cites the STAGE page SPAN of the section it belongs to.
+        def _doc_pages(path):
+            try:
+                d = fitz.open(path)
+                n = d.page_count
+                d.close()
+                return n
+            except Exception:
+                return 0
+        _prod_pages, _stage_pages = _doc_pages(prod_path), _doc_pages(stage_path)
+
+        def _sect_range(marks, title, total):
+            """(first, last) page span of section `title` on one side \u2014 `last`
+            is the page just before the next section starts."""
+            if not title or title == "\u2014":
+                return None
+            starts = sorted({p for p, _t in marks})
+            hit = next((p for p, t in marks if t == title), None)
+            if hit is None:
+                return None
+            nxt = next((p for p in starts if p > hit), None)
+            last = (nxt - 1) if nxt else (total or hit)
+            return hit, max(hit, last)
+
+        def _stage_span(title):
+            """`" / STAGE pA"` or `" / STAGE pA-B"` for `title`, else `""`."""
+            rng = _sect_range(_s_marks, title, _stage_pages)
+            if not rng:
+                return ""
+            a, b = rng[0], max(rng[0], rng[1])
+            return f" / STAGE p{a}" if a == b else f" / STAGE p{a}\u2013{b}"
+
+        def _true_page(path, text, hint, skip):
+            """The page `text` genuinely sits on in `path` (exact match), or 0."""
+            toks = _seq_tokens(text or "")
+            if len(toks) < 3:
+                return 0
+            try:
+                pg, _r = _locate_tokens(path, " ".join(toks[:14]), hint or 0,
+                                        skip_pages=skip)
+                return pg
+            except Exception:
+                return 0
+
         # Collected per category and rendered as one section each. Numbering runs
         # within a section (E1, C1, I1 …) so an issue's id says what kind it is.
         buckets = {key: [] for key, _t, _d in _CATEGORIES}
@@ -7860,7 +7979,12 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
         def add(issue, where, topic, detail, style, probe=None):
             if not _is_reported(issue):
                 return
-            key = (issue, where, topic, detail)
+            # Two detectors describing the same defect word it slightly
+            # differently — markup, spacing, a truncation point. Key the
+            # de-dup on the plain-text of the detail so the same finding in the
+            # same place is written once, whichever detector phrased it.
+            flat = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", detail or "")).strip().lower()
+            key = (issue, where, topic, flat)
             if key in _seen_rows:
                 return
             _seen_rows.add(key)
@@ -7873,6 +7997,22 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                           f"has no Unicode map — the page <b>displays correctly</b>, "
                           f"but copy/paste, search and screen readers get the wrong "
                           f"characters.<br/>Nearby: {_esc(_trunc(g['context'], 170))}")
+            elif g["kind"].startswith("HTML entity"):
+                ent = g["text"] if g["text"].endswith(";") else g["text"] + ";"
+                lead = (f"STAGE prints the raw HTML entity "
+                        f"<font color='#b71c1c'><b>{_esc(ent)}</b></font> as "
+                        f"literal text")
+                if g.get("decoded"):
+                    lead += (f", where the character <b>{_esc(g['decoded'])}</b> "
+                             f"should appear")
+                lead += "."
+                if (g.get("word_raw") and g.get("word_fixed")
+                        and g["word_raw"] != g["word_fixed"]):
+                    lead += (f"<br/>The word reads <font color='#b71c1c'><b>"
+                             f"{_esc(g['word_raw'])}</b></font> — it should read "
+                             f"<b>{_esc(g['word_fixed'])}</b>.")
+                detail = (f"{lead}<br/>In context: "
+                          f"{_esc(_trunc(g['context'], 170))}")
             else:
                 detail = (f"<font color='#b71c1c'><b>{_esc(g['text'])}</b></font>"
                           f"<br/>In context: {_esc(_trunc(g['context'], 170))}")
@@ -7906,6 +8046,20 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 f"for the same topic have none.", fail_s)
 
         for f in figdiff_findings:
+            if f.get("kind") == "mirrored":
+                # A left-to-right flip is a specific, checkable defect \u2014 the
+                # flipped picture matches where the un-flipped one does not \u2014 so
+                # unlike a plain SSIM difference this one is reported.
+                add("Image mismatch",
+                    f"PROD p{f['page']} / STAGE p{f['stage_page']}",
+                    f"Section \u201c{_esc(_trunc(f['anchor'], 46))}\u201d",
+                    f"<font color='#b71c1c'><b>The figure is mirrored in STAGE."
+                    f"</b></font> Both figures carry the same caption, but "
+                    f"STAGE's picture is flipped left-to-right against PROD's \u2014 "
+                    f"what points or faces one way in PROD points the other way "
+                    f"in STAGE. Compare the two crops below and restore PROD's "
+                    f"orientation in STAGE.", fail_s, probe=f.get("anchor"))
+                continue
             add("Image not correctly updated",
                 f"PROD p{f['page']} / STAGE p{f['stage_page']}",
                 f"Section \u201c{_esc(_trunc(f['anchor'], 46))}\u201d",
@@ -8034,14 +8188,17 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 f"{' and '.join(side)}. PROD keeps this table inside its column.",
                 fail_s, probe=f.get("header"))
 
+        _broken_table_keys = set()
         for f in tablebreak_findings:
-            add("Table layout broken",
+            _broken_table_keys.add(f.get("header_key") or "")
+            add("Table broken",
                 f"PROD p{f['prod_page']} / STAGE p{f['stage_from']}-{f['stage_to']}",
                 f"Table \u201c{_esc(_trunc(f['header'], 44))}\u201d",
-                f"The table is split by a page break in STAGE: it runs over "
+                f"PROD prints this table whole on <b>page {f['prod_page']}</b>. "
+                f"STAGE splits it across a page break, running it over "
                 f"<b>{f['stage_pages']} pages</b> (p{f['stage_from']}\u2013"
-                f"{f['stage_to']}) where PROD keeps it on <b>{f['prod_pages']}</b>. "
-                f"Rows are separated from their header.", fail_s,
+                f"{f['stage_to']}), so its rows are carried onto pages away from "
+                f"the header.", fail_s,
                 probe=f.get("header"))
 
         for f in tablemerge_findings:
@@ -8059,12 +8216,15 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 probe=f.get("header"))
 
         for f in tablecont_findings:
+            if " ".join(_seq_tokens(f.get("header") or "")) in _broken_table_keys:
+                continue                 # same table already reported as broken
             _sect = _section_for(f"{f['doc']} p{f['page']}", f.get("header"))
-            add("Table continuation missing its header",
+            add("Table broken",
                 f"{f['doc']} p{f['page']}",
                 f"Table “{_esc(_trunc(f['header'], 40))}” under "
                 f"“{_esc(_sect)}”, continued on {f['doc']} page {f['page']}",
-                f"The table from page {f['prev_page']} continues onto page "
+                f"PROD keeps this table's header row with its rows. In STAGE the "
+                f"table from page {f['prev_page']} continues onto page "
                 f"{f['page']} without repeating its header row "
                 f"(<font color='#b71c1c'><b>{_esc(_trunc(f['header'], 90))}</b>"
                 f"</font>), so the columns on this page are unlabelled.", fail_s,
@@ -8097,19 +8257,23 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                 probe=f.get("header"))
 
         for f in heading_findings:
-            _sect = _section_for(f"PROD p{f['page']}", f.get("row"))
-            add("Table heading missing", f"PROD p{f['page']}",
-                f"Table under “{_esc(_sect)}”, PROD page {f['page']}",
+            _probe = f.get("row") or f["text"]
+            _pp = _true_page(prod_path, _probe, f["page"], prod_nav_pages) or f["page"]
+            _sect = _section_for(f"PROD p{_pp}", _probe)
+            add("Table heading missing", f"PROD p{_pp}{_stage_span(_sect)}",
+                f"Table under “{_esc(_sect)}”, PROD page {_pp}",
                 f"Column heading(s) <font color='#b71c1c'><b>"
                 f"{_esc(_trunc(f['text'], 140))}</b></font> dropped. PROD header: "
                 f"<i>{_esc(_trunc(f.get('row',''), 170))}</i>", fail_s,
-                probe=f.get("row") or f["text"])
+                probe=_probe)
 
         for f in tablerow_findings:
-            _sect = _section_for(f"PROD p{f['page']}", f["label"])
-            add("Table row missing", f"PROD p{f['page']}",
-                f"Table under “{_esc(_sect)}”, PROD page {f['page']}",
-                f"<b>PROD page {f['page']}</b> has a table row<br/>"
+            _pp = _true_page(prod_path, f.get("value") or f["label"],
+                             f["page"], prod_nav_pages) or f["page"]
+            _sect = _section_for(f"PROD p{_pp}", f["label"])
+            add("Table row missing", f"PROD p{_pp}{_stage_span(_sect)}",
+                f"Table under “{_esc(_sect)}”, PROD page {_pp}",
+                f"<b>PROD page {_pp}</b> has a table row<br/>"
                 f"<font color='#b71c1c'><b>{_esc(_trunc(f['label'], 80))}</b>"
                 f"{(' : ' + _esc(_trunc(f['value'], 150))) if f.get('value') else ''}"
                 f"</font><br/>"
@@ -8126,28 +8290,29 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             if re.fullmatch(r"[x\u00d7]?\s*\d{1,3}|n/?a", (f["text"] or "").strip(),
                             re.IGNORECASE):
                 continue
+            _pp = _true_page(prod_path, f["text"], f["page"], prod_nav_pages) or f["page"]
+            _sect = _section_for(f"PROD p{_pp}", f["text"])
             where_tbl = (f"the table with columns [{_esc(_trunc(hdr, 90))}]"
-                         if hdr else f"a table on PROD page {f['page']}")
+                         if hdr else f"a table on PROD page {_pp}")
             row_bit = (f" the row for <b>{_esc(_trunc(rlab, 70))}</b>"
                        if rlab else " one row")
             if f.get("whole_cell", True):
-                detail = (f"<b>PROD page {f['page']}</b> — in {where_tbl},"
+                detail = (f"<b>PROD page {_pp}</b> — in {where_tbl},"
                           f"{row_bit} contains<br/>"
                           f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 240))}"
                           f"</b></font><br/>"
                           f"<b>STAGE's copy of that row does not carry this "
                           f"text anywhere.</b>")
             else:
-                detail = (f"<b>PROD page {f['page']}</b> — in {where_tbl},"
+                detail = (f"<b>PROD page {_pp}</b> — in {where_tbl},"
                           f"{row_bit} lists the value<br/>"
                           f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 200))}"
                           f"</b></font><br/>"
                           f"<b>That value is missing from STAGE</b> — the rest "
                           f"of the row's values are present.")
-            _sect = _section_for(f"PROD p{f['page']}", f["text"])
             add("Table cell missing",
-                f"PROD p{f['page']} · row {f.get('row', '?')}",
-                f"Table under “{_esc(_sect)}”, PROD page {f['page']}", detail,
+                f"PROD p{_pp} · row {f.get('row', '?')}{_stage_span(_sect)}",
+                f"Table under “{_esc(_sect)}”, PROD page {_pp}", detail,
                 fail_s,
                 probe=f["text"])
 
@@ -8223,13 +8388,30 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             add(f["kind"], f"{f['doc']} p{f['page']}",
                 f"{f['doc']} page {f['page']}", _esc(f["text"]), fail_s)
 
+        # An "(AI) p12 (STAGE p10): …" fragment already carries the exact pages
+        # the AI cross-check found the row on — parse them out rather than
+        # re-deriving, and drop the prefix from the text shown to the reader.
+        _ai_pg_re = re.compile(r"^\(AI\)\s*p(\d+)(?:\s*\(STAGE p(\d+)\))?\s*[:-]\s*")
         for r in diff_rows:
-            where = f"PROD p{r['prod_page']} / STAGE p{r['stage_page']}"
+            _pp0 = _pageno(r.get("prod_page"))
+            _stage_where = (_stage_span(r["title"]).lstrip(" /")
+                            or f"STAGE p{_pageno(r.get('stage_page'))}")
             for m in r.get("missing", []):
+                mm = _ai_pg_re.match(m)
+                if mm:
+                    frag = m[mm.end():]
+                    disp = f"(AI) {frag}"
+                    where = (f"PROD p{mm.group(1)} / "
+                             + (f"STAGE p{mm.group(2)}" if mm.group(2)
+                                else _stage_where))
+                else:
+                    frag = disp = m
+                    _pp = _true_page(prod_path, m, _pp0, prod_nav_pages) or _pp0
+                    where = f"PROD p{_pp} / {_stage_where}"
                 add("Content missing", where, _esc(r["title"]),
                     f"In PROD, absent from STAGE: <font color='#b71c1c'>"
-                    f"{_highlight_notice_labels(_trunc(m, 300))}</font>", fail_s,
-                    probe=m)
+                    f"{_highlight_notice_labels(_trunc(disp, 300))}</font>", fail_s,
+                    probe=frag)
 
 
         # ── Summary: how many of each kind ──
@@ -8851,6 +9033,28 @@ def validate(prod_path, stage_path, report_path):
         # the continuation is a grid of values with nothing naming the columns.
         tablecont_findings = _table_continuation_header_issues(
             stage_path, "STAGE", stage_nav)
+        # Keep only the continuations that are a genuine STAGE regression: the
+        # same table in PROD either fits on one page or repeats its header on
+        # every page it spans. A continuation PROD makes the same way, or a
+        # table PROD has no single-page copy of, is not reported — and one
+        # already flagged as a broken split is not repeated here.
+        if tablecont_findings:
+            _prod_sp = _table_page_spans(prod_path, prod_nav)
+            _break_keys = {b.get("header_key") or "" for b in tablebreak_findings}
+            _kept = []
+            for _f in tablecont_findings:
+                _hk = " ".join(_seq_tokens(_f.get("header") or ""))
+                if _hk in _break_keys:
+                    continue                    # same table already "Table broken"
+                _ps = _prod_sp.get(_hk)
+                if not _ps:
+                    continue                    # PROD has no such table — cannot confirm
+                _p0, _p1 = _ps[0], _ps[1]
+                if _p1 > _p0 and not _span_repeats_header(
+                        prod_path, prod_nav, _hk, _p0, _p1):
+                    continue                    # PROD breaks it the same way — not new
+                _kept.append(_f)
+            tablecont_findings = _kept
         tablemerge_findings = _table_merge_issues(prod_path, stage_path,
                                                   prod_nav, stage_nav)
         print(f"  tables with merged/split cell differences: "
