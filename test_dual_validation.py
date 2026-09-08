@@ -104,9 +104,10 @@ def test_table_issue_labels_are_reported():
         "Table columns differ",
         "Table column layout differs",
         "Table cell layout differs",
-        "Table layout broken",
+        # a page break that splits a table PROD keeps whole, and a continuation
+        # page that drops the header row, are both reported as one "Table broken"
+        "Table broken",
         "Table breaking the margins",
-        "Table continuation missing its header",
         "Table heading missing",
         "Table cell missing",
     ):

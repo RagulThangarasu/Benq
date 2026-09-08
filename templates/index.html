@@ -702,10 +702,18 @@
         }
         products.sort((a, b) => Number(!!b.has_stage) - Number(!!a.has_stage)
           || String(a.product).localeCompare(String(b.product)));
+        const matchedCount = products.filter(p => p.has_stage).length;
+        const olderCount = products.filter(p => p.stage_match === 'oldest available').length;
+        serverPickerMsg.textContent = `${matchedCount} matched PROD PDFs available.`
+          + (olderCount ? ` ${olderCount} use the oldest available Stage PDF because a newer exact match was not found.` : '');
+        serverPickerMsg.style.color = olderCount ? '#92400e' : '#047857';
         serverProductSelect.innerHTML = products.map(p => {
           const ok = !!p.has_stage;
           const label = p.pdf_name || p.product;
-          return `<option value="${p.product}" ${ok ? '' : 'disabled'}>${label}${ok ? '' : ' (no STAGE)'}</option>`;
+          const title = p.stage_match === 'oldest available'
+            ? 'Oldest available Stage PDF will be used'
+            : (ok ? 'Exact Stage PDF match' : 'No Stage PDF match');
+          return `<option title="${title}" value="${p.product}" ${ok ? '' : 'disabled'}>${label}${ok ? '' : ' (no STAGE)'}</option>`;
         }).join('');
       }
 
@@ -717,18 +725,22 @@
         }
         addServerSelected.disabled = addServerAll.disabled = true;
         serverPickerMsg.style.color = '';
-        let added = 0; const failed = [];
+        let added = 0; let skipped = 0; const failed = [];
         for (const name of productNames) {
           serverPickerMsg.textContent = `Adding ${name}… (${added}/${productNames.length})`;
           try {
             const r = await fetch('/download/add-to-validation/' + encodeURIComponent(name), { method: 'POST' });
-            if (r.ok) added++; else { const d = await r.json().catch(() => ({})); failed.push(`${name}: ${d.error || r.status}`); }
+            const d = await r.json().catch(() => ({}));
+            if (r.ok) { if (d.duplicate) skipped++; else added++; }
+            else failed.push(`${name}: ${d.error || r.status}`);
           } catch (e) { failed.push(`${name}: ${e.message}`); }
         }
         await loadQueue();
         addServerSelected.disabled = addServerAll.disabled = false;
         serverPickerMsg.style.color = failed.length ? '#b45309' : '#047857';
-        serverPickerMsg.textContent = `Added ${added} to queue.` + (failed.length ? ` Skipped: ${failed.join('; ')}` : '');
+        serverPickerMsg.textContent = `Added ${added} to queue.`
+          + (skipped ? ` Already queued: ${skipped}.` : '')
+          + (failed.length ? ` Skipped: ${failed.join('; ')}` : '');
       }
 
       addServerSelected.addEventListener('click', () => {

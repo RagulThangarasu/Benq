@@ -238,11 +238,11 @@ def _modified_at(hit):
 
 
 def discover_output_pdfs(languages=None):
-    """Every generated PDF under OUTPUTS_ROOT, filtered by selected languages.
+    """The latest generated PDF for each product/language under OUTPUTS_ROOT.
 
-    Returns a sorted list of (product, lang, pdf_path). A product can have more
-    than one generated export; each asset is retained so the local download
-    matches the complete inventory in the selected guide categories.
+    Returns a sorted list of (product, lang, pdf_path). When AEM contains more
+    than one generated export for the same product and language, the asset with
+    the newest ``jcr:lastModified`` value wins.
     """
     raw = _get(f"/bin/querybuilder.json?path={OUTPUTS_ROOT}&nodename=%2a.pdf"
                f"&p.limit=-1&p.guessTotal=true&p.hits=selective"
@@ -255,7 +255,7 @@ def discover_output_pdfs(languages=None):
     roots = None if SOURCE_ROOTS.strip() == "*" else [
         r.strip().rstrip("/") for r in SOURCE_ROOTS.split(",") if r.strip()]
     categories = wanted_categories()
-    seen, out = set(), []
+    seen, latest = set(), {}
     for h in hits:
         p = h.get("jcr:path")
         if not p or not p.lower().endswith(".pdf") or p in seen:
@@ -276,14 +276,21 @@ def discover_output_pdfs(languages=None):
             continue
         if categories is not None and category.lower() not in categories:
             continue
-        out.append((product, lang, p))
+        key = (product.lower(), lang.lower())
+        candidate = (product, lang, p, _modified_at(h))
+        previous = latest.get(key)
+        if (previous is None
+                or candidate[3] > previous[3]
+                or (candidate[3] == previous[3] and p > previous[2])):
+            latest[key] = candidate
+    out = [(product, lang, p) for product, lang, p, _modified in latest.values()]
     out.sort(key=lambda t: (t[0].lower(), t[1]))
     return out
 
 
 def download_all(progress_cb=None, should_cancel=None, languages=None):
-    """Crawl every language folder under OUTPUTS_ROOT and download EVERY
-    generated PDF into:
+    """Crawl every language folder under OUTPUTS_ROOT and download the latest
+    generated PDF for each product into:
 
         benq_pdfs/<PRODUCT>/<PRODUCT>.pdf          (for the default `en`)
         benq_pdfs/<PRODUCT>__<lang>/<PRODUCT>__<lang>.pdf   (other languages)
@@ -317,11 +324,11 @@ def download_all(progress_cb=None, should_cancel=None, languages=None):
     _emit(0.02, "crawling every folder for generated PDFs…")
     pdfs = discover_output_pdfs(languages=languages)
 
-    # Replace the managed local snapshot only after AEM has responded and its
-    # inventory is known, so a failed discovery cannot erase prior downloads.
-    if os.path.isdir(OUT_ROOT):
-        shutil.rmtree(OUT_ROOT)
-    os.makedirs(OUT_ROOT)
+    # Keep older local PDFs. They are useful Stage fallbacks when the latest DAM
+    # export is missing for a product, and deleting them here made the matcher
+    # drop from the full catalog to only the products returned by one DAM run.
+    # The selected latest asset overwrites its own destination below.
+    os.makedirs(OUT_ROOT, exist_ok=True)
     rows, ok = [], 0
     total = len(pdfs)
     cancelled = False
@@ -339,8 +346,8 @@ def download_all(progress_cb=None, should_cancel=None, languages=None):
         name = _clean_folder(name)
         _emit(0.05 + 0.93 * i / max(total, 1), f"{name} ({i + 1}/{total})")
         dest_dir = os.path.join(OUT_ROOT, name)
-        # A product can have multiple exports in AEM. Preserve each generated
-        # filename so later assets do not overwrite an earlier one.
+        # Discovery has already reduced each product/language to one latest
+        # asset, so the local product folder contains only that PDF.
         asset_name = _clean_folder(os.path.basename(pdf_path))
         if len(destinations[(name, asset_name)]) > 1:
             stem, ext = os.path.splitext(asset_name)
