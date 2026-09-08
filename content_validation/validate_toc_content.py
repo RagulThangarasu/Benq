@@ -104,7 +104,8 @@ CHAR_SHINGLE    = 18     # character window for shingle coverage
 # rather than defects.
 SKIP_SECTIONS = ("q&a index", "qa index", "q & a index")
 
-MIN_FRAG_WORDS  = 5      # short fragments are too easily caused by PDF extraction order
+MIN_FRAG_WORDS  = 5      # default for whole-document checks, where short runs are noisy
+SECTION_MIN_FRAG_WORDS = 3  # matched TOC sections can safely report shorter gaps
 SEQ_MAX_GAP     = 6      # words of filler tolerated between two fragment words when
                          # confirming a fragment really is absent from STAGE.
                          # Absorbs page-break artifacts (page numbers, running
@@ -1034,6 +1035,19 @@ def _build_stage_index(stage_pdf_path: str, nav_pages: set):
     return nospace, cset, full_lower
 
 
+def _text_compare_index(text: str):
+    """Build the same comparison index for an already-extracted section."""
+    words = _keep(_tokenize(text or ""))
+    nospace = "".join(_canon(w) for w in words)
+    full_lower = _s_norm(re.sub(r"\s+", " ", text or "")).lower()
+    if not nospace:
+        return "", set(), full_lower
+    shingle_len = 8 if _CJK_RE.search(nospace) else CHAR_SHINGLE
+    cset = {nospace[i:i + shingle_len]
+            for i in range(len(nospace) - shingle_len + 1)}
+    return nospace, cset, full_lower
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Image extraction and comparison
 # ────────────────────────────────────────────────────────────────────────────
@@ -1388,13 +1402,14 @@ def _seq_present(idx, seq, max_gap: int = SEQ_MAX_GAP) -> bool:
     return False
 
 
-def _refine_fragment(frag_words, idx, source_idx=None):
+def _refine_fragment(frag_words, idx, source_idx=None, min_words=None):
     """Split an uncovered run into only the parts genuinely absent from STAGE.
 
     Returns a list of readable fragment strings (original spelling preserved).
     A word counts as present when any SEQ_WINDOW-word window containing it is
     found in STAGE, so reordered or page-split content is not reported.
     """
+    min_words = MIN_FRAG_WORDS if min_words is None else min_words
     canon, origin = [], []
     for i, w in enumerate(frag_words):
         for cw in _split_canon(w):     # one word may hold several runs
@@ -1406,7 +1421,7 @@ def _refine_fragment(frag_words, idx, source_idx=None):
         # Too short to slide a window over. Still honour MIN_FRAG_WORDS — a run
         # that shrinks below it once bare numbers and punctuation are dropped
         # (e.g. ["1.", "2.", "foo"]) is noise, not a reportable difference.
-        if len(canon) < MIN_FRAG_WORDS or _seq_present(idx, canon):
+        if len(canon) < min_words or _seq_present(idx, canon):
             return []
         return [_join_tokens(frag_words[origin[0]:origin[-1] + 1])]
 
@@ -1424,7 +1439,7 @@ def _refine_fragment(frag_words, idx, source_idx=None):
         st = i
         while i < len(canon) and not present[i]:
             i += 1
-        if i - st >= MIN_FRAG_WORDS:
+        if i - st >= min_words:
             # Only report text that genuinely reads this way in the SOURCE
             # document. Section slicing concatenates a page-ordered token
             # stream, so a run can be an artifact that appears in neither PDF
@@ -1441,8 +1456,49 @@ def _refine_fragment(frag_words, idx, source_idx=None):
     return out
 
 
+def _sentences_absent_doc_wide(frag_text: str, seq_idx, min_toks: int = 6):
+    """The sentences of a fragment that STAGE does not carry ANYWHERE.
+
+    An uncovered run is assembled from whatever words the shingle pass did not
+    match, so it routinely welds a heading to two bullets ("Caution The distance
+    between you and the monitor … Looking at the screen …"). Judged against the
+    matched STAGE section alone, that whole run reads as dropped even when STAGE
+    prints every sentence of it under a neighbouring heading — which is where
+    the false "missing content" findings came from.
+
+    Each sentence is therefore checked against the WHOLE STAGE document, and
+    only the ones STAGE genuinely does not have are returned. A sentence whose
+    wording exists anywhere in STAGE was moved, not deleted.
+    """
+    out = []
+    for sent in re.split(r"(?<=[.!?])\s+", frag_text or ""):
+        sent = sent.strip()
+        toks = _seq_tokens(sent)
+        if not toks:
+            continue
+        if len(toks) < min_toks:
+            # Short runs ("Remove the monitor stand.") are the ones the matcher
+            # produces most, and there is nothing vague about them: either the
+            # words occur in that order somewhere in STAGE or they do not.
+            # Waving them through as "too short to judge" is what left findings
+            # whose PROD and STAGE text read identically.
+            if not _seq_present(seq_idx, toks, max_gap=6):
+                out.append(sent)
+            continue
+        grams = [toks[k:k + 5] for k in range(len(toks) - 4)]
+        if not grams:
+            if not _seq_present(seq_idx, toks, max_gap=6):
+                out.append(sent)
+            continue
+        hit = sum(1 for g in grams if _seq_present(seq_idx, g, max_gap=2))
+        if hit / len(grams) < 0.30:
+            out.append(sent)
+    return out
+
+
 def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
-                     stage_section_lower="", source_idx=None):
+                     stage_section_lower="", source_idx=None,
+                     min_frag_words=None, doc_full_lower=None):
     """Return (coverage_pct, [missing_fragment_str, ...]).
 
     Uses shingle windows to detect which PROD words are covered by STAGE text.
@@ -1453,6 +1509,7 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
     - Checking variations of fragments with common punctuation/formatting differences
     - Verifying absence through multiple matching strategies
     """
+    min_frag_words = MIN_FRAG_WORDS if min_frag_words is None else min_frag_words
     words  = _keep(prod_words)
     if not words:
         return 100.0, []
@@ -1482,10 +1539,10 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
         phrase = _s_norm(re.sub(r"\s+", " ", _join_tokens(words))).lower()
         if phrase in stage_full_lower:
             return 100.0, []
-        if len(words) < MIN_FRAG_WORDS:
+        if len(words) < min_frag_words:
             return 0.0, []
         return 0.0, _refine_fragment(words, _stage_seq_index(stage_full_lower),
-                                     source_idx)
+                                     source_idx, min_words=min_frag_words)
 
     covered_char = [False] * len(s)
     for p in range(len(s) - L + 1):
@@ -1504,6 +1561,12 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
     coverage = 100.0 * sum(covered) / len(words)
 
     _seq_idx = _stage_seq_index(stage_full_lower)
+    # The matched-section path passes a section-scoped index. "Missing" has to
+    # mean missing from STAGE, not merely from the section STAGE paired with,
+    # so the final gate is given the whole document when the caller has it.
+    _doc_idx = (_stage_seq_index(doc_full_lower)
+                if doc_full_lower and doc_full_lower != stage_full_lower
+                else _seq_idx)
 
     frags, i = [], 0
     while i < len(words):
@@ -1512,7 +1575,7 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
             while i < len(words) and not covered[i]:
                 i += 1
             frag = words[st:i]
-            if len(frag) >= MIN_FRAG_WORDS:
+            if len(frag) >= min_frag_words:
                 phrase = _s_norm(re.sub(r"\s+", " ", _join_tokens(frag))).lower()
                 if phrase in stage_full_lower:
                     pass  # covered
@@ -1571,14 +1634,22 @@ def _section_missing(prod_words, stage_ns, stage_cset, stage_full_lower,
                                   for t, n in need.items()):
                                 reported = False
 
-                    # 5) Final gate: re-verify the fragment against the WHOLE
-                    #    STAGE document word by word, tolerating small gaps.
-                    #    Only the parts with no counterpart anywhere in STAGE
-                    #    survive — content that merely moved to the next page,
-                    #    got re-laid-out, or was glued to a heading by section
-                    #    slicing is no longer reported.
+                    # 5) Final gate: re-verify the fragment against the text
+                    #    index this check was given. Matched TOC sections pass a
+                    #    section-scoped index; missing topics can still pass a
+                    #    whole-document index.
                     if reported:
-                        frags.extend(_refine_fragment(frag, _seq_idx, source_idx))
+                        for _piece in _refine_fragment(
+                                frag, _seq_idx, source_idx,
+                                min_words=min_frag_words):
+                            # PROD is the reference, but "missing" has to mean
+                            # missing from STAGE — not merely missing from the
+                            # section STAGE happened to pair with. STAGE splits
+                            # these manuals into twice as many headings, so the
+                            # last word on whether wording survived belongs to
+                            # the whole document.
+                            frags.extend(
+                                _sentences_absent_doc_wide(_piece, _doc_idx))
         else:
             i += 1
     return coverage, frags
@@ -3692,6 +3763,151 @@ def _table_margin_issues(prod_path, stage_path, prod_nav, stage_nav):
         doc.close()
     return findings
 
+
+
+def _table_content_diff(prod_path, stage_path, prod_nav, stage_nav, toc_results):
+    """Every table-layout and table-content difference PROD -> STAGE, each
+    tagged with the section heading it sits under.
+
+    One pass replaces the three narrowly-guarded checks. For each PROD table it
+    finds the STAGE table with the most cell-content in common, then reports:
+
+      * columns present in PROD's header that STAGE's header does not carry;
+      * columns in a different order;
+      * PROD body rows whose label is absent from the whole STAGE document
+        (the row was dropped, not merely re-laid-out);
+      * a PROD cell value missing from the paired STAGE row (and from STAGE
+        entirely) -- an emptied Range/spec cell;
+      * a grid-shape change (STAGE merges or splits cells).
+
+    Every finding carries {section, header, kind, detail, prod_page,
+    stage_page}. PROD is the baseline: columns/rows STAGE *adds* are not
+    reported.
+    """
+    if os.path.abspath(prod_path) == os.path.abspath(stage_path):
+        return []
+
+    _pd = fitz.open(prod_path); _pc = _pd.page_count; _pd.close()
+    _sd = fitz.open(stage_path); _sc = _sd.page_count; _sd.close()
+    p_ranges = _section_ranges(toc_results, "prod", _pc)
+    s_ranges = _section_ranges(toc_results, "stage", _sc)
+    stage_flat = _stage_flat_text(stage_path, stage_nav)
+
+    def _section_of(page, ranges):
+        name = ""
+        for title, a, b in ranges:
+            if a <= page <= b:
+                name = title
+        if not name and ranges:
+            name = min(ranges, key=lambda r: abs(r[1] - page))[0]
+        return name
+
+    def _tables(path, nav, ranges):
+        out = []
+        for pno, nrow, ncol, rows in _merge_continued_tables(
+                _crawl_tables(path, nav)):
+            if not rows or ncol < 2 or nrow < 2:
+                continue
+            head = [" ".join((c or "").split()) for c in rows[0]]
+            filled = [h for h in head if h]
+            if len(filled) < 2:
+                continue
+            body_rows = [[" ".join((c or "").split()) for c in r]
+                         for r in rows[1:]]
+            toks = set()
+            for r in body_rows:
+                for c in r:
+                    toks |= {t for t in _seq_tokens(c) if len(t) > 1}
+            if len(toks) < 4:
+                continue
+            out.append({
+                "page": pno, "ncol": ncol,
+                "head": filled,
+                "hkeys": [" ".join(_seq_tokens(h)) for h in filled],
+                "rows": body_rows, "toks": toks,
+                "section": _section_of(pno, ranges),
+            })
+        return out
+
+    P = _tables(prod_path, prod_nav, p_ranges)
+    S = _tables(stage_path, stage_nav, s_ranges)
+    if not P:
+        return []
+    s_head_keys = {k for st in S for k in st["hkeys"]}
+
+    # Pair PROD tables to STAGE tables, best overlap first.
+    scored = []
+    for pi, pt in enumerate(P):
+        for si, st in enumerate(S):
+            inter = len(pt["toks"] & st["toks"])
+            if inter:
+                scored.append((inter / len(pt["toks"] | st["toks"]), pi, si))
+    scored.sort(reverse=True)
+
+    findings, used_p, used_s = [], set(), set()
+
+    def _emit(pt, st, kind, detail):
+        findings.append({
+            "section": pt["section"] or (st["section"] if st else ""),
+            "header": " | ".join(pt["head"]),
+            "kind": kind, "detail": detail,
+            "prod_page": pt["page"],
+            "stage_page": st["page"] if st else 0,
+        })
+
+    for score, pi, si in scored:
+        if pi in used_p or si in used_s or score < _TABLE_PAIR_MIN:
+            continue
+        used_p.add(pi); used_s.add(si)
+        pt, st = P[pi], S[si]
+
+        # 1) columns PROD has that STAGE's header does not carry anywhere
+        gone = [h for h, k in zip(pt["head"], pt["hkeys"])
+                if k and k not in s_head_keys]
+        if gone:
+            _emit(pt, st, "column dropped",
+                  f"PROD column(s) {', '.join(repr(g) for g in gone)} are not "
+                  f"a heading in any STAGE table.")
+
+        # (column reordering and bare grid-count changes are not
+        #  reported: find_tables() orders and fragments the two pipelines'
+        #  tables differently and neither gives the reader a real defect.)
+
+        # 4) an option / Range list that STAGE does not carry. A bullet cell
+        #    ("• OFF • 10 min • 20 min • 30 min") either survives with its
+        #    values in STAGE or it does not — checked as the whole list in
+        #    order, and then value by value, against the entire STAGE document.
+        #    Prose Function cells are left to the sentence diff.
+        for pr in pt["rows"]:
+            cells = [c for c in pr if c]
+            if len(cells) < 2:
+                continue
+            label = pr[0] or cells[0]
+            for vc in cells[1:]:
+                if "•" not in vc:
+                    continue
+                opts = [o.strip() for o in re.split(r"[•\u2022]", vc)
+                        if len(o.strip()) > 1]
+                if len(opts) < 2:
+                    continue
+                joined = " ".join(opts)
+                if _phrase_present(joined, stage_flat, n=min(4, len(opts))):
+                    break        # the list is in STAGE, in order
+                gone = [o for o in opts if not _phrase_present(o, stage_flat, n=2)
+                        and f" {o.lower()} " not in stage_flat]
+                if len(gone) >= max(2, len(opts) - 1):
+                    _emit(pt, st, "option cell emptied",
+                          f"In the row for “{_trunc(label, 40)}”, STAGE does "
+                          f"not carry the option list “{_trunc(vc, 80)}”.")
+                break
+
+    return findings
+
+
+def _phrase_present(text: str, stage_flat: str, n: int = 5) -> bool:
+    """True when STAGE's flattened text carries this wording (see
+    _phrase_coverage) at 60% or more."""
+    return _phrase_coverage(text, stage_flat, n) >= 0.6
 
 def _table_shape_issues(prod_path, stage_path, prod_nav, stage_nav):
     """Tables whose column layout in STAGE does not match PROD's.
@@ -6828,10 +7044,23 @@ _FIX_ADVICE = {
                               "on the same line.",
                               "Break the paragraph onto its own line under the "
                               "label in STAGE, matching PROD."),
+    "Figure or menu label missing":
+                             ("Wording PROD prints as text — a diagram callout, "
+                              "an OSD menu label, a model-variant list — that "
+                              "STAGE does not carry as text anywhere. STAGE "
+                              "publishes these as pictures, so it is usually "
+                              "visible to a reader and only needs an eye on the "
+                              "figure; it is listed so nothing is hidden.",
+                              "Open the STAGE figure and confirm the wording is "
+                              "in the picture. If it is not, restore it."),
     "Content missing":       ("Text PROD carries under this topic is absent from "
                               "STAGE.",
                               "Restore the sentence in the STAGE topic, or confirm "
                               "it was withdrawn deliberately."),
+    "Content mismatch":      ("Text STAGE carries under the matched topic is not "
+                              "present in PROD for that topic.",
+                              "Move, remove, or rewrite the STAGE-only wording so "
+                              "the matched topic mirrors PROD."),
     "Hyperlink lost":        ("PROD links this text; STAGE publishes the same "
                               "words with no link on them.",
                               "Restore the hyperlink on this text in STAGE and "
@@ -7380,7 +7609,7 @@ _CATEGORIES = [
      "Characters that were published wrong, or text the page draws correctly but "
      "no machine can read."),
     ("content",   "Content differences",
-     "Wording PROD carries that STAGE does not."),
+     "Wording missing from STAGE, or STAGE-only wording inside a matched topic."),
     ("image",     "Image issues",
      "Figures, their labels, and the quality they are published at."),
     ("table",     "Table issues",
@@ -7397,6 +7626,8 @@ _ISSUE_CATEGORY = {
     "Text layer":            "encoding",
     "HTML entity":           "encoding",
     "Content missing":       "content",
+    "Figure or menu label missing": "content",
+    "Content mismatch":      "content",
     "Image label missing":   "image",
     "Diagram callout number missing": "image",
     "Image missing":         "image",
@@ -7462,6 +7693,8 @@ _REPORTED_ISSUES = (
     "Garbled",
     # missing
     "Content missing",
+    "Figure or menu label missing",
+    "Content mismatch",
     "Image label missing",
     "Diagram callout number missing",
     "Image missing",
@@ -7544,6 +7777,523 @@ def _section_page_index(toc_results, side: str):
             marks.append((pg, r["title"]))
     marks.sort(key=lambda t: t[0])
     return marks
+
+
+# Past this a "sentence" is a run of OSD menu labels with no punctuation, not
+# prose; substituting it for the fragment makes the finding worse, not better.
+_MAX_SENTENCE_CHARS = 400
+_DOC_SENT_CACHE = {}
+
+
+def _doc_sentences(pdf_path: str, nav_pages):
+    """([sentence, ...], [(sentence, token set), ...]) over a PDF's body text."""
+    key = (os.path.abspath(pdf_path), tuple(sorted(nav_pages or ())))
+    hit = _DOC_SENT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    parts = []
+    doc = fitz.open(pdf_path)
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in (nav_pages or ()):
+                continue
+            parts.append(_normalize(_strip_formatting(page.get_text())))
+    finally:
+        doc.close()
+    raw = re.sub(r"\s+", " ", " ".join(parts))
+    sents = [x.strip() for x in re.split(r"(?<=[.!?])\s+", raw) if x.strip()]
+    idx = [(x, set(_seq_tokens(x))) for x in sents]
+    if len(_DOC_SENT_CACHE) > 6:
+        _DOC_SENT_CACHE.clear()
+    _DOC_SENT_CACHE[key] = (sents, idx)
+    return sents, idx
+
+
+def _full_sentence_for(frag: str, sent_idx, min_cover: float = 0.6):
+    """The PROD sentence(s) a reported fragment came from, or None.
+
+    A fragment is whatever run of words came back uncovered, so it routinely
+    stops mid-sentence ("You can u your monitor.") or mid-word ("… settings
+    simultane"). That asks the reader to guess what was dropped. None means no
+    sentence PROD prints covers enough of it — the signature of a scrambled
+    draw-order run that never read that way in PROD at all.
+    """
+    ftoks = [t for t in _seq_tokens(frag) if len(t) > 1]
+    if len(ftoks) < 3 or not sent_idx:
+        return None
+    want = set(ftoks)
+    best_i, best_cov = None, 0.0
+    for i, (_sent, toks) in enumerate(sent_idx):
+        cov = len(want & toks) / len(want)
+        if cov > best_cov:
+            best_i, best_cov = i, cov
+    if best_i is None:
+        return None
+    span = [best_i]
+    for j in (best_i - 1, best_i + 1):
+        if 0 <= j < len(sent_idx):
+            cov = len(want & (sent_idx[best_i][1] | sent_idx[j][1])) / len(want)
+            if cov > best_cov:
+                span, best_cov = sorted([best_i, j]), cov
+    if best_cov < min_cover:
+        return None
+    out = " ".join(sent_idx[i][0] for i in span)
+    # A run of OSD menu labels has no punctuation to split on and survives as
+    # one long "sentence". Prose has function words; a label run does not.
+    words = re.findall(r"[A-Za-z][A-Za-z’'-]+", out)
+    lower = [w for w in words if w[0].islower()]
+    if len(lower) < 6 or not words or len(lower) / len(words) < 0.5:
+        return None
+    return out
+
+
+def _ai_confirm_missing(items, batch: int = 8):
+    """Ask the local model which content findings are genuinely missing.
+
+    ``items`` is [(id, prod_text, stage_text)]; returns the set of ids the model
+    judged genuinely absent from STAGE. Every id is kept when the model is
+    unreachable or its answer cannot be parsed — the AI narrows the report, it
+    never becomes the reason a real difference is dropped.
+
+    Set VALIDATOR_AI_CONFIRM=0 to skip this pass.
+    """
+    ids = {i for i, _p, _s in items}
+    if not items or os.environ.get("VALIDATOR_AI_CONFIRM", "").strip() == "0":
+        return ids
+    try:
+        import urllib.request as _u
+        from content_validation import ai_validate as _ai
+        _u.urlopen(_ai.OLLAMA_HOST + "/api/version", timeout=4).read()
+    except Exception as exc:
+        print(f"  AI confirm: model unreachable, keeping all findings ({exc})")
+        return ids
+
+    sysmsg = (
+        "You compare two revisions of a product manual. PROD is the baseline; "
+        "STAGE should carry the same content. For each numbered item you get "
+        "the PROD wording and the STAGE wording found in its place.\n"
+        "Answer PRESENT if STAGE states the same thing in any wording, or if "
+        "the PROD text is not a real sentence (a run of diagram labels, menu "
+        "names or part numbers, or scrambled words with no grammar).\n"
+        "Answer MISSING only if the PROD text is a readable statement that "
+        "STAGE does not make at all. When genuinely unsure, answer MISSING so "
+        "a real difference is never lost.\n"
+        'Reply with JSON only: {"r":[{"i":<id>,"v":"MISSING"|"PRESENT"}]}')
+
+    dropped = set()
+    for base in range(0, len(items), batch):
+        chunk = items[base:base + batch]
+        body = "\n\n".join(
+            f"[{i}]\nPROD: {(pt or '')[:600]}\nSTAGE: {(st or '(nothing found)')[:600]}"
+            for i, pt, st in chunk)
+        try:
+            req = _u.Request(
+                _ai.OLLAMA_HOST + "/api/generate",
+                data=json.dumps({
+                    "model": _ai.OLLAMA_MODEL, "system": sysmsg,
+                    "prompt": body, "stream": False, "format": "json",
+                    "options": {"temperature": 0, "num_ctx": 8192,
+                                "num_predict": 400}}).encode(),
+                headers={"Content-Type": "application/json"})
+            raw = json.loads(_u.urlopen(req, timeout=240).read())["response"]
+        except Exception as exc:
+            print(f"  AI confirm: batch skipped, findings kept ({exc})")
+            continue
+        for m in re.finditer(r'"i"\s*:\s*(\d+)\s*,\s*"v"\s*:\s*"([A-Za-z]+)"',
+                             raw):
+            if m.group(2).upper().startswith("PRESENT"):
+                dropped.add(int(m.group(1)))
+    kept = ids - dropped
+    print(f"  AI confirm: {len(kept)}/{len(ids)} content finding(s) confirmed "
+          f"missing, {len(dropped)} dropped as present in STAGE")
+    return kept
+
+
+# ── Content comparison by fuzzy sentence matching (rapidfuzz) ────────────────
+# Shingle/n-gram coverage answers "do these characters appear somewhere", which
+# is not the question. The question is "does STAGE make this statement", and
+# that is a nearest-neighbour problem: for each PROD sentence, find the STAGE
+# sentence closest to it and look at how close. rapidfuzz does 640k comparisons
+# in ~0.3s, so the whole document is compared sentence-to-sentence, and the
+# match it returns is the STAGE wording to show beside PROD's.
+# WRatio, not token_set_ratio. token_set compares token *sets*, so it scores
+# "Use or to select Input" against "Use or to select KVM Switch" at 89 — the one
+# word that carries the meaning is the one it ignores. Measured over known
+# cases, WRatio puts every genuine gap at 86 and every same-content pair at 99,
+# which is a real gap to put a threshold in; token_set overlapped (89 vs 87) and
+# was silently hiding genuine differences.
+_FUZZ_THRESHOLD = 90       # best-match score below this = STAGE does not say it
+# 4, not 6: "2. Use or to select Input" and "Remove the monitor stand." are
+# content. A six-word floor silently hid 34 genuinely absent items per manual.
+_FUZZ_MIN_WORDS = 4
+
+
+def _squash_punct_space(text: str) -> str:
+    """Drop spacing around punctuation so "region/ country" == "region/country"."""
+    return re.sub(r"\s*([/:;,.()\u2013\u2014-])\s*", r"\1", text or "").strip()
+
+
+def _fuzz_sentences(pdf_path: str, nav_pages):
+    """Body sentences of a PDF, with hyphenation healed."""
+    parts = []
+    doc = fitz.open(pdf_path)
+    try:
+        for i, page in enumerate(doc, 1):
+            if i in (nav_pages or ()):
+                continue
+            parts.append(_normalize(_strip_formatting(page.get_text())))
+    finally:
+        doc.close()
+    raw = re.sub(r"\s+", " ", " ".join(parts))
+    # "sup- plies" is one word split across a line break, not two.
+    raw = raw.replace("- ", "")
+    try:
+        import pysbd
+        pieces = pysbd.Segmenter(language="en", clean=False).segment(raw)
+    except Exception:
+        # A regex split mis-cuts on "e.g.", "1.4", "Fig. 2" and every model
+        # number in these manuals; pysbd is only a fallback away from that.
+        pieces = re.split(r"(?<=[.!?])\s+", raw)
+    return [x.strip() for x in pieces if len(x.split()) >= _FUZZ_MIN_WORDS]
+
+
+def _deleted_spans(prod_sent: str, stage_sent: str):
+    """The runs of PROD words that STAGE's nearest sentence does not contain.
+
+    Two sentences can match closely and still have a clause dropped — "move the
+    controller to the directions instructed by the on-screen icons" against
+    "follow the onscreen icons". Sentence-level scoring calls that present; a
+    word-level diff finds the gap. diff-match-patch is run per word (each word
+    mapped to a line) so the spans come back as phrases, not characters.
+    """
+    try:
+        from diff_match_patch import diff_match_patch
+    except ImportError:
+        return []
+    dmp = diff_match_patch()
+    la, lb, arr = dmp.diff_linesToChars(prod_sent.replace(" ", "\n"),
+                                        stage_sent.replace(" ", "\n"))
+    diffs = dmp.diff_main(la, lb, False)
+    dmp.diff_charsToLines(diffs, arr)
+    return [t.replace("\n", " ").strip() for op, t in diffs if op == -1]
+
+
+def _is_label_run(text: str) -> bool:
+    """True for a run of OSD/diagram labels rather than a sentence.
+
+    STAGE publishes the OSD menus as screenshots, so their labels live in its
+    pixels and not in its text layer. PROD sets the same labels as text. Every
+    one of those runs therefore looks like missing content and none of it is.
+    Prose carries function words; a label run does not.
+    """
+    words = re.findall(r"[A-Za-z][A-Za-z\u2019'-]+", text or "")
+    if len(words) < 4:
+        return True
+    lower = [w for w in words if w[0].islower()]
+    return len(lower) / len(words) < 0.5
+
+
+_STAGE_NORM_CACHE = {}
+
+
+def _norm_flat(text: str) -> str:
+    """Whitespace- and punctuation-flattened lowercase text, space-padded."""
+    return " " + re.sub(r"\s+", " ",
+                        re.sub(r"[^a-z0-9]+", " ", (text or "").lower())).strip() + " "
+
+
+def _stage_flat_text(pdf_path: str, nav_pages) -> str:
+    """The whole STAGE document as one flattened string, cached."""
+    key = (os.path.abspath(pdf_path), tuple(sorted(nav_pages or ())))
+    hit = _STAGE_NORM_CACHE.get(key)
+    if hit is not None:
+        return hit
+    doc = fitz.open(pdf_path)
+    try:
+        raw = " ".join(page.get_text() for i, page in enumerate(doc, 1)
+                       if i not in (nav_pages or ()))
+    finally:
+        doc.close()
+    out = _norm_flat(raw)
+    if len(_STAGE_NORM_CACHE) > 4:
+        _STAGE_NORM_CACHE.clear()
+    _STAGE_NORM_CACHE[key] = out
+    return out
+
+
+def _phrase_coverage(sentence: str, stage_flat: str, n: int = 6) -> float:
+    """Fraction of a PROD sentence's n-word phrases that occur verbatim in STAGE.
+
+    This, not a similarity score, is the right presence test. rapidfuzz scores
+    penalise length: when STAGE merges two sentences where PROD has one, a PROD
+    sentence that is present *word for word* still scored 89 and was reported
+    missing. Nine of sixteen PD20U findings were false for exactly that reason.
+    Containment has no length bias — either STAGE prints those words in that
+    order or it does not.
+    """
+    w = re.sub(r"[^a-z0-9]+", " ", (sentence or "").lower()).split()
+    if not w:
+        return 1.0
+    if len(w) < n:
+        return 1.0 if f" {' '.join(w)} " in stage_flat else 0.0
+    grams = [" ".join(w[i:i + n]) for i in range(len(w) - n + 1)]
+    return sum(1 for g in grams if f" {g} " in stage_flat) / len(grams)
+
+
+def _is_interleaved(text: str) -> bool:
+    """True when a run repeats its own phrases — the signature of column
+    interleaving, not of anything a reader would see.
+
+    PROD lays these manuals out in columns and the extractor reads across them,
+    welding two columns into one line: "Picture with the Picture with the
+    setting from Color > Color setting from Color > DualView". No sentence in a
+    manual repeats a three-word phrase inside itself, so the repeat is the
+    tell. Such a run never read that way on the page, so a comparison against
+    it says nothing about whether STAGE dropped content.
+    """
+    w = [x.lower() for x in re.findall(r"[A-Za-z]{2,}", text or "")]
+    if len(w) < 4:
+        return False
+    tri = [" ".join(w[i:i + 3]) for i in range(len(w) - 2)]
+    if len(tri) != len(set(tri)):
+        return True
+    bi = [" ".join(w[i:i + 2]) for i in range(len(w) - 1)]
+    return len(bi) - len(set(bi)) >= 2
+
+
+def _toc_content_gaps(prod_path, stage_path, prod_nav, stage_nav,
+                      toc_results, prod_sections, stage_sections, stage_lookup,
+                      threshold: int = _FUZZ_THRESHOLD):
+    """Walk the TOC in order and compare each topic's content, PROD vs STAGE.
+
+    For every TOC heading, PROD's slice (the heading and its paragraphs, up to
+    the next heading) is compared sentence-by-sentence against STAGE's slice of
+    the same heading. A PROD sentence with no close counterpart there is a gap.
+
+    Before it is reported, the sentence is checked against the WHOLE STAGE
+    document: STAGE cuts these manuals into roughly twice as many headings, so
+    wording that merely moved under a neighbouring heading must not read as
+    deleted. Only wording STAGE does not carry anywhere is returned.
+
+    Each gap carries the topic it belongs to, its TOC level, the PROD and STAGE
+    pages, the PROD wording, and the closest STAGE wording in that topic.
+    """
+    try:
+        from rapidfuzz import process as _rf_process, fuzz as _rf_fuzz
+    except ImportError:
+        print("  TOC content diff: rapidfuzz not installed, skipped")
+        return []
+
+    stage_all = _fuzz_sentences(stage_path, stage_nav)
+    if not stage_all:
+        return [], {}
+    stage_flat = _stage_flat_text(stage_path, stage_nav)
+
+    def _split(text):
+        body = re.sub(r"\s+", " ", (text or "")).replace("- ", "")
+        try:
+            import pysbd
+            pieces = pysbd.Segmenter(language="en", clean=False).segment(body)
+        except Exception:
+            pieces = re.split(r"(?<=[.!?])\s+", body)
+        return [x.strip() for x in pieces if len(x.split()) >= _FUZZ_MIN_WORDS]
+
+    heads = {" ".join(_seq_tokens(t)) for t in (prod_sections or {})}
+    heads.discard("")
+
+    def _gap_ok(gap, near):
+        toks = _seq_tokens(gap)
+        # One real word is a difference. A floor of four silently passed over
+        # 300+ single- and two-word drops per manual — a spec losing "65W", a
+        # step losing "not". Completeness is the requirement here.
+        if len([t for t in toks if re.fullmatch(r"[a-z]{2,}", t)]) < 1:
+            return False        # punctuation or digits only, no wording lost
+        if len([t for t in toks if t.isdigit()]) / max(1, len(toks)) > 0.6:
+            return False        # a page number that ran into the text flow
+        key = " ".join(toks)
+        if any(key in h or h in key for h in heads):
+            return False
+        if _MIXED_SCRIPT_RE.search(gap):
+            return False
+        real = [t for t in toks if re.fullmatch(r"[a-z]{2,}", t)]
+        if len(real) < 4:
+            # A short span is part of a sentence, not a run of its own. Two
+            # checks that make sense for a whole run are wrong here and were
+            # discarding every one of them: _is_label_run calls anything under
+            # four words a label, and "does this appear elsewhere in STAGE"
+            # is always true of a common word. The question for a short span is
+            # only whether the paired STAGE sentence carries those words.
+            have = set(_seq_tokens(near))
+            return any(t not in have for t in real)
+        if _is_label_run(gap):
+            return False
+        if _rf_fuzz.WRatio(gap, near) >= 85:
+            return False
+        return _rf_process.extractOne(
+            gap, stage_all, scorer=_rf_fuzz.WRatio)[1] < 88
+
+    out, seen, stats = [], set(), {}
+    for r in (toc_results or []):
+        if r.get("toc_status") == "Extra in Stage":
+            continue                       # no PROD counterpart to compare
+        title = r.get("title") or ""
+        p_text = prod_sections.get(title) or ""
+        if not p_text or _is_skipped_section(title):
+            continue
+        s_text = (stage_sections.get(title)
+                  or stage_lookup.get(_norm_key(title)) or "")
+        p_sents = _split(p_text)
+        if not p_sents:
+            continue
+        # Compare against this topic in STAGE; fall back to the whole document
+        # when STAGE has no slice under this heading at all.
+        s_sents = _split(s_text) or stage_all
+        scores = _rf_process.cdist(p_sents, s_sents,
+                                   scorer=_rf_fuzz.WRatio, workers=-1)
+        # Coverage on the same measure the findings use, so the two agree.
+        # in_topic: STAGE says it under this heading.
+        # anywhere: STAGE says it at all — the number that answers "is content
+        # missing". The difference between them is content that moved.
+        _doc = _rf_process.cdist(p_sents, stage_all,
+                                 scorer=_rf_fuzz.WRatio, workers=-1)
+        _n = len(p_sents)
+        _in_topic = int((scores.max(axis=1) >= threshold).sum())
+        _anywhere = int((_doc.max(axis=1) >= threshold).sum())
+        stats[title] = {
+            "sentences": _n,
+            "in_topic_pct": round(100.0 * _in_topic / _n, 1),
+            "anywhere_pct": round(100.0 * _anywhere / _n, 1),
+            "moved": _anywhere - _in_topic,
+            "absent": _n - _anywhere,
+        }
+        for i, sent in enumerate(p_sents):
+            row = scores[i]
+            j = int(row.argmax())
+            best = float(row[j])
+            near = s_sents[j]
+            if _MIXED_SCRIPT_RE.search(sent):
+                continue          # OSD language list: not comparable at all
+            if _is_interleaved(sent):
+                continue          # two columns welded together by the extractor
+            # A label run is still content PROD prints and STAGE does not carry
+            # as text. It is tagged rather than dropped, so the report can group
+            # it separately instead of hiding it.
+            _label = _is_label_run(sent)
+            # Containment decides presence; the fuzzy score only decides which
+            # STAGE sentence to show beside it.
+            _cov = _phrase_coverage(sent, stage_flat)
+            if _cov >= 0.9:
+                continue          # STAGE prints this wording
+            if _cov > 0:
+                # Mostly present: report the spans this STAGE sentence drops.
+                # The scope is the paired sentence, NOT the whole document:
+                # "BenQ" changed to "ABC" here is a real loss even though the
+                # word "BenQ" still appears elsewhere in the manual. _gap_ok
+                # already checks the span against `near`.
+                for gap in _deleted_spans(sent, near):
+                    _gk = " ".join(_seq_tokens(gap))
+                    _sk = " ".join(_seq_tokens(sent))
+                    if not _gk or _sk in seen:
+                        continue
+                    if not _gap_ok(gap, near):
+                        continue
+                    # ...but a span that IS printed verbatim somewhere in STAGE
+                    # in a run of its own (a whole phrase re-homed, not a word
+                    # swapped) is a move, not a loss.
+                    if len(_seq_tokens(gap)) >= 4 and _phrase_coverage(
+                            gap, stage_flat, n=4) >= 0.8:
+                        continue
+                    seen.add(_sk)
+                    out.append({"title": title, "level": r.get("level"),
+                                "prod_page": r.get("prod_page"),
+                                "stage_page": r.get("stage_page"),
+                                "prod": sent, "stage": near, "score": best,
+                                "kind": "part", "gap": gap})
+                    break
+                continue
+            if False:
+                # A clause can still be dropped inside a near match.
+                if best < 100:
+                    # Several spans can be dropped from one sentence. The
+                    # finding is the sentence, so it is reported once with
+                    # every dropped span marked inside it.
+                    _gaps = [g for g in _deleted_spans(sent, near)
+                             if _gap_ok(g, near)]
+                    _sk = " ".join(_seq_tokens(sent))
+                    if _gaps and _sk and _sk not in seen:
+                        seen.add(_sk)
+                        for gap in _gaps[:1]:
+                            # Report the whole sentence, not the bare span.
+                            # "move the controller to" on its own says nothing;
+                            # the renderer marks the dropped words inside the
+                            # sentence, which is what a reader can act on.
+                            out.append({
+                                "title": title, "level": r.get("level"),
+                                "prod_page": r.get("prod_page"),
+                                "stage_page": r.get("stage_page"),
+                                "prod": sent, "stage": near, "score": best,
+                                "kind": "part", "gap": "; ".join(_gaps)})
+                continue
+            # Not in this topic — but is it anywhere in STAGE?
+            elsewhere = _rf_process.extractOne(
+                sent, stage_all, scorer=_rf_fuzz.WRatio)
+            if elsewhere and elsewhere[1] >= threshold:
+                continue                   # moved to another heading, not lost
+            k = " ".join(_seq_tokens(sent))
+            if not k or k in seen:
+                continue
+            if any(_rf_fuzz.ratio(sent, o["prod"]) >= 97 for o in out):
+                continue               # the identical sentence, already reported
+            seen.add(k)
+            # Show the closest STAGE wording in the whole document when it beats
+            # anything in the topic. Pairing a finding against the least-bad
+            # sentence of one section produced comparisons like "Never stand your
+            # monitor…" against a packing list; the real nearest sentence is what
+            # tells the reader whether this is a rewrite or a deletion.
+            if elsewhere and elsewhere[1] > best:
+                near, best = elsewhere[0], float(elsewhere[1])
+            out.append({"title": title, "level": r.get("level"),
+                        "prod_page": r.get("prod_page"),
+                        "stage_page": r.get("stage_page"),
+                        "prod": sent, "stage": near, "score": best,
+                        "kind": "label" if _label else "whole"})
+    return out, stats
+
+
+def _stage_counterpart(sentence: str, sent_idx, min_cover: float = 0.35):
+    """The STAGE sentence that answers a PROD sentence, or None.
+
+    "STAGE does not have this" is only half an answer: the reader still has to
+    open both PDFs to see what STAGE says instead. The nearest STAGE sentence
+    by token overlap is reported alongside, so the finding shows the two
+    versions together. None means STAGE has nothing resembling it at all,
+    which is itself the more serious finding.
+    """
+    want = {t for t in _seq_tokens(sentence or "") if len(t) > 1}
+    if not want or not sent_idx:
+        return None
+    best, best_cov = None, 0.0
+    for sent, toks in sent_idx:
+        cov = len(want & toks) / len(want)
+        if cov > best_cov:
+            best, best_cov = sent, cov
+    return best if best_cov >= min_cover else None
+
+
+def _mark_absent_words(prod_sent: str, stage_sent: str) -> str:
+    """PROD's sentence with the words STAGE does not carry picked out in red."""
+    have = {t for t in _seq_tokens(stage_sent or "")}
+    out = []
+    for piece in re.split(r"(\s+)", prod_sent or ""):
+        if not piece.strip():
+            out.append(piece)
+            continue
+        key = " ".join(_seq_tokens(piece))
+        if key and key not in have:
+            out.append(f"<font color='#b71c1c'><b>{_esc(piece)}</b></font>")
+        else:
+            out.append(_esc(piece))
+    return "".join(out)
 
 
 def generate_report(prod_path, stage_path, toc_results, content_results,
@@ -7819,7 +8569,7 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             r[field] = kept
     diff_rows = [r for r in diff_rows if r.get("missing") or r.get("extra")]
     n_cmiss = sum(len(r.get("missing", [])) for r in diff_rows)
-    n_cxtra = 0     # "extra in STAGE" is not reported: PROD is the reference
+    n_cxtra = sum(len(r.get("extra", [])) for r in diff_rows)
     n_only_prod  = sum(1 for r in toc_results if r["toc_status"] == "Missing in Stage")
     n_only_stage = sum(1 for r in toc_results if r["toc_status"] == "Extra in Stage")
     n_label = sum(f.get("_count", 1) for f in label_findings)
@@ -8297,19 +9047,25 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             row_bit = (f" the row for <b>{_esc(_trunc(rlab, 70))}</b>"
                        if rlab else " one row")
             if f.get("whole_cell", True):
-                detail = (f"<b>PROD page {_pp}</b> — in {where_tbl},"
-                          f"{row_bit} contains<br/>"
+                detail = (f"<b>PROD PDF section:</b> {_esc(_sect)}<br/>"
+                          f"<b>PROD page:</b> {_pp}<br/>"
+                          f"<b>Table location:</b> {where_tbl},{row_bit}<br/>"
+                          f"<b>Missing table cell text from PROD:</b><br/>"
                           f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 240))}"
                           f"</b></font><br/>"
-                          f"<b>STAGE's copy of that row does not carry this "
-                          f"text anywhere.</b>")
+                          f"<b>Problem:</b> STAGE's matched table row does not "
+                          f"carry this cell text. The detector also checks that "
+                          f"it is not simply present elsewhere as body text or "
+                          f"inside artwork before reporting it.")
             else:
-                detail = (f"<b>PROD page {_pp}</b> — in {where_tbl},"
-                          f"{row_bit} lists the value<br/>"
+                detail = (f"<b>PROD PDF section:</b> {_esc(_sect)}<br/>"
+                          f"<b>PROD page:</b> {_pp}<br/>"
+                          f"<b>Table location:</b> {where_tbl},{row_bit}<br/>"
+                          f"<b>Missing table value from PROD:</b><br/>"
                           f"<font color='#b71c1c'><b>{_esc(_trunc(f['text'], 200))}"
                           f"</b></font><br/>"
-                          f"<b>That value is missing from STAGE</b> — the rest "
-                          f"of the row's values are present.")
+                          f"<b>Problem:</b> That value is missing from STAGE, "
+                          f"while the rest of the row's values are present.")
             add("Table cell missing",
                 f"PROD p{_pp} · row {f.get('row', '?')}{_stage_span(_sect)}",
                 f"Table under “{_esc(_sect)}”, PROD page {_pp}", detail,
@@ -8392,6 +9148,29 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
         # the AI cross-check found the row on — parse them out rather than
         # re-deriving, and drop the prefix from the text shown to the reader.
         _ai_pg_re = re.compile(r"^\(AI\)\s*p(\d+)(?:\s*\(STAGE p(\d+)\))?\s*[:-]\s*")
+        try:
+            _, _sent_idx = _doc_sentences(prod_path, prod_nav_pages)
+        except Exception as _e:
+            print(f"  sentence expansion unavailable: {_e}")
+            _sent_idx = []
+        try:
+            _, _stage_sent_idx = _doc_sentences(stage_path, stage_nav_pages)
+        except Exception as _e:
+            print(f"  STAGE side-by-side unavailable: {_e}")
+            _stage_sent_idx = []
+        try:
+            _pd = fitz.open(prod_path)
+            _praw = " ".join(_normalize(_strip_formatting(_pd[i].get_text()))
+                             for i in range(_pd.page_count)
+                             if (i + 1) not in (prod_nav_pages or ()))
+            _pd.close()
+            _prod_tok_idx = _stage_seq_index(
+                _s_norm(re.sub(r"\s+", " ", _praw)).lower())
+        except Exception as _e:
+            print(f"  PROD scramble check unavailable: {_e}")
+            _prod_tok_idx = {}
+        _n_expanded = _n_dropped = 0
+        _pending = []          # (id, where, section, body, frag, prod, stage)
         for r in diff_rows:
             _pp0 = _pageno(r.get("prod_page"))
             _stage_where = (_stage_span(r["title"]).lstrip(" /")
@@ -8408,10 +9187,106 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                     frag = disp = m
                     _pp = _true_page(prod_path, m, _pp0, prod_nav_pages) or _pp0
                     where = f"PROD p{_pp} / {_stage_where}"
-                add("Content missing", where, _esc(r["title"]),
-                    f"In PROD, absent from STAGE: <font color='#b71c1c'>"
-                    f"{_highlight_notice_labels(_trunc(disp, 300))}</font>", fail_s,
-                    probe=frag)
+                section_name = _esc(r["title"])
+                # Report the whole sentence PROD prints, not the run the
+                # matcher happened to stop on. A run no PROD sentence covers
+                # never read that way in PROD and is not reported at all.
+                _shown = re.sub(r"^\(AI\)\s*", "", disp)
+                _row_finding = _shown.lstrip().startswith("table \u201c")
+                if _row_finding and _prod_tok_idx:
+                    # "[s n tructio fety ins sa] ents tory lam Regu State" is a
+                    # draw-order scramble of "Safety Instructions / Regulatory
+                    # Statements", not a cell STAGE dropped. A real cell reads
+                    # that way in PROD.
+                    _cell = re.sub(r"^.*?STAGE is missing:\s*", "", disp)
+                    _cell = re.sub(r"\[[^\]]*\]", " ", _cell)
+                    _ct = [t for t in _seq_tokens(_cell) if len(t) > 1]
+                    if len(_ct) >= 3 and not _seq_present(
+                            _prod_tok_idx, _ct, max_gap=6):
+                        _n_dropped += 1
+                        continue
+                # Findings from the fuzzy TOC walk are already whole PROD
+                # sentences and carry their own STAGE counterpart, so the
+                # shingle-era expansion must not touch them. It was silently
+                # dropping every one it could not map back to a prose sentence
+                # — which is all of the figure/menu label text — and that is
+                # what cut 50 findings down to 18 before the report.
+                _from_fuzzy = _shown in (r.get("pairs") or {})
+                _full = None if _from_fuzzy else _full_sentence_for(frag, _sent_idx)
+                if _full and len(_full) <= _MAX_SENTENCE_CHARS:
+                    if _seq_tokens(_full) != _seq_tokens(disp):
+                        _n_expanded += 1
+                    disp = (f"(AI) {_full}" if disp.startswith("(AI) ")
+                            else _full)
+                elif (not _full and not _from_fuzzy and _sent_idx
+                      and not _row_finding):
+                    # No sentence PROD prints covers this run, so it never read
+                    # that way in PROD: draw-order scramble ("Picture with the
+                    # picture with the setting from color color setting from
+                    # color dualview"), not dropped content. Table-row findings
+                    # are exempt — they name cells, not sentences.
+                    _n_dropped += 1
+                    continue
+                # Both sides, not just PROD's: the STAGE paragraph that answers
+                # this one, with the words STAGE dropped picked out in red.
+                # "not found in STAGE" alone left the reader to open both PDFs
+                # to see what STAGE actually says in its place.
+                # A table-row finding already names the row and the cells STAGE
+                # dropped. Pairing it with a "sentence" pulls in the whole
+                # table, which buries the one row the finding is about.
+                _is_row = _shown.lstrip().startswith("table \u201c")
+                _counter = (r.get("pairs") or {}).get(_shown)
+                if _counter is None:
+                    _counter = (None if _is_row
+                                else _stage_counterpart(_shown, _stage_sent_idx))
+                if _counter:
+                    _body = (
+                        f"<b>Missing from STAGE:</b> "
+                        f"{_mark_absent_words(_trunc(_shown, 700), _counter)}"
+                        f"<br/><b>STAGE has instead:</b> "
+                        f"{_highlight_notice_labels(_trunc(_counter, 700))}")
+                elif _is_row:
+                    _body = (f"<font color='#b71c1c'>"
+                             f"{_highlight_notice_labels(_trunc(_shown, 700))}"
+                             f"</font>")
+                else:
+                    _body = (
+                        f"<b>Missing from STAGE:</b> <font color='#b71c1c'>"
+                        f"{_highlight_notice_labels(_trunc(_shown, 700))}"
+                        f"</font><br/><b>STAGE has instead:</b> "
+                        f"<font color='#b71c1c'><b>nothing on this topic"
+                        f"</b></font>")
+                _kind = (r.get("kinds") or {}).get(_shown, "whole")
+                _issue = ("Figure or menu label missing" if _kind == "label"
+                          else "Content missing")
+                _pending.append((len(_pending), where, section_name, _body,
+                                 frag, _shown, _counter or "", _issue))
+            # Wording STAGE carries that PROD does not is NOT reported: PROD is
+            # the reference, and the question this report answers is what STAGE
+            # dropped. The "extra" list is still computed, just not shown.
+
+        # Last word on every content finding goes to the local model: it sees
+        # the PROD wording and the STAGE wording found in its place, and drops
+        # the ones STAGE actually says in different words. Mechanical matching
+        # cannot tell a rewrite from a deletion; this can. It only ever removes
+        # findings — an unreachable model leaves the list untouched.
+        # AI vetting is OFF. It was dropping roughly half the findings on a
+        # local-model judgement call, and the requirement here is completeness:
+        # every difference goes in the report and a human decides. Set
+        # VALIDATOR_AI_CONFIRM=1 to turn it back on.
+        if os.environ.get("VALIDATOR_AI_CONFIRM", "").strip() == "1":
+            _keep_ids = _ai_confirm_missing(
+                [(pid, prod_txt, stage_txt)
+                 for pid, _w, _sec, _b, _f, prod_txt, stage_txt, _i in _pending])
+        else:
+            _keep_ids = {p[0] for p in _pending}
+
+        # Prose gaps first; figure/menu label text after, so a reader meets the
+        # sentences STAGE dropped before the label runs STAGE renders as images.
+        for pid, _where, _sec, _b, _frag, _pt, _st, _issue in sorted(
+                _pending, key=lambda x: x[7] != "Content missing"):
+            if pid in _keep_ids:
+                add(_issue, _where, _sec, _b, fail_s, probe=_frag)
 
 
         # ── Summary: how many of each kind ──
@@ -8421,6 +9296,7 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             f"<b>{len(diff_rows)}</b> section(s) with content issues</font> &middot; "
             f"<font color='#e65100'><b>{_n_toc_miss}</b> section(s) missing in "
             f"STAGE</font> &middot; <b>{n_cmiss}</b> content fragment(s) dropped "
+            f"&middot; <b>{n_cxtra}</b> content mismatch fragment(s) "
             f"&middot; <b>{total_issues}</b> issue(s) total",
             ParagraphStyle("MetricsLine", parent=styles["Normal"], fontSize=9,
                            leading=12, spaceAfter=6)))
@@ -8457,11 +9333,67 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
             story += [sm, Spacer(1, 4)]
 
         # ── One section per category ──
+        # Content first, and never in a table: a content finding is two whole
+        # sentences shown against each other, and a 288pt "Detail" cell wrapped
+        # them over a dozen lines and clipped the long ones.
+        present = sorted(present, key=lambda c: c[0] != "content")
         for key, title, blurb in present:
             story.append(Paragraph(title, head_s))
             story.append(Paragraph(blurb, ParagraphStyle(
                 "CatBlurb", parent=styles["Normal"], fontSize=8,
                 textColor=colors.grey, spaceAfter=6)))
+
+            if key == "content" and buckets[key]:
+                _hdr = ParagraphStyle(
+                    "CHdr", parent=styles["Normal"], fontSize=9, leading=12,
+                    textColor=colors.HexColor("#37474f"), spaceBefore=4,
+                    spaceAfter=2)
+                _body_s = ParagraphStyle(
+                    "CBody", parent=styles["Normal"], fontSize=9, leading=13.5,
+                    leftIndent=18, spaceAfter=10)
+                story.append(Paragraph(
+                    "Every topic in the PROD table of contents was compared "
+                    "against the same topic in STAGE, heading by heading. Each "
+                    "finding below names the topic and the pages, the wording "
+                    "PROD carries there, and the nearest wording STAGE has in "
+                    "its place. <font color='#b71c1c'><b>Red</b></font> marks "
+                    "what STAGE does not carry. A sentence that merely moved "
+                    "to another STAGE heading is not listed.",
+                    ParagraphStyle("CNote", parent=styles["Normal"], fontSize=8,
+                                   leading=11, spaceAfter=8,
+                                   textColor=colors.HexColor("#1e3a5f"))))
+                _seen_label_hdr = False
+                for idx, (issue, where, topic, detail, style, probe) in enumerate(
+                        buckets[key], 1):
+                    # Figure/menu label text is listed too — nothing absent from
+                    # STAGE is hidden — but under its own heading, so the
+                    # sentences STAGE dropped are not buried under label runs.
+                    if issue.startswith("Figure or menu label") and not _seen_label_hdr:
+                        _seen_label_hdr = True
+                        story.append(Spacer(1, 6))
+                        story.append(Paragraph(
+                            "Figure and menu label text", ParagraphStyle(
+                                "CLblHdr", parent=styles["Normal"], fontSize=9.5,
+                                leading=13, spaceBefore=6, spaceAfter=2,
+                                textColor=colors.HexColor("#37474f"))))
+                        story.append(Paragraph(
+                            "Wording PROD prints as text that STAGE does not "
+                            "carry as text anywhere — diagram callouts, OSD menu "
+                            "labels, model-variant lists. STAGE publishes these "
+                            "as pictures, so each is usually visible in the "
+                            "figure; check the figure rather than the text.",
+                            ParagraphStyle("CLblNote", parent=styles["Normal"],
+                                           fontSize=8, leading=11, spaceAfter=6,
+                                           textColor=colors.HexColor("#6b7280"))))
+                    story.append(KeepTogether([
+                        Paragraph(f"<b>C{idx}</b> &nbsp; {topic}"
+                                  f" &nbsp;<font size='7.5' color='#6b7280'>"
+                                  f"{_esc(where)}</font>", _hdr),
+                        Paragraph(detail, _body_s),
+                    ]))
+                story.append(Spacer(1, 8))
+                continue
+
             rows = [[Paragraph(f"<b>{h}</b>", hdr_s) for h in
                      ["#", "Section", "Where", "Issue", "Detail",
                       "What it means &amp; how to fix it"]]]
@@ -8783,20 +9715,28 @@ def validate(prod_path, stage_path, report_path):
         
         # Also try stage by matching key in case titles differ slightly
         sc    = stage_sections.get(title) or stage_lookup.get(key) or ""
+        if sc:
+            cmp_ns, cmp_cset, cmp_full_lower = _text_compare_index(sc)
+        else:
+            cmp_ns, cmp_cset, cmp_full_lower = stage_ns, stage_cset, stage_full_lower
         coverage, missing = _section_missing(
-            prod_words, stage_ns, stage_cset, stage_full_lower,
-            stage_section_lower=_s_norm(sc or "").lower(),
-            source_idx=prod_seq_idx)
+            prod_words, cmp_ns, cmp_cset, cmp_full_lower,
+            stage_section_lower=cmp_full_lower,
+            source_idx=prod_seq_idx,
+            min_frag_words=SECTION_MIN_FRAG_WORDS,
+            doc_full_lower=stage_full_lower)
 
         # Reverse direction: text STAGE renders under this heading that PROD
         # never had. Same verification, sides swapped.
         stage_words = _keep(_tokenize(sc or ""))
         extra = []
         if stage_words:
+            pcmp_ns, pcmp_cset, pcmp_full_lower = _text_compare_index(pc or "")
             _, extra = _section_missing(
-                stage_words, prod_ref_ns, prod_ref_cset, prod_ref_full,
-                stage_section_lower=_s_norm(pc or "").lower(),
-                source_idx=stage_raw_idx)
+                stage_words, pcmp_ns, pcmp_cset, pcmp_full_lower,
+                stage_section_lower=pcmp_full_lower,
+                source_idx=stage_raw_idx,
+                min_frag_words=SECTION_MIN_FRAG_WORDS)
 
         if untrusted_present:
             missing = [m for m in missing if not _script_unreliable(m)]
@@ -8836,6 +9776,52 @@ def validate(prod_path, stage_path, report_path):
         _llm_verify_missing(content_results, _prod_raw, _stage_raw)
     except Exception as _e:
         print(f"  LLM verify skipped: {_e}")
+
+    # ── Content: nearest-sentence comparison (rapidfuzz) ──
+    # This replaces the shingle/n-gram findings for prose. Coverage of
+    # characters answers the wrong question; "which STAGE sentence is closest
+    # to this PROD sentence, and how close" answers the right one, and hands
+    # the report the STAGE wording to print beside PROD's.
+    _emit(0.50, "comparing content (fuzzy)")
+    try:
+        _fuzzy, _cov = _toc_content_gaps(prod_path, stage_path, _prod_nav,
+                                         stage_nav, toc_results, prod_sections,
+                                         stage_sections, stage_lookup)
+        _by_title = {}
+        for _g in _fuzzy:
+            _by_title.setdefault(_g["title"], []).append(_g)
+        for _r in content_results:
+            _hits = _by_title.get(_r["title"], [])
+            _r["missing"] = [_g["prod"] for _g in _hits]
+            _r["pairs"] = {_g["prod"]: _g["stage"] for _g in _hits}
+            _r["kinds"] = {_g["prod"]: _g["kind"] for _g in _hits}
+            # Coverage now comes from the same comparison the findings do.
+            # It used to be the shingle matcher's number while the findings came
+            # from the fuzzy walk, so a topic could read "12% coverage" beside
+            # zero findings and neither figure explained the other.
+            _st = _cov.get(_r["title"])
+            if _st:
+                _r["coverage"] = _st["anywhere_pct"]
+                _r["in_topic_pct"] = _st["in_topic_pct"]
+                _r["moved"] = _st["moved"]
+                _r["absent"] = _st["absent"]
+            if _r.get("status") != "NO CONTENT":
+                _r["status"] = "Fail" if _hits else "Pass"
+        _mv = sum(x["moved"] for x in _cov.values())
+        _ab = sum(x["absent"] for x in _cov.values())
+        _ns = sum(x["sentences"] for x in _cov.values())
+        if _ns:
+            print(f"  content coverage: {_ns} PROD sentence(s) — "
+                  f"{100.0 * (_ns - _ab) / _ns:.0f}% present in STAGE, "
+                  f"{_mv} moved to another topic, {_ab} absent")
+        _nw = sum(1 for _g in _fuzzy if _g["kind"] == "whole")
+        print(f"  TOC content diff: {len(_fuzzy)} gap(s) across "
+              f"{len(_by_title)} topic(s) — {_nw} whole sentence(s), "
+              f"{len(_fuzzy) - _nw} dropped clause(s)")
+    except Exception as _e:
+        import traceback as _tb
+        print(f"  fuzzy content diff failed, keeping matcher findings: {_e}")
+        print(_tb.format_exc())
 
     # ── Local-AI (Ollama) cross-check: add genuine differences the
     #    section-by-section matcher missed (offline, no API key) ──

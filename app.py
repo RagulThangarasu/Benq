@@ -1053,7 +1053,7 @@ def _report_issue_rows(text: str):
     """
     known = [
         "Text layer", "HTML entity", "Encoding", "Garbled",
-        "Content missing", "Image label missing", "Image mismatch",
+        "Content missing", "Content mismatch", "Image label missing", "Image mismatch",
         "Image alignment changed", "Image highlight box missing",
         "Image not correctly updated", "Images pixelated",
         "Diagram callout number missing", "Image missing", "Broken image",

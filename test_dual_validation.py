@@ -114,6 +114,54 @@ def test_table_issue_labels_are_reported():
         assert validator._is_reported(label), f"{label} should be included in the report"
 
 
+def test_content_missing_is_checked_against_matched_stage_section():
+    from content_validation import validate_toc_content as validator
+
+    prod_words = validator._keep(validator._tokenize(
+        "Install the receiver bracket before connecting the signal cable."))
+    stage_section = "Install the receiver bracket."
+    whole_stage = (
+        stage_section
+        + " Another topic says before connecting the signal cable."
+    )
+
+    whole_ns, whole_cset, whole_full = validator._text_compare_index(whole_stage)
+    whole_coverage, whole_missing = validator._section_missing(
+        prod_words, whole_ns, whole_cset, whole_full)
+    section_ns, section_cset, section_full = validator._text_compare_index(stage_section)
+    section_coverage, section_missing = validator._section_missing(
+        prod_words, section_ns, section_cset, section_full)
+
+    assert whole_coverage > section_coverage
+    assert whole_missing == []
+    assert section_missing == ["before connecting the signal cable."]
+
+
+def test_matched_section_reports_short_content_fragments():
+    from content_validation import validate_toc_content as validator
+
+    prod_words = validator._keep(validator._tokenize(
+        "Open the menu and select USB Awake."))
+    stage_words = validator._keep(validator._tokenize("Open the menu."))
+    stage_ns, stage_cset, stage_full = validator._text_compare_index(
+        "Open the menu.")
+
+    _coverage, default_missing = validator._section_missing(
+        prod_words, stage_ns, stage_cset, stage_full)
+    _coverage, section_missing = validator._section_missing(
+        prod_words, stage_ns, stage_cset, stage_full,
+        min_frag_words=validator.SECTION_MIN_FRAG_WORDS)
+
+    assert default_missing == []
+    assert section_missing == ["and select USB Awake."]
+
+
+def test_content_mismatch_issue_is_reported():
+    from content_validation import validate_toc_content as validator
+
+    assert validator._is_reported("Content mismatch")
+
+
 # ── extraction ───────────────────────────────────────────────────────────────
 @needs_pdfs
 def test_extract_builds_both_views():

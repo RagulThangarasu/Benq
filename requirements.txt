@@ -25,3 +25,4 @@ anthropic>=0.40
 # No extra packages and no API keys: talks to a local Ollama over plain HTTP.
 #   Setup:  ollama serve  +  ollama pull llama3.2:3b   (llama3.2:1b for max speed)
 #   Run:    python -m content_validation.ai_validate prod.pdf stage.pdf -o reports/ai_validation_report.md
+rapidfuzz>=3.0

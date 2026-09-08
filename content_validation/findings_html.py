@@ -199,8 +199,20 @@ def from_toc_kwargs(captured: dict) -> list:
             if not str(frag).strip():
                 continue
             out.append(Row(kind="Content missing", text=str(frag)[:400],
-                           detail=f"In PROD under “{title}”, absent from STAGE"[:600],
+                           detail=(f"PROD PDF section: {title}. Missing sentence / "
+                                   f"fragment from PROD: {frag}. Not found in "
+                                   f"the matched STAGE section.")[:600],
                            severity="high",
+                           prod_page=_page(item.get("prod_page")),
+                           stage_page=_page(item.get("stage_page"))))
+        for frag in (item.get("extra") or []):
+            if not str(frag).strip():
+                continue
+            out.append(Row(kind="Content mismatch", text=str(frag)[:400],
+                           detail=(f"Matched section: {title}. STAGE-only "
+                                   f"sentence / fragment: {frag}. Not present "
+                                   f"in the matched PROD section.")[:600],
+                           severity="medium",
                            prod_page=_page(item.get("prod_page")),
                            stage_page=_page(item.get("stage_page"))))
     for item in (captured.get("toc_results") or []):
