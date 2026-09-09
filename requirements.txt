@@ -26,3 +26,7 @@ anthropic>=0.40
 #   Setup:  ollama serve  +  ollama pull llama3.2:3b   (llama3.2:1b for max speed)
 #   Run:    python -m content_validation.ai_validate prod.pdf stage.pdf -o reports/ai_validation_report.md
 rapidfuzz>=3.0
+
+# Unpacking the append-only prod-pdf's ZIPs: their per-product archives are .7z.
+# Without this only the nested .zip products are extracted (.7z ones are skipped).
+py7zr>=0.20

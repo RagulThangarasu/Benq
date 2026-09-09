@@ -2979,11 +2979,29 @@ def _figure_colour_issues(prod_path, stage_path, prod_nav, stage_nav,
                 continue
             if len(p_figs) > _IMG_MAX_PER_SEC or len(s_figs) > _IMG_MAX_PER_SEC:
                 continue
-            for (p_pno, p_rect, _pt), (s_pno, s_rect, _st) in zip(p_figs, s_figs):
+            # Pair each PROD figure with the STAGE figure that looks like it
+            # (same artwork), not the Nth one in reading order — order pairing
+            # falls apart the moment a section reflows differently or STAGE has
+            # one extra/missing figure earlier, mismatching every pair after it.
+            taken = set()
+            for p_pno, p_rect, p_thumb in p_figs:
                 if len(findings) >= max_findings:
                     break
                 if min(p_rect.width, p_rect.height) < 40:
                     continue
+                best, best_d = None, None
+                for j, (_s_pno, _s_rect, s_thumb) in enumerate(s_figs):
+                    if j in taken:
+                        continue
+                    d = _thumb_diff(p_thumb, s_thumb)
+                    if d is None:
+                        continue
+                    if best_d is None or d < best_d:
+                        best, best_d = j, d
+                if best is None or best_d is None or best_d > _IMG_MATCH_LIMIT:
+                    continue      # no matching STAGE artwork — not this check's business
+                taken.add(best)
+                s_pno, s_rect, _ = s_figs[best]
                 pc = _figure_colours(prod_doc[p_pno - 1], p_rect)
                 sc = _figure_colours(stage_doc[s_pno - 1], s_rect)
                 for name in set(pc) | set(sc):
@@ -6906,6 +6924,28 @@ _FIX_ADVICE = {
                               "character it stands for.",
                               "Decode the entity in the source content, then "
                               "re-publish."),
+    "HTML entity left in text": ("A raw HTML entity was published instead of the "
+                              "character it stands for.",
+                              "Decode the entity in the source content, then "
+                              "re-publish."),
+    "Text layer broken (font has no Unicode map)":
+                             ("The page renders correctly, but the text is drawn "
+                              "with a font that carries no Unicode mapping, so "
+                              "copy/paste, search and screen readers get garbage.",
+                              "Re-embed the font with a ToUnicode map, or set the "
+                              "text in a text-mapped font, and re-export."),
+    "Private-use glyph (no real character)":
+                             ("A Unicode private-use code point is on the page — "
+                              "it is not a real character and reads as a box or "
+                              "random glyph outside the authoring app.",
+                              "Replace it with the intended real character in the "
+                              "source and re-export."),
+    "Replacement character (U+FFFD)":
+                             ("U+FFFD (the replacement character) is printed where "
+                              "a real character should be — the encoding was lost "
+                              "somewhere in the pipeline.",
+                              "Trace the character back to the source, fix the "
+                              "encoding, and re-export."),
     "Image label missing":   ("A label PROD prints on a figure is not readable in "
                               "STAGE.",
                               "Restore the label on the STAGE figure. If STAGE "
@@ -7624,7 +7664,11 @@ _CATEGORIES = [
 # Which category an issue belongs to, by the issue label it is reported under.
 _ISSUE_CATEGORY = {
     "Text layer":            "encoding",
+    "Text layer broken (font has no Unicode map)": "encoding",
+    "Private-use glyph (no real character)": "encoding",
+    "Replacement character (U+FFFD)": "encoding",
     "HTML entity":           "encoding",
+    "HTML entity left in text": "encoding",
     "Content missing":       "content",
     "Figure or menu label missing": "content",
     "Content mismatch":      "content",
@@ -7688,7 +7732,11 @@ _REPORTED_ISSUES = (
     # other reading of the page unreliable, so it has to be visible in the
     # report rather than detected and dropped.
     "Text layer",
+    "Text layer broken (font has no Unicode map)",
+    "Private-use glyph (no real character)",
+    "Replacement character (U+FFFD)",
     "HTML entity",
+    "HTML entity left in text",
     "Encoding",
     "Garbled",
     # missing
@@ -8052,13 +8100,22 @@ def _is_interleaved(text: str) -> bool:
     it says nothing about whether STAGE dropped content.
     """
     w = [x.lower() for x in re.findall(r"[A-Za-z]{2,}", text or "")]
-    if len(w) < 4:
+    if len(w) < 6:
         return False
-    tri = [" ".join(w[i:i + 3]) for i in range(len(w) - 2)]
-    if len(tri) != len(set(tri)):
+    # A repeated 4-word phrase is a weld, always.
+    q = [" ".join(w[i:i + 4]) for i in range(len(w) - 3)]
+    if len(q) != len(set(q)):
         return True
-    bi = [" ".join(w[i:i + 2]) for i in range(len(w) - 1)]
-    return len(bi) - len(set(bi)) >= 2
+    # Otherwise, interleaving welds two different column texts, so SEVERAL
+    # distinctive words each show up twice ("Picture ... Picture", "Color ...
+    # Color", "setting ... setting"). A natural sentence repeats at most one
+    # content word ("... the monitor ... on the monitor"), so two or more
+    # repeated content words is the tell.
+    _stop = {"the", "and", "for", "with", "you", "your", "this", "that", "from",
+             "into", "onto", "are", "was", "can", "will", "not", "its", "has"}
+    from collections import Counter as _C
+    cw = _C(x for x in w if len(x) >= 4 and x not in _stop)
+    return sum(1 for n in cw.values() if n >= 2) >= 2
 
 
 def _toc_content_gaps(prod_path, stage_path, prod_nav, stage_nav,
@@ -8088,6 +8145,7 @@ def _toc_content_gaps(prod_path, stage_path, prod_nav, stage_nav,
     if not stage_all:
         return [], {}
     stage_flat = _stage_flat_text(stage_path, stage_nav)
+    stage_seq = _stage_seq_index(stage_flat)
 
     def _split(text):
         body = re.sub(r"\s+", " ", (text or "")).replace("- ", "")
@@ -8175,6 +8233,13 @@ def _toc_content_gaps(prod_path, stage_path, prod_nav, stage_nav,
                 continue          # OSD language list: not comparable at all
             if _is_interleaved(sent):
                 continue          # two columns welded together by the extractor
+            if re.match(r"^[A-Z][a-z]+(?: [a-z]+){0,3} \d+[.)] [A-Z]", sent):
+                continue          # a heading welded to a step ("Rotating the monitor 1. Pivot ...")
+            if re.match(r"^(?:frequently asked questions|imaging\b|osd (?:messages|controls)\b)",
+                        sent, re.I):
+                continue          # a run of troubleshooting headings, not prose
+            if re.match(r"^\d+\s+\d+[.)]?\s", sent):
+                continue          # a broken two-number callout ("1 6. Shortcut key")
             # A label run is still content PROD prints and STAGE does not carry
             # as text. It is tagged rather than dropped, so the report can group
             # it separately instead of hiding it.
@@ -8184,6 +8249,20 @@ def _toc_content_gaps(prod_path, stage_path, prod_nav, stage_nav,
             _cov = _phrase_coverage(sent, stage_flat)
             if _cov >= 0.9:
                 continue          # STAGE prints this wording
+            # Enumerator- and gap-tolerant presence: PROD numbers a callout
+            # "12." that STAGE numbers "11." or runs together with its
+            # neighbours ("... slot 12. AC power input jack 13. ..."), and
+            # exact-phrase containment then reads it as missing when every
+            # word is right there. Strip a leading number and check the words
+            # occur in order in STAGE, allowing small gaps.
+            _bare = re.sub(r"^\s*(?:\d+\s*[.)]?\s+){1,3}", "", sent).strip()
+            _bt = [t for t in _seq_tokens(_bare) if len(t) > 1]
+            if _bt and len(_bt) >= 3:
+                if _phrase_coverage(_bare, stage_flat,
+                                    n=min(5, len(_bt))) >= 0.8:
+                    continue
+                if _seq_present(stage_seq, _bt, max_gap=4):
+                    continue      # words are in STAGE, in order
             if _cov > 0:
                 # Mostly present: report the spans this STAGE sentence drops.
                 # The scope is the paired sentence, NOT the whole document:
@@ -8242,16 +8321,36 @@ def _toc_content_gaps(prod_path, stage_path, prod_nav, stage_nav,
             k = " ".join(_seq_tokens(sent))
             if not k or k in seen:
                 continue
-            if any(_rf_fuzz.ratio(sent, o["prod"]) >= 97 for o in out):
+            if any(_rf_fuzz.ratio(sent, o["prod"]) >= 99
+                   or _seq_tokens(sent) == _seq_tokens(o["prod"])
+                   for o in out):
                 continue               # the identical sentence, already reported
-            seen.add(k)
-            # Show the closest STAGE wording in the whole document when it beats
-            # anything in the topic. Pairing a finding against the least-bad
-            # sentence of one section produced comparisons like "Never stand your
-            # monitor…" against a packing list; the real nearest sentence is what
-            # tells the reader whether this is a rewrite or a deletion.
+            # ...but symmetric left/right steps ("Slide plate (Rt)..." vs
+            # "...(Lt)...") differ by one token and are distinct instructions —
+            # keep both.
+            # Show the closest STAGE wording in the whole document when it
+            # beats anything in the topic.
             if elsewhere and elsewhere[1] > best:
                 near, best = elsewhere[0], float(elsewhere[1])
+            # Final guard: if the STAGE text this finding would print beside
+            # PROD carries essentially the same words (a heading run that STAGE
+            # also has, a callout STAGE numbers differently, a fragment welded
+            # from text STAGE keeps), the finding tells the reader nothing —
+            # "Missing from STAGE: X / STAGE has instead: X". Drop it.
+            _sk_now = [t for t in _seq_tokens(sent) if len(t) > 1]
+            _cands = [near]
+            if elsewhere:
+                _cands.append(elsewhere[0])
+            _stc = _stage_counterpart(sent, [(x, set(_seq_tokens(x)))
+                                             for x in stage_all])
+            if _stc:
+                _cands.append(_stc)
+            if _sk_now and any(
+                    set(_sk_now).issubset(set(_seq_tokens(c)))
+                    for c in _cands if c):
+                continue          # some STAGE sentence carries every one of
+                                  # these words — nothing to report
+            seen.add(k)
             out.append({"title": title, "level": r.get("level"),
                         "prod_page": r.get("prod_page"),
                         "stage_page": r.get("stage_page"),
@@ -8749,7 +8848,7 @@ def generate_report(prod_path, stage_path, toc_results, content_results,
                           f"characters.<br/>Nearby: {_esc(_trunc(g['context'], 170))}")
             elif g["kind"].startswith("HTML entity"):
                 ent = g["text"] if g["text"].endswith(";") else g["text"] + ";"
-                lead = (f"STAGE prints the raw HTML entity "
+                lead = (f"{g['doc']} prints the raw HTML entity "
                         f"<font color='#b71c1c'><b>{_esc(ent)}</b></font> as "
                         f"literal text")
                 if g.get("decoded"):
@@ -9962,11 +10061,15 @@ def validate(prod_path, stage_path, report_path):
     _emit(0.93, "checking encoding, table headings, image labels")
     print("Checking encoding, table headings and image labels...")
     try:
-        # PROD is the reference: it is not under test. Only STAGE is inspected,
-        # so the report is a list of gaps in STAGE rather than a mix of defects
-        # from both documents.
-        glitches = _encoding_glitches(stage_path, stage_nav, "STAGE")
-        print(f"  encoding/garbling issues: {len(glitches)}")
+        # Encoding damage — a garbled glyph, a raw HTML entity, a private-use
+        # character, a broken text layer — is a defect wherever it lands, not a
+        # gap "between" the two documents. Both are scanned; each finding is
+        # tagged with the doc it sits in.
+        glitches = (_encoding_glitches(prod_path, prod_nav, "PROD")
+                    + _encoding_glitches(stage_path, stage_nav, "STAGE"))
+        _egp = sum(1 for g in glitches if g["doc"] == "PROD")
+        print(f"  encoding/garbling issues: {len(glitches)} "
+              f"(PROD {_egp}, STAGE {len(glitches) - _egp})")
     except Exception as exc:
         print(f"  encoding scan failed: {exc}")
         glitches = []
