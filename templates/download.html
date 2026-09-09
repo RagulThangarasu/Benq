@@ -124,9 +124,9 @@
       <section class="card" style="margin-top:22px;">
         <h2>Download a single product</h2>
         <p style="margin:0 0 14px; color:var(--muted); max-width:60rem;">
-          Every downloaded <strong>PROD product</strong>. Pick one to grab its generated PROD PDF;
-          where a matching <strong>Final Cleanup files</strong> entry exists (by folder name), its
-          source ZIP is offered too.
+          Every <strong>PROD product</strong> from the append-only <code>prod-pdf's</code> ZIPs
+          (and <code>PROD FIles/</code>). Pick one to grab its PROD PDF; where this week's AEM
+          regeneration produced a matching <strong>STAGE PDF</strong>, it is paired in automatically.
         </p>
 
         <div class="actions">
@@ -143,18 +143,18 @@
             <tbody>
               <tr>
                 <td><strong>PROD PDF</strong><br><span id="pdfName" style="color:var(--muted); font-size:0.85rem;"></span></td>
-                <td>benq_pdfs</td>
+                <td id="pdfSource">prod-pdf's</td>
                 <td id="pdfSize"></td>
                 <td><button id="pdfBtn" class="primary">⬇ Download PDF</button></td>
               </tr>
               <tr id="zipRow">
-                <td><strong>Final Cleanup ZIP</strong><br><span id="zipName" style="color:var(--muted); font-size:0.85rem;"></span></td>
+                <td><strong>STAGE PDF</strong><br><span id="zipName" style="color:var(--muted); font-size:0.85rem;"></span></td>
                 <td id="zipSource"></td>
                 <td id="zipSize"></td>
-                <td><button id="zipDlBtn" class="secondary">⬇ Download ZIP</button></td>
+                <td></td>
               </tr>
               <tr id="noZipRow">
-                <td colspan="4" style="color:var(--muted); font-style:italic;">No matching Final Cleanup file for this product — PROD PDF only.</td>
+                <td colspan="4" style="color:var(--muted); font-style:italic;">No STAGE PDF from this week's AEM regeneration matched this product — PROD PDF only.</td>
               </tr>
             </tbody>
           </table>
@@ -165,15 +165,34 @@
             <span id="validateMsg" class="status-line" style="margin:0;"></span>
           </div>
           <p style="margin:8px 0 0; color:var(--muted); font-size:0.85rem;">
-            Queues this product without downloading — <strong>PROD</strong> = the generated PDF,
-            <strong>STAGE</strong> = the PDF inside its Final Cleanup file. Then run it from the
-            validation page.
+            Queues this product without downloading — <strong>PROD</strong> = the PDF from
+            <code>prod-pdf's</code>, <strong>STAGE</strong> = this week's AEM-regenerated PDF.
+            Then run it from the validation page.
           </p>
         </div>
         <div id="prodEmpty" class="notice" style="display:none;">
           No matched products found. Download the PROD PDFs above first, and make sure the
           Final Cleanup files directory is reachable (set <code>BENQ_CLEANUP_DIR</code> if its path differs).
         </div>
+      </section>
+
+      <section class="card" style="margin-top:22px;">
+        <h2>Bulk add by product name</h2>
+        <p style="margin:0 0 14px; color:var(--muted); max-width:60rem;">
+          Paste product names — one per line (or comma / semicolon separated). Each is matched
+          to its <strong>PROD</strong> PDF (from <code>prod-pdf's</code>) and its <strong>STAGE</strong>
+          PDF (this week's AEM regeneration), and the pair is appended to the
+          <a href="/">validation queue</a>. Names can be a product id (<code>PD05U-EM-V3_EN</code>)
+          or just a model code (<code>PD05U</code>).
+        </p>
+        <textarea id="bulkNames" rows="6" placeholder="PD05U&#10;SW272&#10;PV3200U"
+          style="width:100%; box-sizing:border-box; padding:11px 14px; border-radius:10px; border:1px solid var(--border); font-size:0.95rem; font-family:ui-monospace,Menlo,monospace; resize:vertical;"></textarea>
+        <div class="actions" style="margin-top:12px;">
+          <button id="bulkAddBtn" class="primary">➕ Match &amp; add to validation queue</button>
+          <a href="/" class="backlink" id="bulkGoValidate" style="display:none;">Go to validation →</a>
+          <span id="bulkMsg" class="status-line" style="margin:0;"></span>
+        </div>
+        <div id="bulkResultsWrap" style="margin-top:14px;"></div>
       </section>
     </div>
 
@@ -317,17 +336,19 @@
         if (!m) { prodDetail.style.display = 'none'; return; }
         pdfName.textContent = m.pdf_dl || m.pdf_name;
         pdfSize.textContent = m.pdf_kb + ' KB';
-        const hasZip = !!m.zip_name;
-        zipRow.style.display = hasZip ? '' : 'none';
-        noZipRow.style.display = hasZip ? 'none' : '';
-        if (hasZip) {
-          zipName.textContent = m.zip_name;
-          zipSize.textContent = m.zip_kb + ' KB';
-          zipSource.textContent = m.source;
+        document.getElementById('pdfSource').textContent = m.prod_source || "prod-pdf's";
+        const hasStage = !!m.stage_pdf_name;
+        zipRow.style.display = hasStage ? '' : 'none';
+        noZipRow.style.display = hasStage ? 'none' : '';
+        if (hasStage) {
+          zipName.textContent = m.stage_pdf_name
+            + (m.stage_match && m.stage_match !== 'exact' ? ` (${m.stage_match})` : '');
+          zipSize.textContent = (m.stage_pdf_kb || 0) + ' KB';
+          zipSource.textContent = m.source || '';
         }
-        // Validation needs a STAGE source (the cleanup PDF); disable without one.
-        validateBtn.disabled = !hasZip;
-        validateBtn.title = hasZip ? '' : 'No Final Cleanup file to use as STAGE.';
+        // Validation needs a STAGE PDF from the AEM pull; disable without one.
+        validateBtn.disabled = !hasStage;
+        validateBtn.title = hasStage ? '' : "No STAGE PDF matched from this week's AEM regeneration.";
         validateMsg.textContent = '';
         validateMsg.style.color = '';
         goValidate.style.display = 'none';
@@ -382,10 +403,55 @@
       pdfBtn.addEventListener('click', () => {
         if (prodSelect.value) window.location = '/download/prod-pdf/' + encodeURIComponent(prodSelect.value);
       });
-      zipDlBtn.addEventListener('click', () => {
+      if (zipDlBtn) zipDlBtn.addEventListener('click', () => {
         if (prodSelect.value) window.location = '/download/cleanup-zip/' + encodeURIComponent(prodSelect.value);
       });
       loadProducts();
+
+      // ── Bulk add by product name ──────────────────────────────────────────
+      const bulkNames = document.getElementById('bulkNames');
+      const bulkAddBtn = document.getElementById('bulkAddBtn');
+      const bulkMsg = document.getElementById('bulkMsg');
+      const bulkResultsWrap = document.getElementById('bulkResultsWrap');
+      const bulkGoValidate = document.getElementById('bulkGoValidate');
+      const BULK_LABEL = {
+        added: 'Added', duplicate: 'Already queued', no_stage: 'No STAGE PDF',
+        not_found: 'No match', error: 'Error',
+      };
+
+      bulkAddBtn.addEventListener('click', async () => {
+        const names = bulkNames.value.trim();
+        if (!names) { bulkMsg.style.color = '#b91c1c'; bulkMsg.textContent = 'Paste at least one product name.'; return; }
+        bulkAddBtn.disabled = true;
+        bulkMsg.style.color = '';
+        bulkMsg.textContent = 'Matching and queueing…';
+        bulkGoValidate.style.display = 'none';
+        bulkResultsWrap.innerHTML = '';
+        try {
+          const r = await fetch('/download/add-to-validation-bulk', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ names }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+          const rows = (d.results || []).map((x, i) => `<tr>
+            <td>${i + 1}</td>
+            <td>${x.name || ''}${x.product && x.product !== x.name ? ` → <strong>${x.product}</strong>` : ''}</td>
+            <td>${BULK_LABEL[x.status] || x.status}${x.stage_match && x.stage_match !== 'exact' ? ` (${x.stage_match})` : ''}</td>
+            <td style="color:var(--muted);">${x.detail || ''}</td>
+          </tr>`).join('');
+          bulkResultsWrap.innerHTML = `<table><thead><tr><th>#</th><th>Name</th><th>Status</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
+          bulkMsg.style.color = d.added ? '#047857' : '#b45309';
+          bulkMsg.textContent = `Added ${d.added} pair(s) — ${d.queue.length} in queue.`;
+          if (d.added) bulkGoValidate.style.display = 'inline';
+        } catch (e) {
+          bulkMsg.style.color = '#b91c1c';
+          bulkMsg.textContent = 'Failed: ' + e.message;
+        } finally {
+          bulkAddBtn.disabled = false;
+        }
+      });
 
       // If a download is already running when the page loads, attach to it.
       tick().then(() => {

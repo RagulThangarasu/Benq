@@ -20,7 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # The AEM host moves between environments, so it is configurable without editing
 # this file: set BENQ_AEM_HOST (and BENQ_AEM_USER / BENQ_AEM_PASSWORD) instead.
@@ -35,6 +35,11 @@ PROJECT = "/content/dam/projects/benq-aem-guides"
 OUTPUTS_ROOT = os.environ.get("BENQ_AEM_OUTPUTS_ROOT", "/content/dam/fmdita-outputs")
 # Comma-separated language codes to pull, or "*" for every language present.
 OUTPUT_LANGS = os.environ.get("BENQ_AEM_OUTPUT_LANGS", "en")
+# Only pull generated PDFs whose `jcr:lastModified` falls within this many days
+# of now — the STAGE side is "what AEM regenerated this week". 0 = no age limit.
+# If nothing matches the window the filter is skipped (with a warning) so a run
+# is never silently empty.
+SINCE_DAYS = int(os.environ.get("BENQ_AEM_SINCE_DAYS", "7"))
 # Only PDFs baked from a map under one of these roots count. A legacy tree at
 # /content/dam/benq-aem-guides holds older copies of most of the same products
 # under different folder names (`ams` vs `AMS_UM_EN`), so including it would
@@ -237,12 +242,17 @@ def _modified_at(hit):
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def discover_output_pdfs(languages=None):
+def discover_output_pdfs(languages=None, since_days=None):
     """The latest generated PDF for each product/language under OUTPUTS_ROOT.
 
     Returns a sorted list of (product, lang, pdf_path). When AEM contains more
     than one generated export for the same product and language, the asset with
     the newest ``jcr:lastModified`` value wins.
+
+    When ``since_days`` is a positive number, only products whose latest export
+    was modified within that many days of now are returned. If that would return
+    nothing, the window is ignored (and a warning printed) so a run is never
+    silently empty.
     """
     raw = _get(f"/bin/querybuilder.json?path={OUTPUTS_ROOT}&nodename=%2a.pdf"
                f"&p.limit=-1&p.guessTotal=true&p.hits=selective"
@@ -283,7 +293,20 @@ def discover_output_pdfs(languages=None):
                 or candidate[3] > previous[3]
                 or (candidate[3] == previous[3] and p > previous[2])):
             latest[key] = candidate
-    out = [(product, lang, p) for product, lang, p, _modified in latest.values()]
+    entries = list(latest.values())
+
+    window = SINCE_DAYS if since_days is None else since_days
+    if window and window > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=window)
+        recent = [e for e in entries if e[3] >= cutoff]
+        if recent:
+            entries = recent
+        else:
+            print(f"  [warn] no generated PDF modified in the last {window} day(s) "
+                  f"— ignoring the age window and taking all {len(entries)}.",
+                  flush=True)
+
+    out = [(product, lang, p) for product, lang, p, _modified in entries]
     out.sort(key=lambda t: (t[0].lower(), t[1]))
     return out
 
@@ -321,7 +344,9 @@ def download_all(progress_cb=None, should_cancel=None, languages=None):
 
     _emit(0.01, f"checking {HOST}…")
     check_server()
-    _emit(0.02, "crawling every folder for generated PDFs…")
+    _emit(0.02, (f"crawling for PDFs regenerated in the last {SINCE_DAYS} day(s)…"
+                 if SINCE_DAYS and SINCE_DAYS > 0
+                 else "crawling every folder for generated PDFs…"))
     pdfs = discover_output_pdfs(languages=languages)
 
     # Keep older local PDFs. They are useful Stage fallbacks when the latest DAM

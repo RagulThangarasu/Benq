@@ -19,7 +19,7 @@ import traceback
 import uuid
 import zipfile
 from difflib import SequenceMatcher
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import (Flask, Response, jsonify, render_template, request,
@@ -122,6 +122,13 @@ CLEANUP_DIR = Path(os.environ.get(
     "BENQ_CLEANUP_DIR",
     "/Users/ragul/Downloads/Final Cleanup files for Pavan to add Structure and fix the alt attribute value",
 ))
+# The PROD side of the PDF stage is now the append-only "prod-pdf's" tree: every
+# ZIP dropped in there (FM.zip, INDD.zip, …) is extracted once and its PDFs join
+# the PROD pool. Nothing is ever removed — a ZIP that disappears keeps its
+# already-extracted PDFs. The STAGE side is this week's AEM regeneration: only
+# generated PDFs touched in the last BENQ_STAGE_MAX_AGE_DAYS days count (0 = no
+# age filter), so a run validates "what changed this week".
+STAGE_MAX_AGE_DAYS = int(os.environ.get("BENQ_STAGE_MAX_AGE_DAYS", "7"))
 DL_LOCK = threading.Lock()
 DL_THREAD = None
 DL_STORE: dict = {"running": False, "pct": 0, "current": None, "finished": True,
@@ -1053,7 +1060,7 @@ def _report_issue_rows(text: str):
     """
     known = [
         "Text layer", "HTML entity", "Encoding", "Garbled",
-        "Content missing", "Image label missing", "Image mismatch",
+        "Content missing", "Content mismatch", "Image label missing", "Image mismatch",
         "Image alignment changed", "Image highlight box missing",
         "Image not correctly updated", "Images pixelated",
         "Diagram callout number missing", "Image missing", "Broken image",
@@ -1432,7 +1439,7 @@ def download_languages():
         import download_benq_pdfs as dl
         importlib.reload(dl)
         languages = sorted({lang for _product, lang, _path in
-                            dl.discover_output_pdfs(languages="*") if lang})
+                            dl.discover_output_pdfs(languages="*", since_days=0) if lang})
         return jsonify(languages=languages)
     except Exception as exc:
         return jsonify(error=str(exc), languages=[]), 503
@@ -1584,8 +1591,79 @@ def _zip_cache_dir(zip_path: Path) -> Path:
     return EXTRACTED_ZIP_PDFS_DIR / f"{_norm_name(zip_path.stem)[:80]}_{digest}"
 
 
+def _pdf_members_in_archive(data: bytes, name_hint: str, depth: int = 0):
+    """Yield (inner_path, pdf_bytes) for every PDF inside an archive blob,
+    recursing through nested .zip / .7z containers (the prod-pdf's ZIPs hold one
+    per-product archive each). Missing py7zr just skips the .7z branches."""
+    if depth > 3:
+        return
+    lower = name_hint.lower()
+    try:
+        if lower.endswith(".7z"):
+            try:
+                import py7zr
+            except ImportError:
+                print("[products] py7zr not installed — skipping "
+                      f"{name_hint}. `pip install py7zr` to include it.", flush=True)
+                return
+            with py7zr.SevenZipFile(io.BytesIO(data)) as sz:
+                wanted = [n for n in sz.getnames()
+                          if n.lower().endswith((".pdf", ".zip", ".7z"))
+                          and "__MACOSX" not in n]
+                if not wanted:
+                    return
+                with tempfile.TemporaryDirectory() as td:
+                    sz.extract(path=td, targets=wanted)
+                    for inner in wanted:
+                        fp = Path(td) / inner
+                        if not fp.is_file():
+                            continue
+                        blob = fp.read_bytes()
+                        if inner.lower().endswith(".pdf"):
+                            yield inner, blob
+                        else:
+                            yield from _pdf_members_in_archive(blob, inner, depth + 1)
+            return
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            for inner in z.namelist():
+                if "__MACOSX" in inner:
+                    continue
+                il = inner.lower()
+                if il.endswith(".pdf"):
+                    yield inner, z.read(inner)
+                elif il.endswith((".zip", ".7z")):
+                    yield from _pdf_members_in_archive(z.read(inner), inner, depth + 1)
+    except Exception as exc:
+        print(f"[products] could not read archive {name_hint}: {exc}", flush=True)
+
+
+def _pick_manual_pdf(pdfs: list[str]) -> str | None:
+    """The one real English manual PDF out of an archive's PDFs: skip the
+    review copies (`_marked`, `_updates`, `_update`), prefer an EN path, then
+    take the longest name (the full manual over a timing/resolution table)."""
+    if not pdfs:
+        return None
+    real = [p for p in pdfs
+            if not re.search(r"mark(ed|up)|updat|redline|_diff|compare|revision",
+                             Path(p).stem, re.I)]
+    pool = real or pdfs
+
+    def score(p: str):
+        low = p.lower()
+        stem = Path(low).stem
+        en = ("/en/" in low or "/en " in low
+              or re.search(r"[-_ ]en([-_ ].*)?$", stem) is not None
+              or "_en_" in stem or "-en-" in stem)
+        return (1 if en else 0, len(stem))
+
+    return max(pool, key=score)
+
+
 def _extract_zip_pdf_candidates(zip_path: Path) -> list[Path]:
-    """Extract PDFs from one source ZIP and return the cached PDF paths."""
+    """Extract one PROD PDF per per-product archive inside a prod-pdf's ZIP and
+    return the cached PDF paths. Append-only: the cache is keyed by the ZIP's
+    size+mtime and never purged, so a ZIP that is later removed keeps the PDFs
+    it already contributed."""
     try:
         cache_dir = _zip_cache_dir(zip_path)
     except OSError:
@@ -1600,20 +1678,36 @@ def _extract_zip_pdf_candidates(zip_path: Path) -> list[Path]:
     out = []
     try:
         with zipfile.ZipFile(zip_path) as z:
-            members = [n for n in z.namelist()
-                       if n.lower().endswith(".pdf") and "__MACOSX" not in n]
+            containers = [n for n in z.namelist()
+                          if n.lower().endswith((".zip", ".7z"))
+                          and "__MACOSX" not in n]
+            loose_pdfs = [n for n in z.namelist()
+                          if n.lower().endswith(".pdf") and "__MACOSX" not in n]
             used = set()
-            for idx, member in enumerate(members, start=1):
-                name = secure_filename(Path(member).name) or f"pdf_{idx}.pdf"
-                if not name.lower().endswith(".pdf"):
-                    name += ".pdf"
-                if name.lower() in used:
-                    stem, suffix = Path(name).stem, Path(name).suffix
-                    name = f"{stem}_{idx}{suffix}"
+
+            def _emit(product_hint: str, members: list):
+                pick = _pick_manual_pdf([m for m, _ in members])
+                if not pick:
+                    return
+                blob = dict(members)[pick]
+                base = secure_filename(product_hint) or "prod"
+                name = f"{base}.pdf"
+                n = 2
+                while name.lower() in used:
+                    name = f"{base}_{n}.pdf"
+                    n += 1
                 used.add(name.lower())
                 dest = cache_dir / name
-                dest.write_bytes(z.read(member))
+                dest.write_bytes(blob)
                 out.append(dest)
+
+            for container in containers:
+                members = list(_pdf_members_in_archive(
+                    z.read(container), container))
+                _emit(Path(container).stem, members)
+            if loose_pdfs:
+                _emit(zip_path.stem,
+                      [(m, z.read(m)) for m in loose_pdfs])
         if out:
             marker.write_text(str(zip_path), encoding="utf-8")
     except Exception as exc:
@@ -1632,38 +1726,59 @@ def _source_zip_for_extracted_pdf(pdf_path: Path) -> Path | None:
         return None
 
 
+def _recent_enough(pdf_path: Path, max_age_days: int) -> bool:
+    """True when the file was last modified within max_age_days (0 = always)."""
+    if max_age_days <= 0:
+        return True
+    try:
+        mtime = datetime.fromtimestamp(pdf_path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return False
+    return mtime >= datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+
 def _stage_source_label(pdf_path: Path) -> str:
     if pdf_path.is_relative_to(STAGE_FILES_DIR):
         return "Stage files"
+    if pdf_path.is_relative_to(BENQ_PDFS_DIR):
+        return "AEM (updated this week)"
+    return str(pdf_path.parent)
+
+
+def _prod_source_label(pdf_path: Path) -> str:
     if pdf_path.is_relative_to(EXTRACTED_ZIP_PDFS_DIR):
         source_zip = _source_zip_for_extracted_pdf(pdf_path)
         if source_zip:
             try:
-                return str(source_zip.relative_to(BASE_DIR))
+                return f"prod-pdf's ({source_zip.name})"
             except ValueError:
-                return str(source_zip)
-        return "extracted ZIP PDF"
+                return "prod-pdf's"
+        return "prod-pdf's"
+    if pdf_path.is_relative_to(PROD_FILES_DIR):
+        return "PROD FIles"
     return str(pdf_path.parent)
 
 
-def _stage_pdf_candidates() -> list[Path]:
-    """Every already-downloaded or extracted STAGE-side PDF available locally."""
+def _prod_pdf_candidates() -> list[Path]:
+    """The PROD pool: every PDF extracted from an append-only prod-pdf's ZIP,
+    plus any loose PDF sitting in PROD FIles/. Extraction is cached per ZIP and
+    never purged, so a removed ZIP keeps the PDFs it already contributed."""
     out = []
-    if STAGE_FILES_DIR.is_dir():
-        out.extend(sorted(STAGE_FILES_DIR.rglob("*.pdf")))
     if PROD_PDF_ZIPS_DIR.is_dir():
         for zip_path in sorted(PROD_PDF_ZIPS_DIR.rglob("*.zip")):
             out.extend(_extract_zip_pdf_candidates(zip_path))
+    if PROD_FILES_DIR.is_dir():
+        out.extend(sorted(PROD_FILES_DIR.rglob("*.pdf")))
     return sorted(out)
 
 
-def _downloaded_pdf_candidates() -> list[Path]:
-    """Every downloaded English PDF that can be used as the counterpart side."""
+def _stage_pdf_candidates() -> list[Path]:
+    """The STAGE pool: this week's AEM regeneration (benq_pdfs/, filtered to
+    files modified within STAGE_MAX_AGE_DAYS) plus anything in Stage files/."""
     out = []
     if BENQ_PDFS_DIR.is_dir():
-        out.extend(sorted(BENQ_PDFS_DIR.rglob("*.pdf")))
-    if PROD_FILES_DIR.is_dir():
-        out.extend(sorted(PROD_FILES_DIR.rglob("*.pdf")))
+        out.extend(p for p in sorted(BENQ_PDFS_DIR.rglob("*.pdf"))
+                   if _recent_enough(p, STAGE_MAX_AGE_DAYS))
     if STAGE_FILES_DIR.is_dir():
         out.extend(sorted(STAGE_FILES_DIR.rglob("*.pdf")))
     return sorted(out)
@@ -1744,7 +1859,7 @@ def _product_entry(product: str, prod_pdf: Path, prod_root: Path,
         "pdf_dl": dl_name,
         "pdf_kb": prod_pdf.stat().st_size // 1024,
         "prod_path": str(prod_pdf),
-        "prod_source": str(prod_root.relative_to(BASE_DIR)) if prod_root.is_relative_to(BASE_DIR) else str(prod_root),
+        "prod_source": _prod_source_label(prod_pdf),
         "zip_name": None,
         "zip_kb": None,
         "stage_pdf_name": None,
@@ -1816,38 +1931,32 @@ def _matched_products() -> list:
     """Every PROD product with its matching STAGE PDF or cleanup ZIP, if any."""
     idx = _cleanup_index()
     stage_pdfs = _stage_pdf_candidates()
-    downloaded_pdfs = _downloaded_pdf_candidates()
     out = []
     by_product = {}
 
-    def add_entry(product: str, prod_pdf: Path, prod_root: Path,
-                  candidates: list[Path]):
+    def add_entry(product: str, prod_pdf: Path, prod_root: Path):
         key = _norm_name(product)
         if not key:
             return
-        entry = _product_entry(product, prod_pdf, prod_root, candidates, idx)
+        entry = _product_entry(product, prod_pdf, prod_root, stage_pdfs, idx)
         existing_index = by_product.get(key)
         if existing_index is None:
             by_product[key] = len(out)
             out.append(entry)
             return
-        # The same manual can be present in more than one local source tree.
-        # Keep one catalog row, preferring the copy that can actually be paired.
+        # The same manual can be present in more than one PROD source (a ZIP and
+        # PROD FIles/). Keep one catalog row, preferring the copy that pairs.
         existing = out[existing_index]
         if entry["has_stage"] and not existing["has_stage"]:
             out[existing_index] = entry
 
-    if BENQ_PDFS_DIR.is_dir():
-        for pdf in sorted(BENQ_PDFS_DIR.rglob("*.pdf")):
-            product = pdf.stem or pdf.parent.name
-            add_entry(product, pdf, BENQ_PDFS_DIR, stage_pdfs)
-    if PROD_FILES_DIR.is_dir():
-        for pdf in sorted(PROD_FILES_DIR.rglob("*.pdf")):
-            product = pdf.stem or pdf.name
-            add_entry(product, pdf, PROD_FILES_DIR, stage_pdfs)
-    for pdf in [p for p in stage_pdfs if p.is_relative_to(EXTRACTED_ZIP_PDFS_DIR)]:
-        product = pdf.stem or pdf.name
-        add_entry(product, pdf, EXTRACTED_ZIP_PDFS_DIR, downloaded_pdfs)
+    # PROD side only: prod-pdf's ZIP extractions and PROD FIles/. The STAGE side
+    # (this week's AEM pull + Stage files) is matched in, never enumerated here.
+    for pdf in _prod_pdf_candidates():
+        product = pdf.stem or pdf.parent.name
+        root = (EXTRACTED_ZIP_PDFS_DIR if pdf.is_relative_to(EXTRACTED_ZIP_PDFS_DIR)
+                else PROD_FILES_DIR)
+        add_entry(product, pdf, root)
     return out
 
 
@@ -1898,26 +2007,24 @@ def _extract_stage_pdf(zip_path: Path, dest_dir: Path) -> Path:
         return out
 
 
-@app.route("/download/add-to-validation/<path:product>", methods=["POST"])
-def add_to_validation(product: str):
-    """Queue a matched PROD/STAGE pair already available on the server."""
-    match = next((m for m in _matched_products() if m["product"] == product), None)
-    if not match:
-        return jsonify(error="Unknown product."), 404
-    queue = load_queue()
-    if any(item.get("label") == product for item in queue):
-        return jsonify(queue=queue, added=product, duplicate=True)
+def _queue_matched_pair(match: dict):
+    """Copy one catalog match's PROD + STAGE PDFs into a fresh pair dir and add
+    it to the validation queue. Returns (status, detail) where status is one of
+    'added' | 'duplicate' | 'error'."""
+    product = match["product"]
+    if any(item.get("label") == product for item in load_queue()):
+        return "duplicate", "already in the queue"
     prod_src = Path(match.get("prod_path") or (BENQ_PDFS_DIR / product / match["pdf_name"]))
     stage_src = Path(match["stage_path"]) if match.get("stage_path") else None
     zip_path = (Path(match["zip_path"]) if match.get("zip_path")
                 else (CLEANUP_DIR / match["source"] / match["zip_name"]
                       if match.get("zip_name") else None))
     if not stage_src and not zip_path:
-        return jsonify(error="No STAGE source for this product."), 400
+        return "error", "no STAGE source for this product"
     if (not prod_src.is_file()
             or (stage_src and not stage_src.is_file())
             or (zip_path and not zip_path.is_file())):
-        return jsonify(error="Source files are missing on the server."), 404
+        return "error", "source files are missing on the server"
 
     pair_id = uuid.uuid4().hex
     pair_dir = PAIRS_DIR / pair_id
@@ -1933,10 +2040,98 @@ def add_to_validation(product: str):
             _extract_stage_pdf(zip_path, stage_dir)
     except Exception as exc:
         shutil.rmtree(pair_dir, ignore_errors=True)
-        return jsonify(error=str(exc)), 400
+        return "error", str(exc)
 
-    queue = _register_pair(pair_id, product, prod_dir, stage_dir)
-    return jsonify(queue=queue, added=product)
+    _register_pair(pair_id, product, prod_dir, stage_dir)
+    return "added", f"{prod_src.name} vs {stage_src.name if stage_src else match.get('zip_name')}"
+
+
+_SECONDARY_DOC_RE = re.compile(r"timing|safety|_rs\b|resolution|handbook|_rs_", re.I)
+
+
+def _find_matches_for_name(name: str, catalog: list) -> list:
+    """The catalog entries a pasted product name could mean, best first. An
+    exact product id returns just that; otherwise entries sharing a model code
+    (PD05U) or a normalised substring, ranked so the main manual with an exact
+    STAGE match wins over timing/safety/RS side documents."""
+    q = name.strip()
+    if not q:
+        return []
+    exact = [m for m in catalog if m["product"].lower() == q.lower()]
+    if exact:
+        return exact
+
+    want = model_keys(q)
+    qn = _norm_name(q)
+    hits = []
+    for m in catalog:
+        have = model_keys(m["product"]) | model_keys(m.get("pdf_name", ""))
+        mn = _norm_name(m["product"])
+        if (want and want & have) or (qn and (qn in mn or mn in qn)):
+            hits.append(m)
+
+    def rank(m):
+        return (
+            0 if m.get("stage_match") == "exact" else (1 if m.get("has_stage") else 2),
+            1 if _SECONDARY_DOC_RE.search(m["product"]) else 0,
+            0 if str(m.get("prod_source", "")).startswith("prod-pdf's") else 1,
+            len(m["product"]),
+        )
+
+    return sorted(hits, key=rank)
+
+
+@app.route("/download/add-to-validation/<path:product>", methods=["POST"])
+def add_to_validation(product: str):
+    """Queue a matched PROD/STAGE pair already available on the server."""
+    match = next((m for m in _matched_products() if m["product"] == product), None)
+    if not match:
+        return jsonify(error="Unknown product."), 404
+    status, detail = _queue_matched_pair(match)
+    if status == "error":
+        code = 400 if "no STAGE" in detail else 404
+        return jsonify(error=detail.capitalize()), code
+    return jsonify(queue=load_queue(), added=product,
+                   duplicate=(status == "duplicate"))
+
+
+@app.route("/download/add-to-validation-bulk", methods=["POST"])
+def add_to_validation_bulk():
+    """Paste a list of product names (newline / comma / semicolon separated);
+    queue the matched PROD + STAGE pair for each, appending to the homepage."""
+    payload = request.get_json(silent=True) or request.form
+    raw = str(payload.get("names", ""))
+    names = [n.strip() for n in re.split(r"[\r\n,;]+", raw) if n.strip()]
+    if not names:
+        return jsonify(error="Paste at least one product name."), 400
+
+    catalog = _matched_products()
+    results, seen_products = [], set()
+    for name in names:
+        matches = _find_matches_for_name(name, catalog)
+        if not matches:
+            results.append({"name": name, "status": "not_found",
+                            "detail": "no PROD/STAGE match in the catalog"})
+            continue
+        # One pair per pasted name — the best-ranked match.
+        m = next((c for c in matches if c["product"] not in seen_products), matches[0])
+        if m["product"] in seen_products:
+            results.append({"name": name, "product": m["product"],
+                            "status": "duplicate", "detail": "already handled above"})
+            continue
+        if not m.get("has_stage"):
+            results.append({"name": name, "product": m["product"],
+                            "status": "no_stage",
+                            "detail": "PROD PDF only — no STAGE match"})
+            continue
+        seen_products.add(m["product"])
+        status, detail = _queue_matched_pair(m)
+        results.append({"name": name, "product": m["product"],
+                        "status": status, "detail": detail,
+                        "stage_match": m.get("stage_match")})
+
+    added = sum(1 for r in results if r["status"] == "added")
+    return jsonify(queue=load_queue(), added=added, results=results)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3068,7 +3263,7 @@ def _resolve_ref_pdf(pdf_sel, upload):
     if pdf_sel and pdf_sel != "all":
         match = next((m for m in _matched_products() if m["product"] == pdf_sel), None)
         if match:
-            p = BENQ_PDFS_DIR / match["product"] / match["pdf_name"]
+            p = Path(match.get("prod_path") or (BENQ_PDFS_DIR / match["product"] / match["pdf_name"]))
             if p.is_file():
                 return str(p), match["pdf_name"], None
     return None, None, None
